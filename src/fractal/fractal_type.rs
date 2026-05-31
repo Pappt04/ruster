@@ -21,9 +21,9 @@ impl FractalType {
     pub const fn default_center(self) -> [f64; 2] {
         match self {
             Self::Mandelbrot => [-0.5, 0.0],
-            Self::Julia => [0.0, 0.0],
-            Self::Newton => [-0.4, -0.6],
-            Self::Nova => [0.0, 0.0],
+            Self::Julia      => [0.0, 0.0],
+            Self::Newton     => [0.0, 0.0],
+            Self::Nova       => [0.0, 0.0],
         }
     }
 }
