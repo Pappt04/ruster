@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-image = "0.25"
+eframe  = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui    = { version = "0.33", default-features = false, features = ["default_fonts"] }
+rayon   = "1.10"
+image   = { version = "0.25", default-features = false, features = ["png"] }
 num-complex = "0.4"
-rayon = "1.10"
