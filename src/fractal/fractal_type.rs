@@ -9,6 +9,7 @@ pub enum FractalType {
 
 impl FractalType {
     pub const ALL: &'static [Self] = &[Self::Nova, Self::Newton, Self::Mandelbrot, Self::Julia];
+    
     pub const fn name(self) -> &'static str {
         match self {
             Self::Mandelbrot => "Mandelbrot",

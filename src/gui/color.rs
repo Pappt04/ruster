@@ -93,13 +93,18 @@ fn rgb(r: f32, g: f32, b: f32) -> Color32 {
 pub fn colorize(buf: &[f32], max_iter: u32, scheme: ColorScheme) -> Vec<Color32> {
     let max_f = max_iter as f32;
 
+    // Build palette LUT once — avoids sin/pow per pixel for complex schemes.
+    const LUT_SIZE: usize = 4096;
+    let lut: Vec<Color32> = (0..LUT_SIZE)
+        .map(|i| scheme.sample(i as f32 / (LUT_SIZE - 1) as f32))
+        .collect();
+
     // Build histogram of escaped pixels (exclude in-set)
     let bins = max_iter as usize + 1;
     let mut hist = vec![0u32; bins];
     for &v in buf {
         if v < max_f {
-            let bin = v.floor() as usize;
-            hist[bin.min(bins - 1)] += 1;
+            hist[(v.floor() as usize).min(bins - 1)] += 1;
         }
     }
 
@@ -112,17 +117,16 @@ pub fn colorize(buf: &[f32], max_iter: u32, scheme: ColorScheme) -> Vec<Color32>
         cdf[i] = if total_escaped > 0.0 { (running / total_escaped) as f32 } else { 0.0 };
     }
 
-    // Colorize each pixel
+    // Colorize each pixel via LUT lookup
     buf.iter().map(|&v| {
         if v >= max_f {
             Color32::BLACK
         } else {
-            // Interpolate between the two nearest cdf values for sub-bin smoothness
             let frac = v.fract();
             let lo = v.floor() as usize;
             let hi = (lo + 1).min(bins - 1);
             let t = cdf[lo] + frac * (cdf[hi] - cdf[lo]);
-            scheme.sample(t)
+            lut[((t * (LUT_SIZE - 1) as f32) as usize).min(LUT_SIZE - 1)]
         }
     }).collect()
 }
