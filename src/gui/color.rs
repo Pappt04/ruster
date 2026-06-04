@@ -1,4 +1,15 @@
+use std::sync::LazyLock;
 use egui::Color32;
+
+const LUT_SIZE: usize = 4096;
+const N_SCHEMES: usize = 6;
+
+static PALETTES: LazyLock<[[Color32; LUT_SIZE]; N_SCHEMES]> = LazyLock::new(|| {
+    std::array::from_fn(|scheme_idx| {
+        let scheme = ColorScheme::ALL[scheme_idx];
+        std::array::from_fn(|i| scheme.sample(i as f32 / (LUT_SIZE - 1) as f32))
+    })
+});
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum ColorScheme {
@@ -10,7 +21,6 @@ pub enum ColorScheme {
     Electric,
     Sunset,
 }
-
 
 impl ColorScheme {
     pub const ALL: &'static [Self] = &[
@@ -29,13 +39,23 @@ impl ColorScheme {
         }
     }
 
+    const fn palette_index(self) -> usize {
+        match self {
+            Self::Inferno   => 0,
+            Self::Ocean     => 1,
+            Self::Plasma    => 2,
+            Self::Grayscale => 3,
+            Self::Electric  => 4,
+            Self::Sunset    => 5,
+        }
+    }
+
     /// Sample the palette at t ∈ [0, 1].
     pub fn sample(self, t: f32) -> Color32 {
         use std::f32::consts::TAU;
         let t = t.clamp(0.0, 1.0);
         match self {
             Self::Inferno => {
-                // Dark purple → orange → bright yellow
                 let r = (t * 2.0).min(1.0);
                 let g = (t * 1.5 - 0.25).clamp(0.0, 1.0);
                 let b = ((1.0 - t) * 0.8 * (TAU * t * 0.5).sin().abs()).clamp(0.0, 1.0);
@@ -49,7 +69,7 @@ impl ColorScheme {
                     (0.55 + 0.45 * depth) * shimmer)
             }
             Self::Plasma => {
-                let r = (0.5 + 0.5 * (TAU * t * 1.0).sin()).powf(0.8);
+                let r = (0.5 + 0.5 * (TAU * t).sin()).powf(0.8);
                 let g = (0.5 + 0.5 * (TAU * t * 1.5 + 2.0).sin()).powf(0.8);
                 let b = (0.5 + 0.5 * (TAU * t * 0.7 + 4.0).sin()).powf(0.6);
                 rgb(r, g, b)
@@ -92,12 +112,7 @@ fn rgb(r: f32, g: f32, b: f32) -> Color32 {
 /// Maps a smooth iteration buffer to RGBA pixels using histogram equalization.
 pub fn colorize(buf: &[f32], max_iter: u32, scheme: ColorScheme) -> Vec<Color32> {
     let max_f = max_iter as f32;
-
-    // Build palette LUT once — avoids sin/pow per pixel for complex schemes.
-    const LUT_SIZE: usize = 4096;
-    let lut: Vec<Color32> = (0..LUT_SIZE)
-        .map(|i| scheme.sample(i as f32 / (LUT_SIZE - 1) as f32))
-        .collect();
+    let lut = &PALETTES[scheme.palette_index()];
 
     // Build histogram of escaped pixels (exclude in-set)
     let bins = max_iter as usize + 1;
@@ -117,7 +132,7 @@ pub fn colorize(buf: &[f32], max_iter: u32, scheme: ColorScheme) -> Vec<Color32>
         cdf[i] = if total_escaped > 0.0 { (running / total_escaped) as f32 } else { 0.0 };
     }
 
-    // Colorize each pixel via LUT lookup
+    // Colorize each pixel via static LUT lookup
     buf.iter().map(|&v| {
         if v >= max_f {
             Color32::BLACK
