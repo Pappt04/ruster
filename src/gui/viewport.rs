@@ -14,9 +14,8 @@ impl Default for Viewport {
 
 impl Viewport {
     pub fn pixel_to_complex(&self, px: f64, py: f64) -> [f64; 2] {
-        let aspect = self.aspect_ratio();
         let half = 2.0 / self.zoom;
-        let re = self.center[0] + (px / self.width as f64 - 0.5) * half * aspect * 2.0;
+        let re = self.center[0] + (px / self.width as f64 - 0.5) * half * self.aspect_ratio() * 2.0;
         let im = self.center[1] + (py / self.height as f64 - 0.5) * half * 2.0;
         [re, im]
     }

@@ -2,11 +2,14 @@
 name = "novafractal"
 version = "0.1.0"
 edition = "2024"
+default-run = "novafractal"
 
 [features]
 cuda = ["dep:cudarc"]
 
 [dependencies]
+libc    = "0.2"
+pollster = "0.3"
 eframe  = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 egui    = { version = "0.33", default-features = false, features = ["default_fonts"] }
 rayon   = "1.10"
@@ -16,7 +19,25 @@ wgpu = "22"
 bytemuck = { version = "1", features = ["derive"] }
 cudarc  = { version = "0.12", features = ["cuda-12000"], optional = true }
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rayon = "1.10"
+
+[[bench]]
+name = "fractal_bench"
+harness = false
+
+[[bin]]
+name = "bench_runner"
+path = "src/bin/bench_runner.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = true           # keep symbols for perf annotate / flamegraphs

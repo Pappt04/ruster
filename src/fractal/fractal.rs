@@ -30,6 +30,23 @@ pub fn render(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: 
     buf
 }
 
+/// Single-pixel entry point exposed for benchmarking.
+pub fn pixel(fractal: FractalType, re: f64, im: f64, julia_c: [f64; 2], max_iter: u32) -> f32 {
+    compute(fractal, re, im, julia_c, max_iter)
+}
+
+/// Analytical floating-point operation count per kernel call (lower bound, no FMA fusion).
+pub const fn flops_per_iter(fractal: FractalType) -> u64 {
+    match fractal {
+        // 2 mul (zr²,zi²) + 1 add (zn_sq) + 2 mul + 1 add (zi) + 1 sub + 1 add (zr) = 8
+        FractalType::Mandelbrot | FractalType::Julia => 8,
+        // z³ (6) + f (2) + f' (4) + complex div+sub (10) + step check (3) = 25
+        FractalType::Newton => 25,
+        // Newton + 2 adds for nova perturbation = 27
+        FractalType::Nova => 27,
+    }
+}
+
 fn compute(fractal: FractalType, re: f64, im: f64, julia_c: [f64; 2], max_iter: u32) -> f32 {
     match fractal {
         FractalType::Nova => nova(re, im, max_iter),
