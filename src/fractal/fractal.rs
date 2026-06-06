@@ -48,6 +48,7 @@ fn smooth_iter(iter: u32, zn_sq: f64, max_iter: u32) -> f32 {
     (iter as f64 + 1.0 - nu) as f32
 }
 
+#[inline]
 fn mandelbrot(cr: f64, ci: f64, max_iter: u32) -> f32 {
     let q = (cr - 0.25) * (cr - 0.25) + ci * ci;
     if q * (q + cr - 0.25) < 0.25 * ci * ci {
@@ -71,6 +72,7 @@ fn mandelbrot(cr: f64, ci: f64, max_iter: u32) -> f32 {
     max_iter as f32
 }
 
+#[inline]
 fn julia(zr0: f64, zi0: f64, cr: f64, ci: f64, max_iter: u32) -> f32 {
     let (mut zr, mut zi) = (zr0, zi0);
     for i in 0..max_iter {
@@ -86,6 +88,7 @@ fn julia(zr0: f64, zi0: f64, cr: f64, ci: f64, max_iter: u32) -> f32 {
     max_iter as f32
 }
 
+#[inline]
 fn newton(cr: f64, ci: f64, max_iter: u32) -> f32 {
     let (mut zr, mut zi) = (cr, ci);
     for i in 0..max_iter {
@@ -114,6 +117,7 @@ fn newton(cr: f64, ci: f64, max_iter: u32) -> f32 {
     max_iter as f32
 }
 
+#[inline]
 fn nova(cr: f64, ci: f64, max_iter: u32) -> f32 {
     let (mut zr, mut zi) = (1.0, 0.0);
     for i in 0..max_iter {

@@ -1,7 +1,6 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use egui::ColorImage;
 use crate::{
-    fractal::fractal::render as compute_render,
     fractal::fractal_type::FractalType,
     gui::color::{colorize, ColorScheme},
     gui::viewport::Viewport,
@@ -27,16 +26,54 @@ impl RenderWorker {
         let (img_tx, img_rx) = mpsc::channel::<ColorImage>();
 
         std::thread::spawn(move || {
-            while let Ok(mut req) = req_rx.recv() {
-                while let Ok(newer) = req_rx.try_recv() {
-                    req = newer;
+            #[cfg(feature = "cuda")]
+            {
+                use crate::gpu::cuda::CudaFractal;
+                let mut compute: Option<CudaFractal> = None;
+                let mut cached_size = (0u32, 0u32);
+
+                while let Ok(mut req) = req_rx.recv() {
+                    while let Ok(newer) = req_rx.try_recv() { req = newer; }
+
+                    let sz = (req.vp.width, req.vp.height);
+                    if compute.is_none() || cached_size != sz {
+                        compute = Some(CudaFractal::new(sz.0, sz.1));
+                        cached_size = sz;
+                    }
+
+                    let vp = &req.vp;
+                    let aspect = vp.width as f64 / vp.height as f64;
+                    let half   = 2.0 / vp.zoom;
+
+                    let buf = compute.as_mut().unwrap().render(
+                        vp.center[0] + (0.5 / vp.width  as f64 - 0.5) * half * aspect * 2.0,
+                        vp.center[1] + (0.5 / vp.height as f64 - 0.5) * half * 2.0,
+                        half * aspect * 2.0 / vp.width  as f64,
+                        half * 2.0          / vp.height as f64,
+                        req.julia_c[0], req.julia_c[1],
+                        req.max_iter,
+                        req.fractal.as_u32(),
+                    );
+
+                    let pixels = colorize(&buf, req.max_iter, req.scheme);
+                    let image  = ColorImage::new([sz.0 as usize, sz.1 as usize], pixels);
+                    if img_tx.send(image).is_err() { break; }
                 }
-                let buf = compute_render(&req.vp, req.fractal, req.julia_c, req.max_iter);
-                let pixels = colorize(&buf, req.max_iter, req.scheme);
-                let w = req.vp.width as usize;
-                let h = req.vp.height as usize;
-                let image = ColorImage::new([w, h], pixels);
-                if img_tx.send(image).is_err() { break; }
+            }
+
+            #[cfg(not(feature = "cuda"))]
+            {
+                use crate::fractal::fractal::render as cpu_render;
+
+                while let Ok(mut req) = req_rx.recv() {
+                    while let Ok(newer) = req_rx.try_recv() { req = newer; }
+                    let buf = cpu_render(&req.vp, req.fractal, req.julia_c, req.max_iter);
+                    let pixels = colorize(&buf, req.max_iter, req.scheme);
+                    let w = req.vp.width as usize;
+                    let h = req.vp.height as usize;
+                    let image = ColorImage::new([w, h], pixels);
+                    if img_tx.send(image).is_err() { break; }
+                }
             }
         });
 
@@ -50,8 +87,8 @@ impl RenderWorker {
 
     pub fn poll(&mut self) -> Option<ColorImage> {
         match self.rx.try_recv() {
-            Ok(img) => { self.busy = false; Some(img) }
-            Err(_) => None,
+            Ok(img)  => { self.busy = false; Some(img) }
+            Err(_)   => None,
         }
     }
 }

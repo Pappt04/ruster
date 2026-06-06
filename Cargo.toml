@@ -3,13 +3,18 @@ name = "novafractal"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+cuda = ["dep:cudarc"]
+
 [dependencies]
 eframe  = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 egui    = { version = "0.33", default-features = false, features = ["default_fonts"] }
 rayon   = "1.10"
 image   = { version = "0.25", default-features = false, features = ["png"] }
 num-complex = "0.4"
-
+wgpu = "22"
+bytemuck = { version = "1", features = ["derive"] }
+cudarc  = { version = "0.12", features = ["cuda-12000"], optional = true }
 
 [profile.release]
 opt-level = 3

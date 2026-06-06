@@ -1,5 +1,6 @@
 mod fractal;
 mod gui;
+mod gpu;
 
 use gui::app::FractalApp;
 
