@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 use egui::Color32;
 
-const LUT_SIZE: usize = 4096;
+const LUT_SIZE: usize = 4096*2;
 const N_SCHEMES: usize = 6;
 
 static PALETTES: LazyLock<[[Color32; LUT_SIZE]; N_SCHEMES]> = LazyLock::new(|| {

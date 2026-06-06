@@ -5,6 +5,7 @@ edition = "2024"
 default-run = "novafractal"
 
 [features]
+simd=[]
 cuda = ["dep:cudarc"]
 
 [dependencies]
@@ -18,6 +19,7 @@ num-complex = "0.4"
 wgpu = "22"
 bytemuck = { version = "1", features = ["derive"] }
 cudarc  = { version = "0.12", features = ["cuda-12000"], optional = true }
+wide = "0.7"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

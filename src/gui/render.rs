@@ -64,10 +64,28 @@ impl RenderWorker {
             #[cfg(not(feature = "cuda"))]
             {
                 use crate::fractal::fractal::render as cpu_render;
+                #[cfg(feature = "simd")]
+                use crate::fractal::fractal::render_simd;
+                #[cfg(feature = "simd")]
+                use crate::fractal::fractal_type::FractalType;
 
                 while let Ok(mut req) = req_rx.recv() {
                     while let Ok(newer) = req_rx.try_recv() { req = newer; }
-                    let buf = cpu_render(&req.vp, req.fractal, req.julia_c, req.max_iter);
+
+                    let buf = {
+                        #[cfg(feature = "simd")]
+                        {
+                            match req.fractal {
+                                FractalType::Mandelbrot | FractalType::Julia =>
+                                    render_simd(&req.vp, req.fractal, req.julia_c, req.max_iter),
+                                _ =>
+                                    cpu_render(&req.vp, req.fractal, req.julia_c, req.max_iter),
+                            }
+                        }
+                        #[cfg(not(feature = "simd"))]
+                        cpu_render(&req.vp, req.fractal, req.julia_c, req.max_iter)
+                    };
+
                     let pixels = colorize(&buf, req.max_iter, req.scheme);
                     let w = req.vp.width as usize;
                     let h = req.vp.height as usize;
