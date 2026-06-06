@@ -1,8 +1,4 @@
-mod fractal;
-mod gui;
-mod gpu;
-
-use gui::app::FractalApp;
+use novafractal::gui::app::FractalApp;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
