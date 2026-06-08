@@ -24,6 +24,8 @@ pub struct FractalApp {
 
     // — adaptive iteration depth
     auto_iter: bool,
+
+    use_ms: bool,
 }
 
 impl Default for FractalApp {
@@ -39,6 +41,7 @@ impl Default for FractalApp {
             texture: None,
             needs_render: true,
             auto_iter: true,
+            use_ms: false,
         }
     }
 }
@@ -56,6 +59,7 @@ impl FractalApp {
             julia_c: self.julia_c,
             max_iter: self.max_iter,
             scheme: self.scheme,
+            use_ms: self.use_ms,
         });
         self.needs_render = false;
     }
@@ -194,6 +198,13 @@ impl FractalApp {
 
                 ui.add_space(8.0);
                 ui.separator();
+
+                // Mariani-Silver subdivision
+                if ui.checkbox(&mut self.use_ms, "Mariani-Silver fill").changed() {
+                    self.needs_render = true;
+                }
+
+                ui.add_space(4.0);
 
                 // Iteration depth
                 ui.checkbox(&mut self.auto_iter, "Auto iterations");

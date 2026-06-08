@@ -12,6 +12,7 @@ pub struct RenderRequest {
     pub julia_c: [f64; 2],
     pub max_iter: u32,
     pub scheme: ColorScheme,
+    pub use_ms: bool,
 }
 
 pub struct RenderWorker {
@@ -63,21 +64,28 @@ impl RenderWorker {
 
             #[cfg(not(feature = "cuda"))]
             {
-                use crate::fractal::fractal::render as cpu_render;
+                use crate::fractal::fractal::{render as cpu_render, render_mariani_silver};
                 #[cfg(feature = "simd")]
-                use crate::fractal::fractal::render_simd;
+                use crate::fractal::fractal::{render_simd, render_simd_f32, F32_PRECISION_THRESHOLD};
                 #[cfg(feature = "simd")]
                 use crate::fractal::fractal_type::FractalType;
 
                 while let Ok(mut req) = req_rx.recv() {
                     while let Ok(newer) = req_rx.try_recv() { req = newer; }
 
-                    let buf = {
+                    let buf = if req.use_ms {
+                        render_mariani_silver(&req.vp, req.fractal, req.julia_c, req.max_iter)
+                    } else {
                         #[cfg(feature = "simd")]
                         {
                             match req.fractal {
-                                FractalType::Mandelbrot | FractalType::Julia =>
-                                    render_simd(&req.vp, req.fractal, req.julia_c, req.max_iter),
+                                FractalType::Mandelbrot | FractalType::Julia => {
+                                    if req.vp.zoom < F32_PRECISION_THRESHOLD {
+                                        render_simd_f32(&req.vp, req.fractal, req.julia_c, req.max_iter)
+                                    } else {
+                                        render_simd(&req.vp, req.fractal, req.julia_c, req.max_iter)
+                                    }
+                                }
                                 _ =>
                                     cpu_render(&req.vp, req.fractal, req.julia_c, req.max_iter),
                             }
