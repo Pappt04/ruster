@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use novafractal::fractal::{pixel, render, flops_per_iter, FractalType};
+use novafractal::fractal::{pixel, render, render_perturbation, compute_reference_orbit, flops_per_iter, FractalType};
 use novafractal::gpu::fractal_compute::FractalCompute;
 use novafractal::gpu::unifroms::Uniforms;
 use novafractal::gui::color::{colorize, ColorScheme};
@@ -446,6 +446,63 @@ fn bench_cuda_pipeline(c: &mut Criterion) { let _ = c; }
 #[cfg(not(feature = "cuda"))]
 fn bench_hybrid_cpu_cuda(c: &mut Criterion) { let _ = c; }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Perturbation theory benchmarks
+// Compares render() (scalar) vs render_perturbation() at five zoom levels.
+// At low zoom almost all pixels fall back to scalar (ε grows large immediately),
+// so speedup ≈ 1×.  At high zoom (1e9+) most pixels stay within the linear
+// approximation — speedup grows proportionally with max_iter.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Zoom levels and center matching the bench_runner --perturb-sweep defaults.
+const PERTURB_ZOOMS: &[(f64, &str)] = &[
+    (1.0,  "zoom_1e0"),
+    (1e3,  "zoom_1e3"),
+    (1e6,  "zoom_1e6"),
+    (1e9,  "zoom_1e9"),
+    (1e12, "zoom_1e12"),
+];
+const PERTURB_CENTER: [f64; 2] = [-0.75, 0.1];
+
+fn bench_perturbation_render(c: &mut Criterion) {
+    let mut group = c.benchmark_group("perturbation/Mandelbrot_1080p");
+    group.throughput(Throughput::Elements(1920 * 1080));
+    group.sample_size(10);
+
+    for &(zoom, label) in PERTURB_ZOOMS {
+        let vp = Viewport { center: PERTURB_CENTER, zoom, width: 1920, height: 1080 };
+
+        group.bench_with_input(
+            BenchmarkId::new("scalar", label),
+            &vp,
+            |b, vp| b.iter(|| render(black_box(vp), FractalType::Mandelbrot, JULIA_C, MAX_ITER)),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("perturb", label),
+            &vp,
+            |b, vp| b.iter(|| render_perturbation(black_box(vp), FractalType::Mandelbrot, JULIA_C, MAX_ITER)),
+        );
+    }
+    group.finish();
+}
+
+// Cost of computing the reference orbit alone, amortized over all pixels.
+// This is O(max_iter) and runs once per frame — should be negligible vs render.
+fn bench_perturbation_reference_orbit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("perturbation/reference_orbit");
+
+    for &(_, label) in PERTURB_ZOOMS {
+        group.bench_function(label, |b| {
+            b.iter(|| compute_reference_orbit(
+                black_box(PERTURB_CENTER[0]),
+                black_box(PERTURB_CENTER[1]),
+                black_box(MAX_ITER),
+            ))
+        });
+    }
+    group.finish();
+}
+
 // ── startup info ──────────────────────────────────────────────────────────────
 
 fn print_header() {
@@ -486,6 +543,9 @@ criterion_group! {
         bench_colorize,
         bench_cpu_pipeline,
         bench_thread_scaling,
+        // Perturbation theory (scalar vs perturb × zoom sweep)
+        bench_perturbation_render,
+        bench_perturbation_reference_orbit,
         // wgpu GPU
         bench_wgpu_render,
         bench_wgpu_pipeline,

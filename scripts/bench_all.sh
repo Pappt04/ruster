@@ -18,12 +18,14 @@
 #   --runs   N       timing repetitions (default 5)
 #   --no-perf        skip perf stat (useful if perf needs elevated privileges)
 #   --no-criterion   skip criterion statistical benchmarks
+#   --no-perturb     skip perturbation theory sweep
 #
 # Output layout:
 #   bench_results/run_<timestamp>_<git>_<mode>/
 #     config.txt          system + build info
 #     perf/               perf stat counter files (one per backend)
 #     timing/             bench_runner JSON + plain text tables
+#     timing/perturb_sweep.{txt,json}  scalar vs perturbation zoom sweep
 #     criterion/          full criterion HTML tree
 #     summary.txt         side-by-side comparison of all backends
 
@@ -40,6 +42,7 @@ ITERS=1000
 RUNS=5
 RUN_PERF=1
 RUN_CRITERION=1
+RUN_PERTURB=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -51,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --runs)         RUNS="$2";               shift 2 ;;
         --no-perf)      RUN_PERF=0;              shift ;;
         --no-criterion) RUN_CRITERION=0;         shift ;;
+        --no-perturb)   RUN_PERTURB=0;           shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -197,6 +201,18 @@ if [[ $RUN_PERF -eq 1 ]]; then
             "$CUDA_BINARY" "${COMMON_ARGS[@]}" --fractal all --backend wgpu
     fi
 
+    if [[ $RUN_PERTURB -eq 1 ]]; then
+        echo "  perturbation: deep zoom (1e12) Mandelbrot"
+        run_perf_stat "perturb_deep" \
+            "$BINARY" "${COMMON_ARGS[@]}" --fractal mandelbrot --backend cpu \
+            --zoom 1e12 --center -0.75,0.1 --perturbation
+
+        echo "  scalar baseline: deep zoom (1e12) Mandelbrot"
+        run_perf_stat "scalar_deep" \
+            "$BINARY" "${COMMON_ARGS[@]}" --fractal mandelbrot --backend cpu \
+            --zoom 1e12 --center -0.75,0.1
+    fi
+
     echo ""
 fi
 
@@ -221,6 +237,14 @@ echo "  [timing] cpu_scaling (thread sweep)"
     --json 2>/dev/null > "$RUN_DIR/timing/cpu_scaling.json"
 "$BINARY" "${COMMON_ARGS[@]}" --fractal mandelbrot --backend cpu --scaling \
     2>/dev/null > "$RUN_DIR/timing/cpu_scaling.txt"
+
+if [[ $RUN_PERTURB -eq 1 ]]; then
+    echo "  [timing] perturbation sweep (scalar vs perturb, zoom 1 → 1e12)"
+    "$BINARY" "${COMMON_ARGS[@]}" --perturb-sweep \
+        2>/dev/null | tee "$RUN_DIR/timing/perturb_sweep.txt"
+    "$BINARY" "${COMMON_ARGS[@]}" --perturb-sweep --json \
+        2>/dev/null > "$RUN_DIR/timing/perturb_sweep.json"
+fi
 
 echo ""
 
@@ -267,6 +291,12 @@ echo "── [5/5] Summary ─────────────────�
     echo "--- cpu thread scaling ---"
     [[ -f "$RUN_DIR/timing/cpu_scaling.txt" ]] && cat "$RUN_DIR/timing/cpu_scaling.txt"
     echo ""
+
+    if [[ -f "$RUN_DIR/timing/perturb_sweep.txt" ]]; then
+        echo "--- perturbation theory (scalar vs perturb, seahorse valley) ---"
+        cat "$RUN_DIR/timing/perturb_sweep.txt"
+        echo ""
+    fi
 
     if command -v python3 &>/dev/null && [[ -f "$RUN_DIR/timing/cpu.json" ]]; then
         python3 - "$RUN_DIR/timing" <<'PYEOF'
@@ -319,6 +349,23 @@ for frac in fractals:
         v = all_data[b].get(frac, {}).get("mpix_per_sec", 0)
         row += f"  {v/cpu_v:>9.2f}x"
     print(row)
+PYEOF
+    fi
+
+    if command -v python3 &>/dev/null && [[ -f "$RUN_DIR/timing/perturb_sweep.json" ]]; then
+        python3 - "$RUN_DIR/timing/perturb_sweep.json" <<'PYEOF'
+import json, sys
+
+data = json.load(open(sys.argv[1]))
+if not data:
+    sys.exit(0)
+
+print("=== Perturbation theory zoom sweep ===")
+print(f"{'Zoom':<10} {'Scalar ms':>10} {'Perturb ms':>11} {'Speedup':>9} {'Max diff':>10} {'>0.01 px':>9}")
+print("-" * 65)
+for r in data:
+    print(f"{r['zoom']:<10.0e} {r['scalar_median_ms']:>10.2f} {r['perturb_median_ms']:>11.2f} "
+          f"{r['speedup']:>8.2f}x {r['max_pixel_diff']:>10.4f} {r['pixels_above_0_01']:>9}")
 PYEOF
     fi
 

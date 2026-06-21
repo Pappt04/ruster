@@ -26,6 +26,7 @@ pub struct FractalApp {
     auto_iter: bool,
 
     use_ms: bool,
+    use_perturbation: bool,
 }
 
 impl Default for FractalApp {
@@ -42,6 +43,7 @@ impl Default for FractalApp {
             needs_render: true,
             auto_iter: true,
             use_ms: false,
+            use_perturbation: false,
         }
     }
 }
@@ -60,6 +62,7 @@ impl FractalApp {
             max_iter: self.max_iter,
             scheme: self.scheme,
             use_ms: self.use_ms,
+            use_perturbation: self.use_perturbation,
         });
         self.needs_render = false;
     }
@@ -202,6 +205,15 @@ impl FractalApp {
                 // Mariani-Silver subdivision
                 if ui.checkbox(&mut self.use_ms, "Mariani-Silver fill").changed() {
                     self.needs_render = true;
+                }
+
+                // Perturbation theory (Mandelbrot only)
+                if self.fractal == FractalType::Mandelbrot {
+                    if ui.checkbox(&mut self.use_perturbation, "Perturbation theory").changed() {
+                        self.needs_render = true;
+                    }
+                } else {
+                    self.use_perturbation = false;
                 }
 
                 ui.add_space(4.0);

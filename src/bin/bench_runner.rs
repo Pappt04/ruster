@@ -10,6 +10,11 @@
 ///   --runs     N   warm-up + timed repetitions    (default: 5)
 ///   --threads  N   rayon threads, 0 = num_cpus    (default: 0)
 ///   --backend  cpu|wgpu|hybrid                    (default: cpu)
+///   --zoom     F                                  (default: 1.0)
+///   --center   RE,IM                              (default: -0.5,0.0)
+///   --perturbation     use render_perturbation()  (CPU only, Mandelbrot)
+///   --compare-perturb  scalar vs perturbation timing + pixel diff (Mandelbrot)
+///   --perturb-sweep    zoom sweep [1,1e3,1e6,1e9,1e12] at seahorse valley
 ///   --scaling       run thread-scaling sweep      (flag)
 ///   --json          emit JSON to stdout            (flag)
 ///
@@ -22,7 +27,7 @@
 ///   ./target/release/bench_runner --scaling --json > bench_results/scaling.json
 
 use std::time::{Duration, Instant};
-use novafractal::fractal::{render, flops_per_iter, FractalType};
+use novafractal::fractal::{render, render_perturbation, flops_per_iter, FractalType};
 use novafractal::gui::viewport::Viewport;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -35,9 +40,14 @@ struct Args {
     max_iter:   u32,
     runs:       usize,
     threads:    usize,
-    backend:    Backend,
-    scaling:    bool,
-    json:       bool,
+    backend:            Backend,
+    zoom:               f64,
+    center:             [f64; 2],
+    perturbation:       bool,
+    compare_perturb:    bool,
+    perturb_sweep:      bool,
+    scaling:            bool,
+    json:               bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -52,9 +62,14 @@ impl Default for Args {
             max_iter:  1000,
             runs:      5,
             threads:   0,
-            backend:   Backend::Cpu,
-            scaling:   false,
-            json:      false,
+            backend:         Backend::Cpu,
+            zoom:            1.0,
+            center:          [-0.5, 0.0],
+            perturbation:    false,
+            compare_perturb: false,
+            perturb_sweep:   false,
+            scaling:         false,
+            json:            false,
         }
     }
 }
@@ -90,6 +105,22 @@ fn parse_args() -> Args {
                     x => panic!("unknown backend: {x}"),
                 };
             }
+            "--zoom" => {
+                i += 1;
+                a.zoom = raw[i].parse().unwrap_or_else(|_| {
+                    panic!("invalid --zoom value: {}", raw[i]);
+                });
+            }
+            "--center" => {
+                i += 1;
+                let parts: Vec<&str> = raw[i].split(',').collect();
+                assert!(parts.len() == 2, "--center expects RE,IM");
+                a.center[0] = parts[0].trim().parse().unwrap();
+                a.center[1] = parts[1].trim().parse().unwrap();
+            }
+            "--perturbation"    => a.perturbation    = true,
+            "--compare-perturb" => a.compare_perturb = true,
+            "--perturb-sweep"   => a.perturb_sweep   = true,
             "--scaling" => a.scaling = true,
             "--json"    => a.json    = true,
             x => panic!("unknown flag: {x}"),
@@ -120,56 +151,181 @@ struct Sample {
     mem_traffic_mb: f64,
 }
 
-// ── CPU benchmarking ──────────────────────────────────────────────────────────
+#[derive(Debug)]
+struct PerturbCompare {
+    zoom:               f64,
+    center:             [f64; 2],
+    scalar_median_ms:   f64,
+    perturb_median_ms:  f64,
+    scalar_mpix_per_sec: f64,
+    perturb_mpix_per_sec: f64,
+    speedup:            f64,
+    max_pixel_diff:     f32,
+    mean_pixel_diff:    f64,
+    pixels_above_0_01:  u64,
+    total_pixels:       u64,
+}
 
-fn bench_cpu(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize) -> Sample {
+fn cpu_render(
+    vp: &Viewport,
+    fractal: FractalType,
+    julia_c: [f64; 2],
+    max_iter: u32,
+    perturbation: bool,
+) -> Vec<f32> {
+    if perturbation {
+        render_perturbation(vp, fractal, julia_c, max_iter)
+    } else {
+        render(vp, fractal, julia_c, max_iter)
+    }
+}
+
+fn pixel_diff_stats(a: &[f32], b: &[f32]) -> (f32, f64, u64) {
+    assert_eq!(a.len(), b.len());
+    let mut max_diff = 0.0f32;
+    let mut sum_diff = 0.0f64;
+    let mut above = 0u64;
+    for (&x, &y) in a.iter().zip(b) {
+        let d = (x - y).abs();
+        max_diff = max_diff.max(d);
+        sum_diff += d as f64;
+        if d > 0.01 {
+            above += 1;
+        }
+    }
+    let mean = if a.is_empty() { 0.0 } else { sum_diff / a.len() as f64 };
+    (max_diff, mean, above)
+}
+
+fn time_cpu_render(
+    vp: &Viewport,
+    fractal: FractalType,
+    max_iter: u32,
+    runs: usize,
+    perturbation: bool,
+) -> (Sample, Vec<f32>) {
     let pixels = (vp.width * vp.height) as u64;
     let julia_c = [-0.4f64, 0.6];
 
-    // warm-up (not timed)
-    let _ = render(vp, fractal, julia_c, max_iter);
+    let _ = cpu_render(vp, fractal, julia_c, max_iter, perturbation);
 
     let mut times: Vec<Duration> = Vec::with_capacity(runs);
     let mut last_buf = Vec::new();
 
     for _ in 0..runs {
         let t = Instant::now();
-        last_buf = render(vp, fractal, julia_c, max_iter);
+        last_buf = cpu_render(vp, fractal, julia_c, max_iter, perturbation);
         times.push(t.elapsed());
     }
 
-    // analytical GFLOPS: sum actual iteration values from the last buf
-    // (buf[i] ≈ float iteration count, clamped to max_iter for in-set pixels)
     let total_iters: u64 = last_buf.iter()
         .map(|&v| v.min(max_iter as f32) as u64)
         .sum();
     let fpi = flops_per_iter(fractal);
 
     times.sort();
-    let med = times[runs / 2].as_secs_f64() * 1e3;
-    let mn  = times[0].as_secs_f64()        * 1e3;
-    let mx  = times[runs - 1].as_secs_f64() * 1e3;
     let med_s = times[runs / 2].as_secs_f64();
+    let backend = if perturbation { "cpu+perturb" } else { "cpu" };
 
-    // Memory traffic: read iter buf (f32) + write color buf (4 bytes/pixel).
-    let mem_bytes = pixels * (4 + 4) as u64;
-
-    Sample {
+    let sample = Sample {
         fractal:        fractal.name(),
-        backend:        "cpu",
+        backend,
         threads:        rayon::current_num_threads(),
         width:          vp.width,
         height:         vp.height,
         max_iter,
         runs,
-        median_ms:      med,
-        min_ms:         mn,
-        max_ms:         mx,
+        median_ms:      med_s * 1e3,
+        min_ms:         times[0].as_secs_f64() * 1e3,
+        max_ms:         times[runs - 1].as_secs_f64() * 1e3,
         mpix_per_sec:   pixels as f64 / 1e6 / med_s,
         total_iters,
         gflops:         (total_iters * fpi) as f64 / med_s / 1e9,
-        mem_traffic_mb: mem_bytes as f64 / 1e6,
+        mem_traffic_mb: pixels as f64 * 8.0 / 1e6,
+    };
+
+    (sample, last_buf)
+}
+
+// ── CPU benchmarking ──────────────────────────────────────────────────────────
+
+fn bench_cpu(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize, perturbation: bool) -> Sample {
+    time_cpu_render(vp, fractal, max_iter, runs, perturbation).0
+}
+
+fn bench_compare_perturb(vp: &Viewport, max_iter: u32, runs: usize) -> PerturbCompare {
+    let fractal = FractalType::Mandelbrot;
+    let (scalar_sample, scalar_buf) = time_cpu_render(vp, fractal, max_iter, runs, false);
+    let (perturb_sample, perturb_buf) = time_cpu_render(vp, fractal, max_iter, runs, true);
+    let (max_diff, mean_diff, above) = pixel_diff_stats(&scalar_buf, &perturb_buf);
+    let speedup = if perturb_sample.median_ms > 0.0 {
+        scalar_sample.median_ms / perturb_sample.median_ms
+    } else {
+        0.0
+    };
+
+    PerturbCompare {
+        zoom:                vp.zoom,
+        center:              vp.center,
+        scalar_median_ms:    scalar_sample.median_ms,
+        perturb_median_ms:   perturb_sample.median_ms,
+        scalar_mpix_per_sec: scalar_sample.mpix_per_sec,
+        perturb_mpix_per_sec: perturb_sample.mpix_per_sec,
+        speedup,
+        max_pixel_diff:      max_diff,
+        mean_pixel_diff:     mean_diff,
+        pixels_above_0_01:   above,
+        total_pixels:        scalar_buf.len() as u64,
     }
+}
+
+const PERTURB_SWEEP_ZOOMS: [f64; 5] = [1.0, 1e3, 1e6, 1e9, 1e12];
+const PERTURB_SWEEP_CENTER: [f64; 2] = [-0.75, 0.1];
+
+fn run_perturb_sweep(width: u32, height: u32, max_iter: u32, runs: usize) -> Vec<PerturbCompare> {
+    PERTURB_SWEEP_ZOOMS.iter().map(|&zoom| {
+        let vp = Viewport {
+            center: PERTURB_SWEEP_CENTER,
+            zoom,
+            width,
+            height,
+        };
+        bench_compare_perturb(&vp, max_iter, runs)
+    }).collect()
+}
+
+fn print_perturb_table(results: &[PerturbCompare]) {
+    println!("\n{:-<120}", "");
+    println!("{:<10} {:>12} {:>12} {:>10} {:>12} {:>12} {:>10} {:>10}",
+             "Zoom", "Scalar ms", "Perturb ms", "Speedup",
+             "Scalar Mpix/s", "Perturb Mpix/s", "Max diff", ">0.01 px");
+    println!("{:-<120}", "");
+    for r in results {
+        println!("{:<10.0e} {:>12.2} {:>12.2} {:>9.2}x {:>12.2} {:>12.2} {:>10.4} {:>10}",
+                 r.zoom, r.scalar_median_ms, r.perturb_median_ms, r.speedup,
+                 r.scalar_mpix_per_sec, r.perturb_mpix_per_sec,
+                 r.max_pixel_diff, r.pixels_above_0_01);
+    }
+    println!("{:-<120}", "");
+    println!("center = [{}, {}], mean pixel diff shown in JSON", PERTURB_SWEEP_CENTER[0], PERTURB_SWEEP_CENTER[1]);
+}
+
+fn print_perturb_json(results: &[PerturbCompare]) {
+    println!("[");
+    for (i, r) in results.iter().enumerate() {
+        let comma = if i + 1 < results.len() { "," } else { "" };
+        println!("  {{\"zoom\":{:.6e},\"center\":[{},{}],\
+                  \"scalar_median_ms\":{:.4},\"perturb_median_ms\":{:.4},\
+                  \"scalar_mpix_per_sec\":{:.4},\"perturb_mpix_per_sec\":{:.4},\
+                  \"speedup\":{:.4},\"max_pixel_diff\":{:.6},\"mean_pixel_diff\":{:.6},\
+                  \"pixels_above_0_01\":{},\"total_pixels\":{}}}{}",
+                 r.zoom, r.center[0], r.center[1],
+                 r.scalar_median_ms, r.perturb_median_ms,
+                 r.scalar_mpix_per_sec, r.perturb_mpix_per_sec,
+                 r.speedup, r.max_pixel_diff, r.mean_pixel_diff,
+                 r.pixels_above_0_01, r.total_pixels, comma);
+    }
+    println!("]");
 }
 
 // ── wgpu benchmarking ─────────────────────────────────────────────────────────
@@ -417,7 +573,6 @@ fn git_hash() -> String {
 fn main() {
     let args = parse_args();
 
-    // Configure rayon thread pool.
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
             .num_threads(args.threads)
@@ -426,8 +581,8 @@ fn main() {
     }
 
     let vp = Viewport {
-        center: [-0.5, 0.0],
-        zoom:   1.0,
+        center: args.center,
+        zoom:   args.zoom,
         width:  args.width,
         height: args.height,
     };
@@ -435,16 +590,44 @@ fn main() {
     if !args.json {
         eprintln!("bench_runner  git={}", git_hash());
         eprintln!("  resolution : {}×{}", args.width, args.height);
+        eprintln!("  center     : [{}, {}]", args.center[0], args.center[1]);
+        eprintln!("  zoom       : {}", args.zoom);
         eprintln!("  max_iter   : {}", args.max_iter);
         eprintln!("  runs       : {}", args.runs);
         eprintln!("  backend    : {:?}", args.backend);
+        if args.perturbation {
+            eprintln!("  mode       : perturbation");
+        }
         eprintln!("  rayon cpus : {}", rayon::current_num_threads());
-        print_flop_budget(&args.fractals, args.max_iter);
+        if !args.perturb_sweep && !args.compare_perturb {
+            print_flop_budget(&args.fractals, args.max_iter);
+        }
+    }
+
+    // ── perturbation zoom sweep ──────────────────────────────────────────────
+    if args.perturb_sweep {
+        let results = run_perturb_sweep(args.width, args.height, args.max_iter, args.runs);
+        if args.json {
+            print_perturb_json(&results);
+        } else {
+            print_perturb_table(&results);
+        }
+        return;
+    }
+
+    // ── single zoom scalar vs perturbation compare ───────────────────────────
+    if args.compare_perturb {
+        let result = bench_compare_perturb(&vp, args.max_iter, args.runs);
+        if args.json {
+            print_perturb_json(&[result]);
+        } else {
+            print_perturb_table(&[result]);
+        }
+        return;
     }
 
     let mut samples: Vec<Sample> = Vec::new();
 
-    // ── thread-scaling sweep ─────────────────────────────────────────────────
     if args.scaling {
         let ncpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -460,19 +643,26 @@ fn main() {
                 .expect("rayon pool");
 
             for &fractal in &args.fractals {
-                let mut s = pool.install(|| bench_cpu(fractal, &vp, args.max_iter, args.runs));
+                let mut s = pool.install(|| {
+                    bench_cpu(fractal, &vp, args.max_iter, args.runs, args.perturbation)
+                });
                 s.threads = t;
                 samples.push(s);
             }
         }
     } else {
-        // ── single-configuration run ─────────────────────────────────────────
         for &fractal in &args.fractals {
             match args.backend {
                 Backend::Cpu => {
-                    samples.push(bench_cpu(fractal, &vp, args.max_iter, args.runs));
+                    samples.push(bench_cpu(
+                        fractal, &vp, args.max_iter, args.runs, args.perturbation,
+                    ));
                 }
                 Backend::Wgpu => {
+                    if args.perturbation {
+                        eprintln!("[wgpu] --perturbation is CPU-only — skipping");
+                        continue;
+                    }
                     if let Some(s) = bench_wgpu(fractal, &vp, args.max_iter, args.runs) {
                         samples.push(s);
                     } else {
@@ -480,9 +670,13 @@ fn main() {
                     }
                 }
                 Backend::Hybrid => {
-                    // CPU-only baseline for comparison
-                    samples.push(bench_cpu(fractal, &vp, args.max_iter, args.runs));
-                    // Hybrid (CPU top half + wgpu bottom half)
+                    if args.perturbation {
+                        eprintln!("[hybrid] --perturbation is CPU-only — skipping");
+                        continue;
+                    }
+                    samples.push(bench_cpu(
+                        fractal, &vp, args.max_iter, args.runs, false,
+                    ));
                     if let Some(s) = bench_hybrid(fractal, &vp, args.max_iter, args.runs) {
                         samples.push(s);
                     } else {
@@ -493,7 +687,6 @@ fn main() {
         }
     }
 
-    // ── output ───────────────────────────────────────────────────────────────
     if args.json {
         print_json(&samples);
     } else {

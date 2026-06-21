@@ -278,6 +278,127 @@ fn ms_fill(
     }
 }
 
+/// Reference orbit for perturbation theory.
+///
+/// Stores the Mandelbrot orbit of the reference point C (the viewport center):
+/// Z_0=0, Z_1, ..., Z_len, where `len` iterations were computed before escape
+/// (or `len == max_iter` if the reference never escaped).
+/// The arrays hold `len + 1` valid entries indexed 0..=len.
+pub struct RefOrbit {
+    pub zr: Vec<f64>,
+    pub zi: Vec<f64>,
+    pub len: usize,
+}
+
+/// Compute the Mandelbrot reference orbit for C=(cr,ci) up to max_iter steps.
+pub fn compute_reference_orbit(cr: f64, ci: f64, max_iter: u32) -> RefOrbit {
+    let n = max_iter as usize;
+    let mut zr = vec![0.0f64; n + 1];
+    let mut zi = vec![0.0f64; n + 1];
+    for i in 0..n {
+        let r2 = zr[i] * zr[i];
+        let i2 = zi[i] * zi[i];
+        if r2 + i2 > ESCAPE_RADIUS_SQ {
+            return RefOrbit { zr, zi, len: i };
+        }
+        zr[i + 1] = r2 - i2 + cr;
+        zi[i + 1] = 2.0 * zr[i] * zi[i] + ci;
+    }
+    RefOrbit { zr, zi, len: n }
+}
+
+/// |ε|²/|Z|² ratio above which the linear approximation is no longer trusted.
+/// Equivalent to |ε| > 1e-3 × |Z| (0.1 % of the reference magnitude).
+const GLITCH_SQ: f64 = 1e-6;
+
+/// Approximate one Mandelbrot pixel via perturbation theory.
+///
+/// Recurrence: ε_{n+1} = 2·Z_n·ε_n + ε_n² + δ  (δ = c − C, ε_0 = 0)
+/// Escape check on z_{n+1} = Z_{n+1} + ε_{n+1}.
+/// Falls back to the exact scalar kernel on glitch or when the reference orbit ends early.
+#[inline]
+fn perturb_mandelbrot(
+    orbit: &RefOrbit,
+    dc_re: f64, dc_im: f64,   // δ = pixel c − reference C
+    full_re: f64, full_im: f64, // actual pixel coordinate for fallback
+    max_iter: u32,
+) -> f32 {
+    let mut er = 0.0f64;
+    let mut ei = 0.0f64;
+
+    for n in 0..orbit.len {
+        let zr = orbit.zr[n];
+        let zi = orbit.zi[n];
+
+        // ε_{n+1} = 2·Z_n·ε_n + ε_n² + δ
+        let two_zr = 2.0 * zr;
+        let two_zi = 2.0 * zi;
+        let new_er = two_zr * er - two_zi * ei + (er * er - ei * ei) + dc_re;
+        let new_ei = two_zr * ei + two_zi * er + (2.0 * er * ei)     + dc_im;
+        er = new_er;
+        ei = new_ei;
+
+        // z_{n+1} ≈ Z_{n+1} + ε_{n+1}
+        let az = orbit.zr[n + 1] + er;
+        let bz = orbit.zi[n + 1] + ei;
+        let zn_sq = az * az + bz * bz;
+
+        if zn_sq > ESCAPE_RADIUS_SQ {
+            return smooth_iter(n as u32 + 1, zn_sq, max_iter);
+        }
+
+        // Glitch: ε has grown too large relative to Z — approximation unreliable.
+        let ref_sq = orbit.zr[n + 1] * orbit.zr[n + 1] + orbit.zi[n + 1] * orbit.zi[n + 1];
+        if er * er + ei * ei > ref_sq * GLITCH_SQ {
+            return mandelbrot(full_re, full_im, max_iter);
+        }
+    }
+
+    if orbit.len >= max_iter as usize {
+        max_iter as f32
+    } else {
+        // Reference escaped before this pixel did — fall back to exact kernel.
+        mandelbrot(full_re, full_im, max_iter)
+    }
+}
+
+/// Render Mandelbrot using perturbation theory (all other fractals fall back to scalar).
+///
+/// Computes one reference orbit at the viewport center, then derives every pixel as a
+/// perturbation ε around that orbit.  Glitched pixels fall back to the full scalar kernel.
+pub fn render_perturbation(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
+    if fractal != FractalType::Mandelbrot {
+        return render(vp, fractal, julia_c, max_iter);
+    }
+
+    let w = vp.width as usize;
+    let h = vp.height as usize;
+
+    let aspect   = vp.width as f64 / vp.height as f64;
+    let half     = 2.0 / vp.zoom;
+    let re_step  = half * aspect * 2.0 / vp.width  as f64;
+    let im_step  = half * 2.0          / vp.height as f64;
+    let re_start = vp.center[0] + (0.5 / vp.width  as f64 - 0.5) * half * aspect * 2.0;
+    let im_start = vp.center[1] + (0.5 / vp.height as f64 - 0.5) * half * 2.0;
+    let center_re = vp.center[0];
+    let center_im = vp.center[1];
+
+    let orbit = compute_reference_orbit(center_re, center_im, max_iter);
+
+    let mut buf = vec![0.0f32; w * h];
+    buf.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let im    = im_start + y as f64 * im_step;
+        let dc_im = im - center_im;
+        for x in 0..w {
+            let re    = re_start + x as f64 * re_step;
+            let dc_re = re - center_re;
+            row[x] = perturb_mandelbrot(&orbit, dc_re, dc_im, re, im, max_iter);
+        }
+    });
+
+    buf
+}
+
 /// Single-pixel entry point exposed for benchmarking.
 pub fn pixel(fractal: FractalType, re: f64, im: f64, julia_c: [f64; 2], max_iter: u32) -> f32 {
     compute(fractal, re, im, julia_c, max_iter)
