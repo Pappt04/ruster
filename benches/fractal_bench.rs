@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use novafractal::fractal::{pixel, render, render_perturbation, render_perturbation_sa, compute_reference_orbit, compute_series_approx, flops_per_iter, FractalType};
+use novafractal::fractal::{pixel, render, render_perturbation, render_perturbation_sa, compute_reference_orbit, compute_reference_orbit_f128, compute_series_approx, flops_per_iter, FractalType};
 use novafractal::gpu::fractal_compute::FractalCompute;
 use novafractal::gpu::unifroms::{PerturbUniforms, Uniforms};
 use novafractal::gui::color::{colorize, ColorScheme};
@@ -529,17 +529,27 @@ fn bench_perturbation_render(c: &mut Criterion) {
 }
 
 // Cost of computing the reference orbit alone — O(max_iter), paid once per frame.
+// Compares f64 vs f128 orbit cost so the thesis can quote the overhead ratio.
 fn bench_perturbation_reference_orbit(c: &mut Criterion) {
     let mut group = c.benchmark_group("perturbation/reference_orbit");
 
     for &(_, label) in PERTURB_ZOOMS {
-        group.bench_function(label, |b| {
-            b.iter(|| compute_reference_orbit(
+        group.bench_function(
+            BenchmarkId::new("f64", label),
+            |b| b.iter(|| compute_reference_orbit(
                 black_box(PERTURB_CENTER[0]),
                 black_box(PERTURB_CENTER[1]),
                 black_box(MAX_ITER),
-            ))
-        });
+            )),
+        );
+        group.bench_function(
+            BenchmarkId::new("f128", label),
+            |b| b.iter(|| compute_reference_orbit_f128(
+                black_box(PERTURB_CENTER[0]),
+                black_box(PERTURB_CENTER[1]),
+                black_box(MAX_ITER),
+            )),
+        );
     }
     group.finish();
 }

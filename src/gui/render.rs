@@ -32,7 +32,7 @@ impl RenderWorker {
             #[cfg(feature = "cuda")]
             {
                 use crate::gpu::cuda::CudaFractal;
-                use crate::fractal::fractal::compute_reference_orbit;
+                use crate::fractal::fractal::{compute_reference_orbit, compute_reference_orbit_f128, F128_ZOOM_THRESHOLD};
                 use crate::fractal::fractal_type::FractalType;
                 let mut compute: Option<CudaFractal> = None;
                 let mut cached_size = (0u32, 0u32);
@@ -56,7 +56,11 @@ impl RenderWorker {
                     let cuda     = compute.as_mut().unwrap();
 
                     let buf = if req.use_perturbation && req.fractal == FractalType::Mandelbrot {
-                        let orbit = compute_reference_orbit(vp.center[0], vp.center[1], req.max_iter);
+                        let orbit = if vp.zoom > F128_ZOOM_THRESHOLD {
+                            compute_reference_orbit_f128(vp.center[0], vp.center[1], req.max_iter)
+                        } else {
+                            compute_reference_orbit(vp.center[0], vp.center[1], req.max_iter)
+                        };
                         cuda.render_perturbation(
                             &orbit,
                             re_start, im_start, re_step, im_step,
