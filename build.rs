@@ -16,6 +16,9 @@ fn compile_cuda() {
             "--ptx",
             "--gpu-architecture=sm_86", // Ampere (RTX 30xx)
             "-O3",
+            "--ftz=false",       // keep denormals (needed for smooth coloring accuracy)
+            "--prec-div=true",   // full precision division
+            "--fmad=true",       // allow fused multiply-add (free accuracy boost)
             "-o", ptx.to_str().unwrap(),
             cu,
         ])

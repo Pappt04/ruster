@@ -3,9 +3,12 @@
 
 #define ESCAPE_SQ 65536.0
 
+// Precomputed 1/ln(2) — avoids repeated log(2.0) calls in smooth_iter.
+__device__ static const double INV_LN2 = 1.4426950408889634;
+
 __device__ double smooth_iter(uint32_t i, double zn_sq) {
     double log_zn = log(zn_sq) * 0.5;
-    double nu     = log(log_zn / log(2.0)) / log(2.0);
+    double nu     = log(log_zn * INV_LN2) * INV_LN2;
     return (double)i + 1.0 - nu;
 }
 
@@ -15,24 +18,48 @@ __device__ float mandelbrot(double cr, double ci, uint32_t max_iter) {
     if ((cr + 1.0) * (cr + 1.0) + ci * ci < 0.0625) return (float)max_iter;
 
     double zr = 0.0, zi = 0.0;
+    double zr_b = 0.0, zi_b = 0.0;
+    uint32_t period = 0, check = 8;
+
     for (uint32_t i = 0; i < max_iter; i++) {
         double zr2 = zr * zr, zi2 = zi * zi;
         double zn_sq = zr2 + zi2;
         if (zn_sq > ESCAPE_SQ) return (float)smooth_iter(i, zn_sq);
         zi = 2.0 * zr * zi + ci;
         zr = zr2 - zi2 + cr;
+
+        double dr = zr - zr_b, di = zi - zi_b;
+        if (dr * dr + di * di < 1e-20) return (float)max_iter;
+        if (++period == check) {
+            period = 0;
+            check  = (check * 2 < 512) ? check * 2 : 512;
+            zr_b   = zr;
+            zi_b   = zi;
+        }
     }
     return (float)max_iter;
 }
 
 __device__ float julia(double zr0, double zi0, double cr, double ci, uint32_t max_iter) {
     double zr = zr0, zi = zi0;
+    double zr_b = zr0, zi_b = zi0;
+    uint32_t period = 0, check = 8;
+
     for (uint32_t i = 0; i < max_iter; i++) {
         double zr2 = zr * zr, zi2 = zi * zi;
         double zn_sq = zr2 + zi2;
         if (zn_sq > ESCAPE_SQ) return (float)smooth_iter(i, zn_sq);
         zi = 2.0 * zr * zi + ci;
         zr = zr2 - zi2 + cr;
+
+        double dr = zr - zr_b, di = zi - zi_b;
+        if (dr * dr + di * di < 1e-20) return (float)max_iter;
+        if (++period == check) {
+            period = 0;
+            check  = (check * 2 < 512) ? check * 2 : 512;
+            zr_b   = zr;
+            zi_b   = zi;
+        }
     }
     return (float)max_iter;
 }
@@ -79,10 +106,11 @@ __device__ float nova(double cr, double ci, uint32_t max_iter) {
 // orbit_re / orbit_im hold orbit_len+1 entries of the reference orbit Z_0..Z_{orbit_len}.
 // Each thread iterates ε_{n+1} = 2·Z_n·ε_n + ε_n² + δ and checks escape on
 // z_{n+1} = Z_{n+1} + ε_{n+1}.  Glitched pixels fall back to the scalar kernel.
-extern "C" __global__ void fractal_perturb_kernel(
-    float*          buf,
-    const double*   orbit_re,
-    const double*   orbit_im,
+extern "C" __global__ __launch_bounds__(256, 2)
+void fractal_perturb_kernel(
+    float* __restrict__         buf,
+    const double* __restrict__  orbit_re,
+    const double* __restrict__  orbit_im,
     uint32_t        orbit_len,
     double          re_start,
     double          im_start,
@@ -144,8 +172,9 @@ extern "C" __global__ void fractal_perturb_kernel(
     }
 }
 
-extern "C" __global__ void fractal_kernel(
-    float*   buf,
+extern "C" __global__ __launch_bounds__(256, 2)
+void fractal_kernel(
+    float* __restrict__ buf,
     double   re_start,
     double   im_start,
     double   re_step,
