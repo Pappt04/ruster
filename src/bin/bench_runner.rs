@@ -27,7 +27,7 @@
 ///   ./target/release/bench_runner --scaling --json > bench_results/scaling.json
 
 use std::time::{Duration, Instant};
-use novafractal::fractal::{render, render_perturbation, flops_per_iter, FractalType};
+use novafractal::fractal::{render, render_perturbation, render_perturbation_sa, compute_reference_orbit, compute_series_approx, flops_per_iter, FractalType};
 use novafractal::gui::viewport::Viewport;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -44,6 +44,7 @@ struct Args {
     zoom:               f64,
     center:             [f64; 2],
     perturbation:       bool,
+    use_sa:             bool,
     compare_perturb:    bool,
     perturb_sweep:      bool,
     scaling:            bool,
@@ -66,6 +67,7 @@ impl Default for Args {
             zoom:            1.0,
             center:          [-0.5, 0.0],
             perturbation:    false,
+            use_sa:          false,
             compare_perturb: false,
             perturb_sweep:   false,
             scaling:         false,
@@ -119,6 +121,7 @@ fn parse_args() -> Args {
                 a.center[1] = parts[1].trim().parse().unwrap();
             }
             "--perturbation"    => a.perturbation    = true,
+            "--sa"              => a.use_sa          = true,
             "--compare-perturb" => a.compare_perturb = true,
             "--perturb-sweep"   => a.perturb_sweep   = true,
             "--scaling" => a.scaling = true,
@@ -153,17 +156,21 @@ struct Sample {
 
 #[derive(Debug)]
 struct PerturbCompare {
-    zoom:               f64,
-    center:             [f64; 2],
-    scalar_median_ms:   f64,
-    perturb_median_ms:  f64,
-    scalar_mpix_per_sec: f64,
-    perturb_mpix_per_sec: f64,
-    speedup:            f64,
-    max_pixel_diff:     f32,
-    mean_pixel_diff:    f64,
-    pixels_above_0_01:  u64,
-    total_pixels:       u64,
+    zoom:                  f64,
+    center:                [f64; 2],
+    scalar_median_ms:      f64,
+    perturb_median_ms:     f64,
+    sa_median_ms:          f64,
+    scalar_mpix_per_sec:   f64,
+    perturb_mpix_per_sec:  f64,
+    sa_mpix_per_sec:       f64,
+    speedup_perturb:       f64,
+    speedup_sa:            f64,
+    sa_skip:               usize,
+    max_pixel_diff:        f32,
+    mean_pixel_diff:       f64,
+    pixels_above_0_01:     u64,
+    total_pixels:          u64,
 }
 
 fn cpu_render(
@@ -172,8 +179,11 @@ fn cpu_render(
     julia_c: [f64; 2],
     max_iter: u32,
     perturbation: bool,
+    use_sa: bool,
 ) -> Vec<f32> {
-    if perturbation {
+    if perturbation && use_sa {
+        render_perturbation_sa(vp, fractal, julia_c, max_iter)
+    } else if perturbation {
         render_perturbation(vp, fractal, julia_c, max_iter)
     } else {
         render(vp, fractal, julia_c, max_iter)
@@ -203,18 +213,19 @@ fn time_cpu_render(
     max_iter: u32,
     runs: usize,
     perturbation: bool,
+    use_sa: bool,
 ) -> (Sample, Vec<f32>) {
     let pixels = (vp.width * vp.height) as u64;
     let julia_c = [-0.4f64, 0.6];
 
-    let _ = cpu_render(vp, fractal, julia_c, max_iter, perturbation);
+    let _ = cpu_render(vp, fractal, julia_c, max_iter, perturbation, use_sa);
 
     let mut times: Vec<Duration> = Vec::with_capacity(runs);
     let mut last_buf = Vec::new();
 
     for _ in 0..runs {
         let t = Instant::now();
-        last_buf = cpu_render(vp, fractal, julia_c, max_iter, perturbation);
+        last_buf = cpu_render(vp, fractal, julia_c, max_iter, perturbation, use_sa);
         times.push(t.elapsed());
     }
 
@@ -225,7 +236,11 @@ fn time_cpu_render(
 
     times.sort();
     let med_s = times[runs / 2].as_secs_f64();
-    let backend = if perturbation { "cpu+perturb" } else { "cpu" };
+    let backend = match (perturbation, use_sa) {
+        (true,  true)  => "cpu+perturb+sa",
+        (true,  false) => "cpu+perturb",
+        (false, _)     => "cpu",
+    };
 
     let sample = Sample {
         fractal:        fractal.name(),
@@ -249,33 +264,48 @@ fn time_cpu_render(
 
 // ── CPU benchmarking ──────────────────────────────────────────────────────────
 
-fn bench_cpu(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize, perturbation: bool) -> Sample {
-    time_cpu_render(vp, fractal, max_iter, runs, perturbation).0
+fn bench_cpu(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize, perturbation: bool, use_sa: bool) -> Sample {
+    time_cpu_render(vp, fractal, max_iter, runs, perturbation, use_sa).0
+}
+
+fn sa_skip_count(vp: &Viewport, max_iter: u32) -> usize {
+    let aspect       = vp.width as f64 / vp.height as f64;
+    let half         = 2.0 / vp.zoom;
+    let delta_max_sq = (half * aspect) * (half * aspect) + half * half;
+    let orbit = compute_reference_orbit(vp.center[0], vp.center[1], max_iter);
+    compute_series_approx(&orbit, delta_max_sq).skip
 }
 
 fn bench_compare_perturb(vp: &Viewport, max_iter: u32, runs: usize) -> PerturbCompare {
     let fractal = FractalType::Mandelbrot;
-    let (scalar_sample, scalar_buf) = time_cpu_render(vp, fractal, max_iter, runs, false);
-    let (perturb_sample, perturb_buf) = time_cpu_render(vp, fractal, max_iter, runs, true);
-    let (max_diff, mean_diff, above) = pixel_diff_stats(&scalar_buf, &perturb_buf);
-    let speedup = if perturb_sample.median_ms > 0.0 {
+    let (scalar_sample,  scalar_buf)  = time_cpu_render(vp, fractal, max_iter, runs, false, false);
+    let (perturb_sample, perturb_buf) = time_cpu_render(vp, fractal, max_iter, runs, true,  false);
+    let (sa_sample,      sa_buf)      = time_cpu_render(vp, fractal, max_iter, runs, true,  true);
+    let (max_diff,  mean_diff,  above)  = pixel_diff_stats(&scalar_buf, &perturb_buf);
+    let (max_diff2, mean_diff2, above2) = pixel_diff_stats(&scalar_buf, &sa_buf);
+    let speedup_perturb = if perturb_sample.median_ms > 0.0 {
         scalar_sample.median_ms / perturb_sample.median_ms
-    } else {
-        0.0
-    };
+    } else { 0.0 };
+    let speedup_sa = if sa_sample.median_ms > 0.0 {
+        scalar_sample.median_ms / sa_sample.median_ms
+    } else { 0.0 };
 
     PerturbCompare {
-        zoom:                vp.zoom,
-        center:              vp.center,
-        scalar_median_ms:    scalar_sample.median_ms,
-        perturb_median_ms:   perturb_sample.median_ms,
-        scalar_mpix_per_sec: scalar_sample.mpix_per_sec,
-        perturb_mpix_per_sec: perturb_sample.mpix_per_sec,
-        speedup,
-        max_pixel_diff:      max_diff,
-        mean_pixel_diff:     mean_diff,
-        pixels_above_0_01:   above,
-        total_pixels:        scalar_buf.len() as u64,
+        zoom:                  vp.zoom,
+        center:                vp.center,
+        scalar_median_ms:      scalar_sample.median_ms,
+        perturb_median_ms:     perturb_sample.median_ms,
+        sa_median_ms:          sa_sample.median_ms,
+        scalar_mpix_per_sec:   scalar_sample.mpix_per_sec,
+        perturb_mpix_per_sec:  perturb_sample.mpix_per_sec,
+        sa_mpix_per_sec:       sa_sample.mpix_per_sec,
+        speedup_perturb,
+        speedup_sa,
+        sa_skip:               sa_skip_count(vp, max_iter),
+        max_pixel_diff:        max_diff.max(max_diff2),
+        mean_pixel_diff:       mean_diff.max(mean_diff2),
+        pixels_above_0_01:     above.max(above2),
+        total_pixels:          scalar_buf.len() as u64,
     }
 }
 
@@ -295,19 +325,20 @@ fn run_perturb_sweep(width: u32, height: u32, max_iter: u32, runs: usize) -> Vec
 }
 
 fn print_perturb_table(results: &[PerturbCompare]) {
-    println!("\n{:-<120}", "");
-    println!("{:<10} {:>12} {:>12} {:>10} {:>12} {:>12} {:>10} {:>10}",
-             "Zoom", "Scalar ms", "Perturb ms", "Speedup",
-             "Scalar Mpix/s", "Perturb Mpix/s", "Max diff", ">0.01 px");
-    println!("{:-<120}", "");
+    println!("\n{:-<140}", "");
+    println!("{:<8} {:>10} {:>10} {:>10} {:>8} {:>8} {:>6} {:>10} {:>10}",
+             "Zoom", "Scalar ms", "Perturb ms", "SA ms",
+             "Sp×perturb", "Sp×SA", "SAskip", "Max diff", ">0.01 px");
+    println!("{:-<140}", "");
     for r in results {
-        println!("{:<10.0e} {:>12.2} {:>12.2} {:>9.2}x {:>12.2} {:>12.2} {:>10.4} {:>10}",
-                 r.zoom, r.scalar_median_ms, r.perturb_median_ms, r.speedup,
-                 r.scalar_mpix_per_sec, r.perturb_mpix_per_sec,
+        println!("{:<8.0e} {:>10.2} {:>10.2} {:>10.2} {:>8.2}x {:>7.2}x {:>6} {:>10.4} {:>10}",
+                 r.zoom,
+                 r.scalar_median_ms, r.perturb_median_ms, r.sa_median_ms,
+                 r.speedup_perturb, r.speedup_sa, r.sa_skip,
                  r.max_pixel_diff, r.pixels_above_0_01);
     }
-    println!("{:-<120}", "");
-    println!("center = [{}, {}], mean pixel diff shown in JSON", PERTURB_SWEEP_CENTER[0], PERTURB_SWEEP_CENTER[1]);
+    println!("{:-<140}", "");
+    println!("center = [{}, {}]", PERTURB_SWEEP_CENTER[0], PERTURB_SWEEP_CENTER[1]);
 }
 
 fn print_perturb_json(results: &[PerturbCompare]) {
@@ -315,14 +346,16 @@ fn print_perturb_json(results: &[PerturbCompare]) {
     for (i, r) in results.iter().enumerate() {
         let comma = if i + 1 < results.len() { "," } else { "" };
         println!("  {{\"zoom\":{:.6e},\"center\":[{},{}],\
-                  \"scalar_median_ms\":{:.4},\"perturb_median_ms\":{:.4},\
-                  \"scalar_mpix_per_sec\":{:.4},\"perturb_mpix_per_sec\":{:.4},\
-                  \"speedup\":{:.4},\"max_pixel_diff\":{:.6},\"mean_pixel_diff\":{:.6},\
+                  \"scalar_median_ms\":{:.4},\"perturb_median_ms\":{:.4},\"sa_median_ms\":{:.4},\
+                  \"scalar_mpix_per_sec\":{:.4},\"perturb_mpix_per_sec\":{:.4},\"sa_mpix_per_sec\":{:.4},\
+                  \"speedup_perturb\":{:.4},\"speedup_sa\":{:.4},\"sa_skip\":{},\
+                  \"max_pixel_diff\":{:.6},\"mean_pixel_diff\":{:.6},\
                   \"pixels_above_0_01\":{},\"total_pixels\":{}}}{}",
                  r.zoom, r.center[0], r.center[1],
-                 r.scalar_median_ms, r.perturb_median_ms,
-                 r.scalar_mpix_per_sec, r.perturb_mpix_per_sec,
-                 r.speedup, r.max_pixel_diff, r.mean_pixel_diff,
+                 r.scalar_median_ms, r.perturb_median_ms, r.sa_median_ms,
+                 r.scalar_mpix_per_sec, r.perturb_mpix_per_sec, r.sa_mpix_per_sec,
+                 r.speedup_perturb, r.speedup_sa, r.sa_skip,
+                 r.max_pixel_diff, r.mean_pixel_diff,
                  r.pixels_above_0_01, r.total_pixels, comma);
     }
     println!("]");
@@ -596,7 +629,7 @@ fn main() {
         eprintln!("  runs       : {}", args.runs);
         eprintln!("  backend    : {:?}", args.backend);
         if args.perturbation {
-            eprintln!("  mode       : perturbation");
+            eprintln!("  mode       : {}", if args.use_sa { "perturbation+SA" } else { "perturbation" });
         }
         eprintln!("  rayon cpus : {}", rayon::current_num_threads());
         if !args.perturb_sweep && !args.compare_perturb {
@@ -644,7 +677,7 @@ fn main() {
 
             for &fractal in &args.fractals {
                 let mut s = pool.install(|| {
-                    bench_cpu(fractal, &vp, args.max_iter, args.runs, args.perturbation)
+                    bench_cpu(fractal, &vp, args.max_iter, args.runs, args.perturbation, args.use_sa)
                 });
                 s.threads = t;
                 samples.push(s);
@@ -655,7 +688,7 @@ fn main() {
             match args.backend {
                 Backend::Cpu => {
                     samples.push(bench_cpu(
-                        fractal, &vp, args.max_iter, args.runs, args.perturbation,
+                        fractal, &vp, args.max_iter, args.runs, args.perturbation, args.use_sa,
                     ));
                 }
                 Backend::Wgpu => {
@@ -675,7 +708,7 @@ fn main() {
                         continue;
                     }
                     samples.push(bench_cpu(
-                        fractal, &vp, args.max_iter, args.runs, false,
+                        fractal, &vp, args.max_iter, args.runs, false, false,
                     ));
                     if let Some(s) = bench_hybrid(fractal, &vp, args.max_iter, args.runs) {
                         samples.push(s);

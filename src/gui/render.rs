@@ -14,6 +14,7 @@ pub struct RenderRequest {
     pub scheme: ColorScheme,
     pub use_ms: bool,
     pub use_perturbation: bool,
+    pub use_sa: bool,
 }
 
 pub struct RenderWorker {
@@ -65,7 +66,7 @@ impl RenderWorker {
 
             #[cfg(not(feature = "cuda"))]
             {
-                use crate::fractal::fractal::{render as cpu_render, render_mariani_silver, render_perturbation};
+                use crate::fractal::fractal::{render as cpu_render, render_mariani_silver, render_perturbation, render_perturbation_sa};
                 #[cfg(feature = "simd")]
                 use crate::fractal::fractal::{render_simd, render_simd_f32, F32_PRECISION_THRESHOLD};
                 #[cfg(feature = "simd")]
@@ -74,7 +75,9 @@ impl RenderWorker {
                 while let Ok(mut req) = req_rx.recv() {
                     while let Ok(newer) = req_rx.try_recv() { req = newer; }
 
-                    let buf = if req.use_perturbation {
+                    let buf = if req.use_perturbation && req.use_sa {
+                        render_perturbation_sa(&req.vp, req.fractal, req.julia_c, req.max_iter)
+                    } else if req.use_perturbation {
                         render_perturbation(&req.vp, req.fractal, req.julia_c, req.max_iter)
                     } else if req.use_ms {
                         render_mariani_silver(&req.vp, req.fractal, req.julia_c, req.max_iter)

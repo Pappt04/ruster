@@ -399,6 +399,181 @@ pub fn render_perturbation(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2
     buf
 }
 
+// ── Series Approximation (SA) ─────────────────────────────────────────────────
+//
+// Precomputes three complex power-series coefficients (A, B, C) along the
+// reference orbit so that, for any pixel offset δ = c − C:
+//
+//   ε_n ≈ A_n·δ + B_n·δ² + C_n·δ³
+//
+// Recurrences (derived by expanding the perturbation recurrence order by order):
+//
+//   A_{n+1} = 2·Z_n·A_n + 1
+//   B_{n+1} = 2·Z_n·B_n + A_n²
+//   C_{n+1} = 2·Z_n·C_n + 2·A_n·B_n
+//
+// We advance until the cubic term exceeds SA_THRESHOLD × the linear term for the
+// worst-case (corner) pixel.  That iteration becomes the "skip" — all pixels
+// jump directly to ε_skip via a cheap polynomial evaluation and then continue
+// with the ordinary perturbation loop.
+
+/// SA coefficients at the skip point, plus the skip count itself.
+pub struct SeriesApprox {
+    /// Iterations that can be skipped for the entire frame.
+    pub skip: usize,
+    /// A coefficient (complex): linear term.
+    pub ar: f64, pub ai: f64,
+    /// B coefficient (complex): quadratic term.
+    pub br: f64, pub bi: f64,
+    /// C coefficient (complex): cubic term.
+    pub cr: f64, pub ci: f64,
+}
+
+/// |C·δ³| / |A·δ| ratio above which the 3-term SA is no longer trusted.
+const SA_THRESHOLD: f64 = 1e-6;
+
+/// Walk the reference orbit accumulating SA coefficients; return the largest
+/// safe skip and the coefficient values at that point.
+///
+/// `delta_max_sq` is |δ_corner|² — the squared distance from center to the
+/// corner pixel.  Use it as a conservative bound on all pixel offsets.
+pub fn compute_series_approx(orbit: &RefOrbit, delta_max_sq: f64) -> SeriesApprox {
+    let (mut ar, mut ai) = (0.0f64, 0.0f64);
+    let (mut br, mut bi) = (0.0f64, 0.0f64);
+    let (mut cr, mut ci) = (0.0f64, 0.0f64);
+    let mut skip = 0usize;
+
+    for n in 0..orbit.len {
+        let zr = orbit.zr[n];
+        let zi = orbit.zi[n];
+        let two_zr = 2.0 * zr;
+        let two_zi = 2.0 * zi;
+
+        // A_n² and 2·A_n·B_n in complex arithmetic (needed for B and C updates).
+        let a_sq_r   = ar * ar - ai * ai;
+        let a_sq_i   = 2.0 * ar * ai;
+        let two_ab_r = 2.0 * (ar * br - ai * bi);
+        let two_ab_i = 2.0 * (ar * bi + ai * br);
+
+        // A_{n+1} = 2·Z_n·A_n + 1
+        let new_ar = two_zr * ar - two_zi * ai + 1.0;
+        let new_ai = two_zr * ai + two_zi * ar;
+        // B_{n+1} = 2·Z_n·B_n + A_n²
+        let new_br = two_zr * br - two_zi * bi + a_sq_r;
+        let new_bi = two_zr * bi + two_zi * br + a_sq_i;
+        // C_{n+1} = 2·Z_n·C_n + 2·A_n·B_n
+        let new_cr = two_zr * cr - two_zi * ci + two_ab_r;
+        let new_ci = two_zr * ci + two_zi * cr + two_ab_i;
+
+        ar = new_ar; ai = new_ai;
+        br = new_br; bi = new_bi;
+        cr = new_cr; ci = new_ci;
+
+        // Accuracy guard: stop when |C·δ³| ≥ SA_THRESHOLD × |A·δ| for the corner pixel.
+        // Squared: |C|²·δ⁴ ≥ SA_THRESHOLD²·|A|²·δ²  →  |C|²·delta_max_sq ≥ SA_THRESHOLD²·|A|²
+        let a_mag_sq = ar * ar + ai * ai;
+        let c_mag_sq = cr * cr + ci * ci;
+        if c_mag_sq * delta_max_sq * delta_max_sq > SA_THRESHOLD * SA_THRESHOLD * a_mag_sq {
+            break;
+        }
+        skip = n + 1;
+    }
+
+    SeriesApprox { skip, ar, ai, br, bi, cr, ci }
+}
+
+/// Evaluate the SA polynomial and run perturbation from the skip point.
+#[inline]
+fn perturb_mandelbrot_sa(
+    orbit: &RefOrbit,
+    sa:    &SeriesApprox,
+    dc_re: f64, dc_im: f64,
+    full_re: f64, full_im: f64,
+    max_iter: u32,
+) -> f32 {
+    // δ², δ³ (complex powers of the pixel offset).
+    let d2r = dc_re * dc_re - dc_im * dc_im;
+    let d2i = 2.0 * dc_re * dc_im;
+    let d3r = dc_re * d2r - dc_im * d2i;
+    let d3i = dc_re * d2i + dc_im * d2r;
+
+    // ε_skip = A·δ + B·δ² + C·δ³  (complex multiplications).
+    let mut er = sa.ar * dc_re - sa.ai * dc_im
+               + sa.br * d2r   - sa.bi * d2i
+               + sa.cr * d3r   - sa.ci * d3i;
+    let mut ei = sa.ar * dc_im + sa.ai * dc_re
+               + sa.br * d2i   + sa.bi * d2r
+               + sa.cr * d3i   + sa.ci * d3r;
+
+    // Continue with the standard perturbation loop from iteration `skip`.
+    for n in sa.skip..orbit.len {
+        let zr = orbit.zr[n];
+        let zi = orbit.zi[n];
+        let two_zr = 2.0 * zr;
+        let two_zi = 2.0 * zi;
+        let new_er = two_zr * er - two_zi * ei + (er * er - ei * ei) + dc_re;
+        let new_ei = two_zr * ei + two_zi * er + (2.0 * er * ei)     + dc_im;
+        er = new_er;
+        ei = new_ei;
+
+        let az = orbit.zr[n + 1] + er;
+        let bz = orbit.zi[n + 1] + ei;
+        let zn_sq = az * az + bz * bz;
+        if zn_sq > ESCAPE_RADIUS_SQ {
+            return smooth_iter(n as u32 + 1, zn_sq, max_iter);
+        }
+
+        let ref_sq = orbit.zr[n + 1] * orbit.zr[n + 1] + orbit.zi[n + 1] * orbit.zi[n + 1];
+        if er * er + ei * ei > ref_sq * GLITCH_SQ {
+            return mandelbrot(full_re, full_im, max_iter);
+        }
+    }
+
+    if orbit.len >= max_iter as usize { max_iter as f32 } else { mandelbrot(full_re, full_im, max_iter) }
+}
+
+/// Render Mandelbrot with perturbation theory + series approximation.
+///
+/// Builds the reference orbit and SA coefficients once per frame, then for each
+/// pixel evaluates a 3-term polynomial to skip the first `sa.skip` iterations
+/// and continues with the perturbation recurrence from there.
+pub fn render_perturbation_sa(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
+    if fractal != FractalType::Mandelbrot {
+        return render(vp, fractal, julia_c, max_iter);
+    }
+
+    let w = vp.width  as usize;
+    let h = vp.height as usize;
+
+    let aspect    = vp.width  as f64 / vp.height as f64;
+    let half      = 2.0 / vp.zoom;
+    let re_step   = half * aspect * 2.0 / vp.width  as f64;
+    let im_step   = half * 2.0          / vp.height as f64;
+    let re_start  = vp.center[0] + (0.5 / vp.width  as f64 - 0.5) * half * aspect * 2.0;
+    let im_start  = vp.center[1] + (0.5 / vp.height as f64 - 0.5) * half * 2.0;
+    let center_re = vp.center[0];
+    let center_im = vp.center[1];
+
+    // Conservative corner-pixel |δ|² used for the SA validity bound.
+    let delta_max_sq = (half * aspect) * (half * aspect) + half * half;
+
+    let orbit = compute_reference_orbit(center_re, center_im, max_iter);
+    let sa    = compute_series_approx(&orbit, delta_max_sq);
+
+    let mut buf = vec![0.0f32; w * h];
+    buf.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let im    = im_start + y as f64 * im_step;
+        let dc_im = im - center_im;
+        for x in 0..w {
+            let re    = re_start + x as f64 * re_step;
+            let dc_re = re - center_re;
+            row[x] = perturb_mandelbrot_sa(&orbit, &sa, dc_re, dc_im, re, im, max_iter);
+        }
+    });
+
+    buf
+}
+
 /// Single-pixel entry point exposed for benchmarking.
 pub fn pixel(fractal: FractalType, re: f64, im: f64, julia_c: [f64; 2], max_iter: u32) -> f32 {
     compute(fractal, re, im, julia_c, max_iter)
@@ -429,8 +604,9 @@ fn smooth_iter(iter: u32, zn_sq: f64, max_iter: u32) -> f32 {
     if iter >= max_iter {
         return max_iter as f32;
     }
+    const INV_LN2: f64 = std::f64::consts::LOG2_E;
     let log_zn = zn_sq.ln() / 2.0;
-    let nu = (log_zn / std::f64::consts::LN_2).ln() / std::f64::consts::LN_2;
+    let nu = (log_zn * INV_LN2).ln() * INV_LN2;
     (iter as f64 + 1.0 - nu) as f32
 }
 
@@ -577,8 +753,9 @@ fn nova(cr: f64, ci: f64, max_iter: u32) -> f32 {
 
 fn smooth_iter_f32(iter: u32, zn_sq: f32, max_iter: u32) -> f32 {
     if iter >= max_iter { return max_iter as f32; }
+    const INV_LN2: f32 = std::f32::consts::LOG2_E;
     let log_zn = zn_sq.ln() / 2.0;
-    let nu = (log_zn / std::f32::consts::LN_2).ln() / std::f32::consts::LN_2;
+    let nu = (log_zn * INV_LN2).ln() * INV_LN2;
     iter as f32 + 1.0 - nu
 }
 

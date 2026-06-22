@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use novafractal::fractal::{pixel, render, render_perturbation, compute_reference_orbit, flops_per_iter, FractalType};
+use novafractal::fractal::{pixel, render, render_perturbation, render_perturbation_sa, compute_reference_orbit, compute_series_approx, flops_per_iter, FractalType};
 use novafractal::gpu::fractal_compute::FractalCompute;
 use novafractal::gpu::unifroms::Uniforms;
 use novafractal::gui::color::{colorize, ColorScheme};
@@ -482,12 +482,16 @@ fn bench_perturbation_render(c: &mut Criterion) {
             &vp,
             |b, vp| b.iter(|| render_perturbation(black_box(vp), FractalType::Mandelbrot, JULIA_C, MAX_ITER)),
         );
+        group.bench_with_input(
+            BenchmarkId::new("perturb_sa", label),
+            &vp,
+            |b, vp| b.iter(|| render_perturbation_sa(black_box(vp), FractalType::Mandelbrot, JULIA_C, MAX_ITER)),
+        );
     }
     group.finish();
 }
 
-// Cost of computing the reference orbit alone, amortized over all pixels.
-// This is O(max_iter) and runs once per frame — should be negligible vs render.
+// Cost of computing the reference orbit alone — O(max_iter), paid once per frame.
 fn bench_perturbation_reference_orbit(c: &mut Criterion) {
     let mut group = c.benchmark_group("perturbation/reference_orbit");
 
@@ -498,6 +502,30 @@ fn bench_perturbation_reference_orbit(c: &mut Criterion) {
                 black_box(PERTURB_CENTER[1]),
                 black_box(MAX_ITER),
             ))
+        });
+    }
+    group.finish();
+}
+
+// Cost of computing SA coefficients on top of the reference orbit, and the
+// resulting skip count at each zoom level (printed to stderr for inspection).
+fn bench_series_approx(c: &mut Criterion) {
+    let mut group = c.benchmark_group("perturbation/series_approx");
+
+    for &(zoom, label) in PERTURB_ZOOMS {
+        let aspect       = 1920.0f64 / 1080.0;
+        let half         = 2.0 / zoom;
+        let delta_max_sq = (half * aspect) * (half * aspect) + half * half;
+        let orbit = compute_reference_orbit(PERTURB_CENTER[0], PERTURB_CENTER[1], MAX_ITER);
+
+        // Print skip count so the thesis can quote concrete numbers.
+        let sa = compute_series_approx(&orbit, delta_max_sq);
+        eprintln!("[SA skip] zoom={zoom:.0e}  skip={}/{}  ({:.1}%)",
+            sa.skip, MAX_ITER,
+            100.0 * sa.skip as f64 / MAX_ITER as f64);
+
+        group.bench_function(label, |b| {
+            b.iter(|| compute_series_approx(black_box(&orbit), black_box(delta_max_sq)))
         });
     }
     group.finish();
@@ -543,9 +571,10 @@ criterion_group! {
         bench_colorize,
         bench_cpu_pipeline,
         bench_thread_scaling,
-        // Perturbation theory (scalar vs perturb × zoom sweep)
+        // Perturbation theory (scalar vs perturb vs perturb+SA × zoom sweep)
         bench_perturbation_render,
         bench_perturbation_reference_orbit,
+        bench_series_approx,
         // wgpu GPU
         bench_wgpu_render,
         bench_wgpu_pipeline,

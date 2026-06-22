@@ -27,6 +27,7 @@ pub struct FractalApp {
 
     use_ms: bool,
     use_perturbation: bool,
+    use_sa: bool,
 }
 
 impl Default for FractalApp {
@@ -44,6 +45,7 @@ impl Default for FractalApp {
             auto_iter: true,
             use_ms: false,
             use_perturbation: false,
+            use_sa: false,
         }
     }
 }
@@ -63,6 +65,7 @@ impl FractalApp {
             scheme: self.scheme,
             use_ms: self.use_ms,
             use_perturbation: self.use_perturbation,
+            use_sa: self.use_sa,
         });
         self.needs_render = false;
     }
@@ -207,13 +210,22 @@ impl FractalApp {
                     self.needs_render = true;
                 }
 
-                // Perturbation theory (Mandelbrot only)
+                // Perturbation theory + series approximation (Mandelbrot only)
                 if self.fractal == FractalType::Mandelbrot {
                     if ui.checkbox(&mut self.use_perturbation, "Perturbation theory").changed() {
+                        if !self.use_perturbation { self.use_sa = false; }
                         self.needs_render = true;
+                    }
+                    if self.use_perturbation {
+                        ui.indent("sa_indent", |ui| {
+                            if ui.checkbox(&mut self.use_sa, "Series approx (SA)").changed() {
+                                self.needs_render = true;
+                            }
+                        });
                     }
                 } else {
                     self.use_perturbation = false;
+                    self.use_sa = false;
                 }
 
                 ui.add_space(4.0);
