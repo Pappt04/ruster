@@ -215,6 +215,43 @@ fn bench_thread_scaling(c: &mut Criterion) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// SIMD benchmarks  (only compiled and run with --features simd)
+// Compares scalar render() vs f64x4 render_simd() vs f32x8 render_simd_f32()
+// for Mandelbrot and Julia at three resolutions.
+// Note: render_simd_f32 is only accurate below zoom ~1e6; all runs use zoom=1.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const SIMD_FRACTALS: &[FractalType] = &[FractalType::Mandelbrot, FractalType::Julia];
+
+fn bench_simd_render(c: &mut Criterion) {
+    use novafractal::fractal::{render_simd, render_simd_f32};
+
+    let resolutions: &[(u32, u32, &str)] = &[
+        (800,  600,  "800×600"),
+        (1920, 1080, "1920×1080"),
+        (3840, 2160, "3840×2160"),
+    ];
+
+    for &fractal in SIMD_FRACTALS {
+        let mut group = c.benchmark_group(format!("simd/render/{}", fractal.name()));
+        group.sample_size(10);
+
+        for &(w, h, label) in resolutions {
+            let vp = vp(w, h);
+            group.throughput(Throughput::Elements(w as u64 * h as u64));
+
+            group.bench_with_input(BenchmarkId::new("scalar", label), &vp,
+                |b, vp| b.iter(|| render(          black_box(vp), fractal, JULIA_C, MAX_ITER)));
+            group.bench_with_input(BenchmarkId::new("f64x4",  label), &vp,
+                |b, vp| b.iter(|| render_simd(     black_box(vp), fractal, JULIA_C, MAX_ITER)));
+            group.bench_with_input(BenchmarkId::new("f32x8",  label), &vp,
+                |b, vp| b.iter(|| render_simd_f32( black_box(vp), fractal, JULIA_C, MAX_ITER)));
+        }
+        group.finish();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // wgpu (GPU) benchmarks
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -571,6 +608,8 @@ criterion_group! {
         bench_colorize,
         bench_cpu_pipeline,
         bench_thread_scaling,
+        // SIMD  (no-op stub when feature is off)
+        bench_simd_render,
         // Perturbation theory (scalar vs perturb vs perturb+SA × zoom sweep)
         bench_perturbation_render,
         bench_perturbation_reference_orbit,

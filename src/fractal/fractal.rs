@@ -35,7 +35,6 @@ pub fn render(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: 
     buf
 }
 
-#[cfg(feature = "simd")]
 pub fn render_simd(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
     use wide::f64x4;
 
@@ -92,7 +91,6 @@ pub fn render_simd(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_i
 /// 8-wide f32 SIMD path — 2× more pixels per instruction than f64x4.
 /// Coordinate values are computed in f64 then narrowed to f32 per lane so
 /// the initial pixel mapping stays accurate before the cast.
-#[cfg(feature = "simd")]
 pub fn render_simd_f32(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
     use wide::f32x8;
 
@@ -759,7 +757,6 @@ fn smooth_iter_f32(iter: u32, zn_sq: f32, max_iter: u32) -> f32 {
     iter as f32 + 1.0 - nu
 }
 
-#[cfg(feature = "simd")]
 fn mandelbrot_x8(cr: wide::f32x8, ci: wide::f32x8, max_iter: u32) -> [f32; 8] {
     use wide::{f32x8, CmpGt};
 
@@ -845,7 +842,6 @@ fn mandelbrot_x8(cr: wide::f32x8, ci: wide::f32x8, max_iter: u32) -> [f32; 8] {
     out
 }
 
-#[cfg(feature = "simd")]
 fn julia_x8(zr0: wide::f32x8, zi0: wide::f32x8, cr: wide::f32x8, ci: wide::f32x8, max_iter: u32) -> [f32; 8] {
     use wide::{f32x8, CmpGt};
 
@@ -893,7 +889,6 @@ fn julia_x8(zr0: wide::f32x8, zi0: wide::f32x8, cr: wide::f32x8, ci: wide::f32x8
     out
 }
 
-#[cfg(feature = "simd")]
 fn mandelbrot_x4(cr: wide::f64x4, ci: wide::f64x4, max_iter: u32) -> [f32; 4] {
     use wide::{f64x4, CmpGt};
 
@@ -980,7 +975,6 @@ fn mandelbrot_x4(cr: wide::f64x4, ci: wide::f64x4, max_iter: u32) -> [f32; 4] {
     out
 }
 
-#[cfg(feature = "simd")]
 fn julia_x4(zr0: wide::f64x4, zi0: wide::f64x4, cr: wide::f64x4, ci: wide::f64x4, max_iter: u32) -> [f32; 4] {
     use wide::{f64x4, CmpGt};
 
