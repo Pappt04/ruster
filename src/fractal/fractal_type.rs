@@ -19,6 +19,15 @@ impl FractalType {
         }
     }
 
+    pub const fn as_u32(self) -> u32 {
+        match self {
+            Self::Mandelbrot => 0,
+            Self::Julia      => 1,
+            Self::Newton     => 2,
+            Self::Nova       => 3,
+        }
+    }
+
     pub const fn default_center(self) -> [f64; 2] {
         match self {
             Self::Mandelbrot => [-0.5, 0.0],

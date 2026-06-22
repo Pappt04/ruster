@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use novafractal::fractal::{pixel, render, render_perturbation, render_perturbation_sa, compute_reference_orbit, compute_series_approx, flops_per_iter, FractalType};
 use novafractal::gpu::fractal_compute::FractalCompute;
-use novafractal::gpu::unifroms::Uniforms;
+use novafractal::gpu::unifroms::{PerturbUniforms, Uniforms};
 use novafractal::gui::color::{colorize, ColorScheme};
 use novafractal::gui::viewport::Viewport;
 use rayon::ThreadPoolBuilder;
@@ -568,6 +568,119 @@ fn bench_series_approx(c: &mut Criterion) {
     group.finish();
 }
 
+// ── viewport → PerturbUniforms ────────────────────────────────────────────────
+
+fn perturb_uniforms(vp: &Viewport, orbit_len: usize) -> PerturbUniforms {
+    let aspect = vp.width as f64 / vp.height as f64;
+    let half   = 2.0 / vp.zoom;
+    PerturbUniforms {
+        re_start:  (vp.center[0] + (0.5 / vp.width  as f64 - 0.5) * half * aspect * 2.0) as f32,
+        im_start:  (vp.center[1] + (0.5 / vp.height as f64 - 0.5) * half * 2.0) as f32,
+        re_step:   (half * aspect * 2.0 / vp.width  as f64) as f32,
+        im_step:   (half * 2.0          / vp.height as f64) as f32,
+        ref_re:    vp.center[0] as f32,
+        ref_im:    vp.center[1] as f32,
+        orbit_len: orbit_len as u32,
+        max_iter:  MAX_ITER,
+        width:     vp.width,
+        height:    vp.height,
+        _pad:      [0; 2],
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// wgpu perturbation benchmarks
+// Compares gpu scalar vs gpu perturbation at the same zoom sweep used for CPU.
+// The orbit is computed on CPU, cast f64→f32, then uploaded each iteration.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn bench_wgpu_perturbation(c: &mut Criterion) {
+    let Some(g) = gpu() else {
+        eprintln!("[wgpu] no GPU — skipping wgpu/perturbation");
+        return;
+    };
+
+    let mut group = c.benchmark_group("wgpu/perturbation/Mandelbrot_1080p");
+    group.throughput(Throughput::Elements(1920 * 1080));
+    group.sample_size(10);
+
+    for &(zoom, label) in PERTURB_ZOOMS {
+        let vp      = Viewport { center: PERTURB_CENTER, zoom, width: 1920, height: 1080 };
+        let compute = FractalCompute::new(&g.device, 1920, 1080);
+        let uni     = uniforms(&vp, FractalType::Mandelbrot);
+
+        // Pre-compute orbit outside the timed loop.
+        let orbit      = compute_reference_orbit(PERTURB_CENTER[0], PERTURB_CENTER[1], MAX_ITER);
+        let orbit_re_f: Vec<f32> = orbit.zr[..=orbit.len].iter().map(|&v| v as f32).collect();
+        let orbit_im_f: Vec<f32> = orbit.zi[..=orbit.len].iter().map(|&v| v as f32).collect();
+        let perturb_uni = perturb_uniforms(&vp, orbit.len);
+
+        group.bench_with_input(
+            BenchmarkId::new("scalar", label), &uni,
+            |b, &uni| b.iter(|| compute.render(&g.device, &g.queue, black_box(uni))),
+        );
+        group.bench_function(
+            BenchmarkId::new("perturb", label),
+            |b| b.iter(|| compute.render_perturbation(
+                &g.device, &g.queue,
+                black_box(perturb_uni),
+                black_box(&orbit_re_f),
+                black_box(&orbit_im_f),
+            )),
+        );
+    }
+    group.finish();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CUDA perturbation benchmarks
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "cuda")]
+fn bench_cuda_perturbation(c: &mut Criterion) {
+    use novafractal::gpu::cuda::CudaFractal;
+
+    let mut group = c.benchmark_group("cuda/perturbation/Mandelbrot_1080p");
+    group.throughput(Throughput::Elements(1920 * 1080));
+    group.sample_size(10);
+
+    for &(zoom, label) in PERTURB_ZOOMS {
+        let vp      = Viewport { center: PERTURB_CENTER, zoom, width: 1920, height: 1080 };
+        let aspect  = 1920.0f64 / 1080.0;
+        let half    = 2.0 / zoom;
+        let re_start = vp.center[0] + (0.5 / 1920.0 - 0.5) * half * aspect * 2.0;
+        let im_start = vp.center[1] + (0.5 / 1080.0 - 0.5) * half * 2.0;
+        let re_step  = half * aspect * 2.0 / 1920.0;
+        let im_step  = half * 2.0 / 1080.0;
+
+        let orbit = compute_reference_orbit(PERTURB_CENTER[0], PERTURB_CENTER[1], MAX_ITER);
+
+        let mut cuda = CudaFractal::new(1920, 1080);
+
+        group.bench_function(
+            BenchmarkId::new("scalar", label),
+            |b| b.iter(|| cuda.render(
+                black_box(re_start), black_box(im_start),
+                black_box(re_step),  black_box(im_step),
+                JULIA_C[0], JULIA_C[1], MAX_ITER, 0, // 0 = Mandelbrot
+            )),
+        );
+        group.bench_function(
+            BenchmarkId::new("perturb", label),
+            |b| b.iter(|| cuda.render_perturbation(
+                black_box(&orbit),
+                black_box(re_start), black_box(im_start),
+                black_box(re_step),  black_box(im_step),
+                MAX_ITER,
+            )),
+        );
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "cuda"))]
+fn bench_cuda_perturbation(c: &mut Criterion) { let _ = c; }
+
 // ── startup info ──────────────────────────────────────────────────────────────
 
 fn print_header() {
@@ -617,11 +730,13 @@ criterion_group! {
         // wgpu GPU
         bench_wgpu_render,
         bench_wgpu_pipeline,
+        bench_wgpu_perturbation,
         // Hybrid CPU + wgpu
         bench_hybrid_cpu_wgpu,
         // CUDA GPU  (no-op stubs when feature is off)
         bench_cuda_render,
         bench_cuda_pipeline,
+        bench_cuda_perturbation,
         // Hybrid CPU + CUDA
         bench_hybrid_cpu_cuda
 }

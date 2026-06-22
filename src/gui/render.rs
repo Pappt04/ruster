@@ -32,6 +32,8 @@ impl RenderWorker {
             #[cfg(feature = "cuda")]
             {
                 use crate::gpu::cuda::CudaFractal;
+                use crate::fractal::fractal::compute_reference_orbit;
+                use crate::fractal::fractal_type::FractalType;
                 let mut compute: Option<CudaFractal> = None;
                 let mut cached_size = (0u32, 0u32);
 
@@ -44,19 +46,30 @@ impl RenderWorker {
                         cached_size = sz;
                     }
 
-                    let vp = &req.vp;
+                    let vp     = &req.vp;
                     let aspect = vp.width as f64 / vp.height as f64;
                     let half   = 2.0 / vp.zoom;
+                    let re_start = vp.center[0] + (0.5 / vp.width  as f64 - 0.5) * half * aspect * 2.0;
+                    let im_start = vp.center[1] + (0.5 / vp.height as f64 - 0.5) * half * 2.0;
+                    let re_step  = half * aspect * 2.0 / vp.width  as f64;
+                    let im_step  = half * 2.0          / vp.height as f64;
+                    let cuda     = compute.as_mut().unwrap();
 
-                    let buf = compute.as_mut().unwrap().render(
-                        vp.center[0] + (0.5 / vp.width  as f64 - 0.5) * half * aspect * 2.0,
-                        vp.center[1] + (0.5 / vp.height as f64 - 0.5) * half * 2.0,
-                        half * aspect * 2.0 / vp.width  as f64,
-                        half * 2.0          / vp.height as f64,
-                        req.julia_c[0], req.julia_c[1],
-                        req.max_iter,
-                        req.fractal.as_u32(),
-                    );
+                    let buf = if req.use_perturbation && req.fractal == FractalType::Mandelbrot {
+                        let orbit = compute_reference_orbit(vp.center[0], vp.center[1], req.max_iter);
+                        cuda.render_perturbation(
+                            &orbit,
+                            re_start, im_start, re_step, im_step,
+                            req.max_iter,
+                        )
+                    } else {
+                        cuda.render(
+                            re_start, im_start, re_step, im_step,
+                            req.julia_c[0], req.julia_c[1],
+                            req.max_iter,
+                            req.fractal.as_u32(),
+                        )
+                    };
 
                     let pixels = colorize(&buf, req.max_iter, req.scheme);
                     let image  = ColorImage::new([sz.0 as usize, sz.1 as usize], pixels);

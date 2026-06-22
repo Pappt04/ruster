@@ -75,6 +75,75 @@ __device__ float nova(double cr, double ci, uint32_t max_iter) {
     return (float)max_iter;
 }
 
+// Perturbation-theory kernel for Mandelbrot.
+// orbit_re / orbit_im hold orbit_len+1 entries of the reference orbit Z_0..Z_{orbit_len}.
+// Each thread iterates ε_{n+1} = 2·Z_n·ε_n + ε_n² + δ and checks escape on
+// z_{n+1} = Z_{n+1} + ε_{n+1}.  Glitched pixels fall back to the scalar kernel.
+extern "C" __global__ void fractal_perturb_kernel(
+    float*          buf,
+    const double*   orbit_re,
+    const double*   orbit_im,
+    uint32_t        orbit_len,
+    double          re_start,
+    double          im_start,
+    double          re_step,
+    double          im_step,
+    uint32_t        max_iter,
+    uint32_t        width,
+    uint32_t        height
+) {
+    uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    double re    = re_start + (double)x * re_step;
+    double im    = im_start + (double)y * im_step;
+    // Reference center = viewport center, recoverable from grid params.
+    double ref_re = re_start + (width  - 1.0) * 0.5 * re_step;
+    double ref_im = im_start + (height - 1.0) * 0.5 * im_step;
+    double dc_re = re - ref_re;
+    double dc_im = im - ref_im;
+
+    double er = 0.0, ei = 0.0;
+
+    for (uint32_t n = 0; n < orbit_len; n++) {
+        double zr = orbit_re[n];
+        double zi = orbit_im[n];
+
+        // ε_{n+1} = 2·Z_n·ε_n + ε_n² + δ
+        double new_er = 2.0*zr*er - 2.0*zi*ei + er*er - ei*ei + dc_re;
+        double new_ei = 2.0*zr*ei + 2.0*zi*er + 2.0*er*ei    + dc_im;
+        er = new_er;
+        ei = new_ei;
+
+        // z_{n+1} = Z_{n+1} + ε_{n+1}
+        double zr1   = orbit_re[n + 1];
+        double zi1   = orbit_im[n + 1];
+        double az    = zr1 + er;
+        double bz    = zi1 + ei;
+        double zn_sq = az*az + bz*bz;
+
+        if (zn_sq > ESCAPE_SQ) {
+            buf[y * width + x] = (float)smooth_iter(n + 1, zn_sq);
+            return;
+        }
+
+        // Glitch: |ε|² > 1e-6 · |Z|²  → scalar fallback
+        double ref_sq = zr1*zr1 + zi1*zi1;
+        if (er*er + ei*ei > ref_sq * 1e-6) {
+            buf[y * width + x] = mandelbrot(re, im, max_iter);
+            return;
+        }
+    }
+
+    // Reference orbit escaped early → scalar fallback
+    if (orbit_len < max_iter) {
+        buf[y * width + x] = mandelbrot(re, im, max_iter);
+    } else {
+        buf[y * width + x] = (float)max_iter;
+    }
+}
+
 extern "C" __global__ void fractal_kernel(
     float*   buf,
     double   re_start,
