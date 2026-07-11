@@ -1,5 +1,6 @@
 use std::sync::LazyLock;
 use egui::Color32;
+use rayon::prelude::*;
 
 const LUT_SIZE: usize = 4096*2;
 const N_SCHEMES: usize = 6;
@@ -113,17 +114,42 @@ fn rgb(r: f32, g: f32, b: f32) -> Color32 {
 pub fn colorize(buf: &[f32], max_iter: u32, scheme: ColorScheme) -> Vec<Color32> {
     let max_f = max_iter as f32;
     let lut = &PALETTES[scheme.palette_index()];
+    let bins = max_iter as usize + 1;
 
     // Build histogram of escaped pixels (exclude in-set)
-    let bins = max_iter as usize + 1;
-    let mut hist = vec![0u32; bins];
-    for &v in buf {
-        if v < max_f {
-            hist[(v.floor() as usize).min(bins - 1)] += 1;
+    // Use parallel fold+reduce if the buffer is large enough to warrant the overhead
+    let hist = if buf.len() >= 200_000 {
+        buf.par_iter()
+            .fold(
+                || vec![0u32; bins],
+                |mut local, &v| {
+                    if v < max_f {
+                        local[(v.floor() as usize).min(bins - 1)] += 1;
+                    }
+                    local
+                }
+            )
+            .reduce(
+                || vec![0u32; bins],
+                |mut a, b| {
+                    for i in 0..bins {
+                        a[i] += b[i];
+                    }
+                    a
+                }
+            )
+    } else {
+        // Small buffers: sequential histogram
+        let mut hist = vec![0u32; bins];
+        for &v in buf {
+            if v < max_f {
+                hist[(v.floor() as usize).min(bins - 1)] += 1;
+            }
         }
-    }
+        hist
+    };
 
-    // Cumulative distribution → equalized [0,1] value per bin
+    // Cumulative distribution → equalized [0,1] value per bin (always sequential, cheap)
     let total_escaped = hist.iter().map(|&c| c as f64).sum::<f64>();
     let mut cdf = vec![0.0f32; bins];
     let mut running = 0.0f64;
@@ -132,16 +158,31 @@ pub fn colorize(buf: &[f32], max_iter: u32, scheme: ColorScheme) -> Vec<Color32>
         cdf[i] = if total_escaped > 0.0 { (running / total_escaped) as f32 } else { 0.0 };
     }
 
-    // Colorize each pixel via static LUT lookup
-    buf.iter().map(|&v| {
-        if v >= max_f {
-            Color32::BLACK
-        } else {
-            let frac = v.fract();
-            let lo = v.floor() as usize;
-            let hi = (lo + 1).min(bins - 1);
-            let t = cdf[lo] + frac * (cdf[hi] - cdf[lo]);
-            lut[((t * (LUT_SIZE - 1) as f32) as usize).min(LUT_SIZE - 1)]
-        }
-    }).collect()
+    // Colorize each pixel via static LUT lookup (parallel for large buffers)
+    if buf.len() >= 200_000 {
+        buf.par_iter().map(|&v| {
+            if v >= max_f {
+                Color32::BLACK
+            } else {
+                let frac = v.fract();
+                let lo = v.floor() as usize;
+                let hi = (lo + 1).min(bins - 1);
+                let t = cdf[lo] + frac * (cdf[hi] - cdf[lo]);
+                lut[((t * (LUT_SIZE - 1) as f32) as usize).min(LUT_SIZE - 1)]
+            }
+        }).collect()
+    } else {
+        // Small buffers: sequential mapping
+        buf.iter().map(|&v| {
+            if v >= max_f {
+                Color32::BLACK
+            } else {
+                let frac = v.fract();
+                let lo = v.floor() as usize;
+                let hi = (lo + 1).min(bins - 1);
+                let t = cdf[lo] + frac * (cdf[hi] - cdf[lo]);
+                lut[((t * (LUT_SIZE - 1) as f32) as usize).min(LUT_SIZE - 1)]
+            }
+        }).collect()
+    }
 }

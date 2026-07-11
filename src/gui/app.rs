@@ -21,6 +21,7 @@ pub struct FractalApp {
     worker: RenderWorker,
     texture: Option<TextureHandle>,
     needs_render: bool,
+    needs_recolor: bool,
 
     // — adaptive iteration depth
     auto_iter: bool,
@@ -28,6 +29,8 @@ pub struct FractalApp {
     use_ms: bool,
     use_perturbation: bool,
     use_sa: bool,
+    use_neighbor_cap: bool,
+    use_multiref: bool,
 }
 
 impl Default for FractalApp {
@@ -42,17 +45,20 @@ impl Default for FractalApp {
             worker: RenderWorker::new(),
             texture: None,
             needs_render: true,
+            needs_recolor: false,
             auto_iter: true,
             use_ms: false,
             use_perturbation: false,
             use_sa: false,
+            use_neighbor_cap: false,
+            use_multiref: false,
         }
     }
 }
 
 impl FractalApp {
     fn request_render(&mut self) {
-        if self.auto_iter {
+        if self.auto_iter && self.needs_render {
             // More iterations as you zoom in (logarithmic scale)
             self.max_iter = (100.0 * (1.0 + self.viewport.zoom.ln().max(0.0))) as u32;
             self.max_iter = self.max_iter.clamp(64, 2048);
@@ -66,8 +72,11 @@ impl FractalApp {
             use_ms: self.use_ms,
             use_perturbation: self.use_perturbation,
             use_sa: self.use_sa,
+            use_neighbor_cap: self.use_neighbor_cap,
+            use_multiref: self.use_multiref,
         });
         self.needs_render = false;
+        self.needs_recolor = false;
     }
 
     fn handle_mouse(&mut self, response: &egui::Response, image_rect: Rect) {
@@ -198,7 +207,7 @@ impl FractalApp {
                 for cs in ColorScheme::ALL {
                     if ui.selectable_label(self.scheme == *cs, cs.name()).clicked() {
                         self.scheme = *cs;
-                        self.needs_render = true;
+                        self.needs_recolor = true;
                     }
                 }
 
@@ -207,25 +216,50 @@ impl FractalApp {
 
                 // Mariani-Silver subdivision
                 if ui.checkbox(&mut self.use_ms, "Mariani-Silver fill").changed() {
+                    if self.use_ms { self.use_neighbor_cap = false; }
                     self.needs_render = true;
                 }
 
                 // Perturbation theory + series approximation (Mandelbrot only)
                 if self.fractal == FractalType::Mandelbrot {
                     if ui.checkbox(&mut self.use_perturbation, "Perturbation theory").changed() {
-                        if !self.use_perturbation { self.use_sa = false; }
+                        if !self.use_perturbation {
+                            self.use_sa = false;
+                            self.use_multiref = false;
+                        }
+                        if self.use_perturbation { self.use_neighbor_cap = false; }
                         self.needs_render = true;
                     }
                     if self.use_perturbation {
                         ui.indent("sa_indent", |ui| {
                             if ui.checkbox(&mut self.use_sa, "Series approx (SA)").changed() {
+                                // Multi-ref + SA is not implemented in v1 (see
+                                // CURSOR_OPTIMIZATIONS.md 4a) — mutually exclusive.
+                                if self.use_sa { self.use_multiref = false; }
                                 self.needs_render = true;
+                            }
+                            if !self.use_sa {
+                                if ui.checkbox(&mut self.use_multiref, "Multi-reference glitch correction").changed() {
+                                    self.needs_render = true;
+                                }
                             }
                         });
                     }
                 } else {
                     self.use_perturbation = false;
                     self.use_sa = false;
+                    self.use_multiref = false;
+                }
+
+                // Neighbor iteration upper bound — scalar row path only, mutually
+                // exclusive with MS/perturbation (see CURSOR_OPTIMIZATIONS.md 1d).
+                if ui.checkbox(&mut self.use_neighbor_cap, "Neighbor iteration cap").changed() {
+                    if self.use_neighbor_cap {
+                        self.use_ms = false;
+                        self.use_perturbation = false;
+                        self.use_sa = false;
+                    }
+                    self.needs_render = true;
                 }
 
                 ui.add_space(4.0);
@@ -291,9 +325,11 @@ impl eframe::App for FractalApp {
             self.settings_panel(ctx);
         }
 
-        // Poll for completed render
-        if let Some(image) = self.worker.poll() {
-            self.texture = Some(ctx.load_texture("fractal", image, TextureOptions::LINEAR));
+        // Poll for completed render (may be a fast lower-res preview followed by
+        // the full-res final — the paint call below upscales either via linear
+        // filtering, so no separate preview-scaling code is needed).
+        if let Some(result) = self.worker.poll() {
+            self.texture = Some(ctx.load_texture("fractal", result.image, TextureOptions::LINEAR));
             ctx.request_repaint(); // repaint once to show new frame
         }
 
@@ -310,7 +346,7 @@ impl eframe::App for FractalApp {
             }
 
             // Kick off a render if needed and worker is free
-            if self.needs_render && !self.worker.busy {
+            if (self.needs_render || self.needs_recolor) && !self.worker.busy {
                 self.request_render();
             }
 

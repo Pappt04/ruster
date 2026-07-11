@@ -15,6 +15,23 @@
 ///   --perturbation     use render_perturbation()  (CPU only, Mandelbrot)
 ///   --compare-perturb  scalar vs perturbation timing + pixel diff (Mandelbrot)
 ///   --perturb-sweep    zoom sweep [1,1e3,1e6,1e9,1e12] at seahorse valley
+///   --compare-bulb-reject   validate period-3 bulb disk against raw escape ground truth
+///   --compare-neighbor-cap  validate render_neighbor_capped vs render() (max_diff + recompute_pct)
+///   --cap-slack N           slack for --compare-neighbor-cap             (default: 16)
+///   --tile-check            validate render_tiled() vs render() (expect max_diff == 0)
+///   --compare-pan-recycle DX,DY  validate shift_and_fill vs a from-scratch render at
+///                                 the panned viewport (expect a small, near-zero diff —
+///                                 see shift_and_fill's doc comment for why it isn't
+///                                 always bit-exact)
+///   --compare-multiref      count glitched pixels: primary-ref only vs after multi-ref
+///                            correction, plus a pixel_diff_stats vs scalar ground truth
+///   --compare-rebase        rebased perturbation vs single-ref: timing + mismatch counts
+///                            vs scalar (rebase keeps chaotic boundary pixels in perturbation,
+///                            so a small mismatch fraction vs f64 scalar is expected)
+///   --compare-dem-cull [--dem-k F]  DEM-culled Mariani-Silver vs exact MS (approximate
+///                                    bilinear fill — report pixel diff, tune k)
+///   --compare-ide           render_ide_biased vs render() (derivative-bailout interior
+///                            detection is approximate — report pixel diff)
 ///   --scaling       run thread-scaling sweep      (flag)
 ///   --json          emit JSON to stdout            (flag)
 ///
@@ -27,7 +44,7 @@
 ///   ./target/release/bench_runner --scaling --json > bench_results/scaling.json
 
 use std::time::{Duration, Instant};
-use novafractal::fractal::{render, render_perturbation, render_perturbation_sa, compute_reference_orbit, compute_series_approx, flops_per_iter, FractalType};
+use novafractal::fractal::{render, render_perturbation, render_perturbation_sa, compute_reference_orbit, compute_series_approx, flops_per_iter, FractalType, render_neighbor_capped, in_period3_bulb, pixel_grid, render_tiled, shift_and_fill, render_perturbation_multiref, perturb_mandelbrot_flagged, render_perturbation_rebase, render_mariani_silver_dem, render_ide_biased};
 use novafractal::gui::viewport::Viewport;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -49,6 +66,16 @@ struct Args {
     perturb_sweep:      bool,
     scaling:            bool,
     json:               bool,
+    compare_bulb_reject: bool,
+    compare_neighbor_cap: bool,
+    cap_slack:           u32,
+    tile_check:           bool,
+    compare_pan_recycle:  Option<(i32, i32)>,
+    compare_multiref:     bool,
+    compare_rebase:       bool,
+    compare_dem_cull:     bool,
+    dem_k:                f64,
+    compare_ide:          bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,6 +99,16 @@ impl Default for Args {
             perturb_sweep:   false,
             scaling:         false,
             json:            false,
+            compare_bulb_reject: false,
+            compare_neighbor_cap: false,
+            cap_slack:           16,
+            tile_check:           false,
+            compare_pan_recycle:  None,
+            compare_multiref:     false,
+            compare_rebase:       false,
+            compare_dem_cull:     false,
+            dem_k:                4.0,
+            compare_ide:          false,
         }
     }
 }
@@ -124,6 +161,23 @@ fn parse_args() -> Args {
             "--sa"              => a.use_sa          = true,
             "--compare-perturb" => a.compare_perturb = true,
             "--perturb-sweep"   => a.perturb_sweep   = true,
+            "--compare-bulb-reject" => a.compare_bulb_reject = true,
+            "--compare-neighbor-cap" => a.compare_neighbor_cap = true,
+            "--cap-slack" => { i += 1; a.cap_slack = raw[i].parse().unwrap(); }
+            "--tile-check" => a.tile_check = true,
+            "--compare-pan-recycle" => {
+                i += 1;
+                let parts: Vec<&str> = raw[i].split(',').collect();
+                assert!(parts.len() == 2, "--compare-pan-recycle expects DX,DY");
+                let dx: i32 = parts[0].trim().parse().unwrap();
+                let dy: i32 = parts[1].trim().parse().unwrap();
+                a.compare_pan_recycle = Some((dx, dy));
+            }
+            "--compare-multiref" => a.compare_multiref = true,
+            "--compare-rebase" => a.compare_rebase = true,
+            "--compare-dem-cull" => a.compare_dem_cull = true,
+            "--dem-k" => { i += 1; a.dem_k = raw[i].parse().unwrap(); }
+            "--compare-ide" => a.compare_ide = true,
             "--scaling" => a.scaling = true,
             "--json"    => a.json    = true,
             x => panic!("unknown flag: {x}"),
@@ -322,6 +376,178 @@ fn run_perturb_sweep(width: u32, height: u32, max_iter: u32, runs: usize) -> Vec
         };
         bench_compare_perturb(&vp, max_iter, runs)
     }).collect()
+}
+
+// ── Phase B validation: bulb rejection + neighbor cap ──────────────────────────
+
+/// Ground-truth Mandelbrot escape test with NO early-outs (no cardioid/period-2/
+/// period-3 bulb checks, no period detection) — used only to validate that
+/// `in_period3_bulb` never misclassifies an escaping pixel as in-set.
+fn mandelbrot_raw(cr: f64, ci: f64, max_iter: u32) -> f32 {
+    let mut zr = cr;
+    let mut zi = ci;
+    if max_iter <= 1 { return max_iter as f32; }
+    let zr2 = zr * zr;
+    let zi2 = zi * zi;
+    zi = 2.0 * zr * zi + ci;
+    zr = zr2 - zi2 + cr;
+    if max_iter <= 2 { return max_iter as f32; }
+    for i in 2..max_iter {
+        let zr2 = zr * zr;
+        let zi2 = zi * zi;
+        let zn_sq = zr2 + zi2;
+        if zn_sq > 256.0 * 256.0 {
+            return i as f32;
+        }
+        zi = 2.0 * zr * zi + ci;
+        zr = zr2 - zi2 + cr;
+    }
+    max_iter as f32
+}
+
+/// Validates `in_period3_bulb` against `mandelbrot_raw`: every pixel the disk test
+/// claims is in the bulb must NOT escape under the raw ground-truth loop. Scans a
+/// wide overview viewport. `max_diff == 0` (i.e. `bad_pixels == 0`) means the disk
+/// parameters are safe; any bad pixel means they must be shrunk before trusting.
+fn bench_compare_bulb_reject(width: u32, height: u32, max_iter: u32) -> (u64, u64) {
+    let vp = Viewport { center: [-0.5, 0.0], zoom: 1.0, width, height };
+    let pg = pixel_grid(&vp);
+    let mut checked = 0u64;
+    let mut bad = 0u64;
+    for y in 0..height as usize {
+        let im = pg.im_start + y as f64 * pg.im_step;
+        for x in 0..width as usize {
+            let re = pg.re_start + x as f64 * pg.re_step;
+            if in_period3_bulb(re, im) {
+                checked += 1;
+                if mandelbrot_raw(re, im, max_iter) < max_iter as f32 {
+                    bad += 1;
+                }
+            }
+        }
+    }
+    (checked, bad)
+}
+
+/// Validates `render_neighbor_capped` against `render()`: max_diff must be 0 (the
+/// cap is self-correcting by construction — any nonzero diff is an implementation
+/// bug, not tunable error). Also reports `recompute_pct`, the real tuning metric —
+/// the fraction of pixels that hit the cap and paid for a full max_iter re-run.
+fn bench_compare_neighbor_cap(vp: &Viewport, max_iter: u32, slack: u32) -> (f32, f64, f64) {
+    let julia_c = [-0.4f64, 0.6];
+    let baseline = render(vp, FractalType::Mandelbrot, julia_c, max_iter);
+    let capped = render_neighbor_capped(vp, FractalType::Mandelbrot, julia_c, max_iter, slack);
+    let (max_diff, mean_diff, _above) = pixel_diff_stats(&baseline, &capped);
+
+    // recompute_pct: fraction of pixels whose row-scan cap was hit (i.e. the pixel's
+    // value equals max_iter but a smaller cap would have been insufficient — we
+    // approximate by recomputing the row-cap sequence and counting cap hits).
+    let pg = pixel_grid(vp);
+    let w = vp.width as usize;
+    let h = vp.height as usize;
+    let mut hit_cap = 0u64;
+    let mut total = 0u64;
+    for y in 0..h {
+        let im = pg.im_start + y as f64 * pg.im_step;
+        let mut cap = max_iter;
+        for x in 0..w {
+            let re = pg.re_start + x as f64 * pg.re_step;
+            let guess = novafractal::fractal::pixel(FractalType::Mandelbrot, re, im, julia_c, cap);
+            total += 1;
+            if guess >= cap as f32 && cap < max_iter {
+                hit_cap += 1;
+            }
+            cap = ((guess as u32).saturating_add(slack)).min(max_iter);
+        }
+    }
+    let recompute_pct = if total > 0 { hit_cap as f64 / total as f64 * 100.0 } else { 0.0 };
+
+    (max_diff, mean_diff, recompute_pct)
+}
+
+/// Validates `shift_and_fill` against a from-scratch render of the panned viewport.
+/// See `shift_and_fill`'s doc comment: recycled pixels can differ from a fresh
+/// render by a tiny amount (floating-point non-associativity between the old and
+/// new viewport's independently-computed coordinate bases), so this reports the
+/// diff rather than hard-asserting zero.
+fn bench_compare_pan_recycle(vp: &Viewport, max_iter: u32, dx: i32, dy: i32) -> (f32, f64, u64) {
+    let julia_c = [-0.4f64, 0.6];
+    let w = vp.width as usize;
+    let h = vp.height as usize;
+
+    let mut buf = render(vp, FractalType::Mandelbrot, julia_c, max_iter);
+
+    let half = 2.0 / vp.zoom;
+    let aspect = vp.width as f64 / vp.height as f64;
+    let re_per_px = half * aspect * 2.0 / vp.width as f64;
+    let im_per_px = half * 2.0 / vp.height as f64;
+    let new_vp = Viewport {
+        center: [vp.center[0] - dx as f64 * re_per_px, vp.center[1] - dy as f64 * im_per_px],
+        zoom: vp.zoom,
+        width: vp.width,
+        height: vp.height,
+    };
+
+    shift_and_fill(&mut buf, w, h, dx, dy, &new_vp, FractalType::Mandelbrot, julia_c, max_iter);
+    let expected = render(&new_vp, FractalType::Mandelbrot, julia_c, max_iter);
+
+    pixel_diff_stats(&buf, &expected)
+}
+
+/// Counts glitched pixels against the primary reference orbit only (what
+/// `render_perturbation` falls back to scalar for), then validates
+/// `render_perturbation_multiref`'s output against scalar ground truth. The
+/// glitch-pixel-count before/after is the real success metric for 4a — it's
+/// directly measurable, unlike pixel diffs (both single-ref-with-fallback and
+/// multi-ref converge to the exact same correct values, by construction).
+fn bench_compare_multiref(vp: &Viewport, max_iter: u32) -> (usize, u64, f32) {
+    let julia_c = [0.0f64, 0.0];
+    let w = vp.width as usize;
+    let h = vp.height as usize;
+    let pg = pixel_grid(vp);
+
+    let orbit = compute_reference_orbit(vp.center[0], vp.center[1], max_iter);
+    let mut primary_glitches = 0usize;
+    for y in 0..h {
+        let im = pg.im_start + y as f64 * pg.im_step;
+        for x in 0..w {
+            let re = pg.re_start + x as f64 * pg.re_step;
+            if perturb_mandelbrot_flagged(&orbit, re - vp.center[0], im - vp.center[1], max_iter).is_none() {
+                primary_glitches += 1;
+            }
+        }
+    }
+
+    let multi = render_perturbation_multiref(vp, FractalType::Mandelbrot, julia_c, max_iter);
+    let scalar = render(vp, FractalType::Mandelbrot, julia_c, max_iter);
+    let (max_diff, _mean, _above) = pixel_diff_stats(&multi, &scalar);
+
+    (primary_glitches, (w * h) as u64, max_diff)
+}
+
+/// Rebased perturbation (4b) vs single-ref-with-scalar-fallback: median timing of
+/// each, plus mismatch counts vs f64 scalar ground truth. Rebase keeps chaotic
+/// boundary pixels inside perturbation instead of recomputing them exactly, so a
+/// small mismatch fraction vs scalar is expected — report, don't assert.
+fn bench_compare_rebase(vp: &Viewport, max_iter: u32, runs: usize) -> (f64, f64, usize, usize, u64) {
+    let julia_c = [0.0f64, 0.0];
+    let time_it = |f: &dyn Fn() -> Vec<f32>| -> (f64, Vec<f32>) {
+        let _ = f();
+        let mut times: Vec<f64> = Vec::with_capacity(runs);
+        let mut buf = Vec::new();
+        for _ in 0..runs {
+            let t = Instant::now();
+            buf = f();
+            times.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (times[runs / 2], buf)
+    };
+    let (single_ms, single) = time_it(&|| render_perturbation(vp, FractalType::Mandelbrot, julia_c, max_iter));
+    let (rebase_ms, rebase) = time_it(&|| render_perturbation_rebase(vp, FractalType::Mandelbrot, julia_c, max_iter));
+    let scalar = render(vp, FractalType::Mandelbrot, julia_c, max_iter);
+    let d = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| (**x - **y).abs() > 0.5).count();
+    (single_ms, rebase_ms, d(&single, &scalar), d(&rebase, &scalar), scalar.len() as u64)
 }
 
 fn print_perturb_table(results: &[PerturbCompare]) {
@@ -644,6 +870,131 @@ fn main() {
             print_perturb_json(&results);
         } else {
             print_perturb_table(&results);
+        }
+        return;
+    }
+
+    // ── period-3 bulb rejection validation ───────────────────────────────────
+    if args.compare_bulb_reject {
+        let (checked, bad) = bench_compare_bulb_reject(args.width, args.height, args.max_iter);
+        if args.json {
+            println!("{{\"checked_pixels\":{checked},\"bad_pixels\":{bad}}}");
+        } else {
+            println!("\nperiod-3 bulb rejection validation ({}×{}, max_iter={})", args.width, args.height, args.max_iter);
+            println!("  pixels claimed in-bulb : {checked}");
+            println!("  pixels that escape (BAD): {bad}");
+            if bad == 0 {
+                println!("  RESULT: SAFE (disk parameters are conservative)");
+            } else {
+                println!("  RESULT: UNSAFE — shrink PERIOD3_RADIUS_SQ in fractal.rs");
+            }
+        }
+        return;
+    }
+
+    // ── neighbor iteration cap validation ────────────────────────────────────
+    if args.compare_neighbor_cap {
+        let (max_diff, mean_diff, recompute_pct) = bench_compare_neighbor_cap(&vp, args.max_iter, args.cap_slack);
+        if args.json {
+            println!("{{\"max_diff\":{max_diff},\"mean_diff\":{mean_diff},\"recompute_pct\":{recompute_pct}}}");
+        } else {
+            println!("\nneighbor iteration cap validation (slack={})", args.cap_slack);
+            println!("  max_diff       : {max_diff} (expect 0.0 — correctness by construction)");
+            println!("  mean_diff      : {mean_diff}");
+            println!("  recompute_pct  : {recompute_pct:.2}% (pixels that hit the cap and paid for a full re-run)");
+        }
+        return;
+    }
+
+    // ── incremental pan (shift_and_fill) validation ──────────────────────────
+    if let Some((dx, dy)) = args.compare_pan_recycle {
+        let (max_diff, mean_diff, above) = bench_compare_pan_recycle(&vp, args.max_iter, dx, dy);
+        if args.json {
+            println!("{{\"dx\":{dx},\"dy\":{dy},\"max_diff\":{max_diff},\"mean_diff\":{mean_diff},\"above_0_01\":{above}}}");
+        } else {
+            println!("\nincremental pan validation (dx={dx}, dy={dy})");
+            println!("  max_diff  : {max_diff} (expect a small non-zero value — see shift_and_fill doc comment)");
+            println!("  mean_diff : {mean_diff}");
+            println!("  pixels with diff > 0.01 : {above}");
+        }
+        return;
+    }
+
+    // ── multi-reference glitch correction validation ─────────────────────────
+    if args.compare_multiref {
+        let (primary_glitches, total, max_diff) = bench_compare_multiref(&vp, args.max_iter);
+        if args.json {
+            println!("{{\"primary_glitches\":{primary_glitches},\"total_pixels\":{total},\"max_diff_vs_scalar\":{max_diff}}}");
+        } else {
+            println!("\nmulti-reference glitch correction validation ({}×{}, max_iter={}, zoom={})", args.width, args.height, args.max_iter, args.zoom);
+            println!("  primary-ref-only glitches : {primary_glitches}/{total} ({:.2}%)", primary_glitches as f64 / total as f64 * 100.0);
+            println!("  max_diff vs scalar ground truth (after multiref+fallback): {max_diff} (expect 0.0 — correctness guaranteed by scalar fallback cap)");
+        }
+        return;
+    }
+
+    // ── DEM-culled Mariani-Silver validation ─────────────────────────────────
+    if args.compare_dem_cull {
+        let julia_c = [-0.4f64, 0.6];
+        let exact = novafractal::fractal::render_mariani_silver(&vp, FractalType::Mandelbrot, julia_c, args.max_iter);
+        let dem = render_mariani_silver_dem(&vp, FractalType::Mandelbrot, julia_c, args.max_iter, args.dem_k);
+        let (max_diff, mean_diff, above) = pixel_diff_stats(&exact, &dem);
+        if args.json {
+            println!("{{\"k\":{},\"max_diff\":{max_diff},\"mean_diff\":{mean_diff},\"above_0_01\":{above}}}", args.dem_k);
+        } else {
+            println!("\nDEM-culled Mariani-Silver validation (k={})", args.dem_k);
+            println!("  max_diff  : {max_diff} (interpolated fill is approximate — tune k against this)");
+            println!("  mean_diff : {mean_diff}");
+            println!("  pixels with diff > 0.01 : {above}");
+        }
+        return;
+    }
+
+    // ── IDE biased interior checking validation ──────────────────────────────
+    if args.compare_ide {
+        let julia_c = [-0.4f64, 0.6];
+        let exact = render(&vp, FractalType::Mandelbrot, julia_c, args.max_iter);
+        let ide = render_ide_biased(&vp, FractalType::Mandelbrot, julia_c, args.max_iter);
+        let (max_diff, mean_diff, above) = pixel_diff_stats(&exact, &ide);
+        if args.json {
+            println!("{{\"max_diff\":{max_diff},\"mean_diff\":{mean_diff},\"above_0_01\":{above}}}");
+        } else {
+            println!("\nIDE biased interior checking validation");
+            println!("  max_diff  : {max_diff} (derivative-bailout interior detection is approximate)");
+            println!("  mean_diff : {mean_diff}");
+            println!("  pixels with diff > 0.01 : {above}");
+        }
+        return;
+    }
+
+    // ── rebased perturbation validation ──────────────────────────────────────
+    if args.compare_rebase {
+        let (single_ms, rebase_ms, single_mm, rebase_mm, total) = bench_compare_rebase(&vp, args.max_iter, args.runs);
+        if args.json {
+            println!("{{\"single_ms\":{single_ms},\"rebase_ms\":{rebase_ms},\"single_mismatches\":{single_mm},\"rebase_mismatches\":{rebase_mm},\"total_pixels\":{total}}}");
+        } else {
+            println!("\nrebased perturbation validation ({}×{}, max_iter={}, zoom={})", args.width, args.height, args.max_iter, args.zoom);
+            println!("  single-ref median : {single_ms:.2} ms ({single_mm} mismatches vs scalar)");
+            println!("  rebase median     : {rebase_ms:.2} ms ({rebase_mm} mismatches vs scalar, small fraction expected)");
+            println!("  speedup           : {:.2}x", single_ms / rebase_ms);
+        }
+        return;
+    }
+
+    // ── Hilbert tile traversal validation ────────────────────────────────────
+    if args.tile_check {
+        for &fractal in &args.fractals {
+            let julia_c = [-0.4f64, 0.6];
+            let a = render(&vp, fractal, julia_c, args.max_iter);
+            let b = render_tiled(&vp, fractal, julia_c, args.max_iter);
+            let (max_diff, mean_diff, above) = pixel_diff_stats(&a, &b);
+            if args.json {
+                println!("{{\"fractal\":\"{}\",\"max_diff\":{max_diff},\"mean_diff\":{mean_diff},\"above_0_01\":{above}}}", fractal.name());
+            } else {
+                println!("\ntile traversal validation: {} ({}×{}, max_iter={})", fractal.name(), args.width, args.height, args.max_iter);
+                println!("  max_diff  : {max_diff} (expect 0.0 — same math, different write order)");
+                println!("  mean_diff : {mean_diff}");
+            }
         }
         return;
     }

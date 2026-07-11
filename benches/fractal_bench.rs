@@ -162,6 +162,33 @@ fn bench_cpu_render(c: &mut Criterion) {
     }
 }
 
+/// Hilbert-tile traversal vs plain row-parallel render (2b in
+/// CURSOR_OPTIMIZATIONS.md). Bit-identical output — measures cache-locality gain.
+fn bench_tiled_render(c: &mut Criterion) {
+    use novafractal::fractal::render_tiled;
+
+    let resolutions: &[(u32, u32, &str)] = &[
+        (800,  600,  "800×600"),
+        (1920, 1080, "1920×1080"),
+        (3840, 2160, "3840×2160"),
+    ];
+
+    for &fractal in FractalType::ALL {
+        let mut group = c.benchmark_group(format!("cpu/render_tiled/{}", fractal.name()));
+        group.sample_size(10);
+
+        for &(w, h, label) in resolutions {
+            let vp = vp(w, h);
+            group.throughput(Throughput::Elements(w as u64 * h as u64));
+            group.bench_with_input(BenchmarkId::new("rows",    label), &vp,
+                |b, vp| b.iter(|| render(       black_box(vp), fractal, JULIA_C, MAX_ITER)));
+            group.bench_with_input(BenchmarkId::new("hilbert", label), &vp,
+                |b, vp| b.iter(|| render_tiled( black_box(vp), fractal, JULIA_C, MAX_ITER)));
+        }
+        group.finish();
+    }
+}
+
 fn bench_colorize(c: &mut Criterion) {
     let mut group = c.benchmark_group("cpu/colorize");
 
@@ -249,6 +276,35 @@ fn bench_simd_render(c: &mut Criterion) {
         }
         group.finish();
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIMD ILP: f32x8 vs interleaved 2×f32x8 (CURSOR_OPTIMIZATIONS.md 2a). Mandelbrot
+// only — bit-identical output to render_simd_f32, only faster scheduling.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn bench_simd_ilp_render(c: &mut Criterion) {
+    use novafractal::fractal::{render_simd_f32, render_simd_f32_ilp};
+
+    let resolutions: &[(u32, u32, &str)] = &[
+        (800,  600,  "800×600"),
+        (1920, 1080, "1920×1080"),
+        (3840, 2160, "3840×2160"),
+    ];
+
+    let mut group = c.benchmark_group("simd/render_ilp/Mandelbrot_1080p");
+    group.sample_size(10);
+
+    for &(w, h, label) in resolutions {
+        let vp = vp(w, h);
+        group.throughput(Throughput::Elements(w as u64 * h as u64));
+
+        group.bench_with_input(BenchmarkId::new("f32x8",     label), &vp,
+            |b, vp| b.iter(|| render_simd_f32(    black_box(vp), FractalType::Mandelbrot, JULIA_C, MAX_ITER)));
+        group.bench_with_input(BenchmarkId::new("f32x8_ilp", label), &vp,
+            |b, vp| b.iter(|| render_simd_f32_ilp(black_box(vp), FractalType::Mandelbrot, JULIA_C, MAX_ITER)));
+    }
+    group.finish();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -728,11 +784,13 @@ criterion_group! {
         // CPU
         bench_pixel_kernels,
         bench_cpu_render,
+        bench_tiled_render,
         bench_colorize,
         bench_cpu_pipeline,
         bench_thread_scaling,
         // SIMD  (no-op stub when feature is off)
         bench_simd_render,
+        bench_simd_ilp_render,
         // Perturbation theory (scalar vs perturb vs perturb+SA × zoom sweep)
         bench_perturbation_render,
         bench_perturbation_reference_orbit,
