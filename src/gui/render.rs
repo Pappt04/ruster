@@ -76,6 +76,9 @@ pub struct RenderRequest {
     pub use_sa: bool,
     pub use_neighbor_cap: bool,
     pub use_multiref: bool,
+    /// CUDA builds only: route tiles between CPU/GPU via the adaptive
+    /// prepass-guided scheduler instead of a single full-frame GPU dispatch.
+    pub use_heterogeneous: bool,
 }
 
 /// Whether a `RenderResult` is a fast, lower-resolution preview (worker still busy,
@@ -109,8 +112,11 @@ impl RenderWorker {
                 use crate::gpu::cuda::CudaFractal;
                 use crate::fractal::fractal::{compute_reference_orbit, compute_reference_orbit_f128, F128_ZOOM_THRESHOLD};
                 use crate::fractal::fractal_type::FractalType;
+                use crate::scheduler::{self, controller::ThresholdController, SchedulerConfig};
                 let mut compute: Option<CudaFractal> = None;
                 let mut cached_size = (0u32, 0u32);
+                let mut het_controller = ThresholdController::new(50.0);
+                let scheduler_cfg = SchedulerConfig::default();
 
                 while let Ok(mut req) = req_rx.recv() {
                     while let Ok(newer) = req_rx.try_recv() { req = newer; }
@@ -141,6 +147,11 @@ impl RenderWorker {
                             re_start, im_start, re_step, im_step,
                             req.max_iter,
                         )
+                    } else if req.use_heterogeneous {
+                        scheduler::render_heterogeneous(
+                            vp, req.fractal, req.julia_c, req.max_iter,
+                            cuda, &mut het_controller, &scheduler_cfg,
+                        ).buf
                     } else {
                         cuda.render(
                             re_start, im_start, re_step, im_step,

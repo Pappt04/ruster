@@ -528,6 +528,48 @@ fn bench_hybrid_cpu_cuda(c: &mut Criterion) {
     group.finish();
 }
 
+// Adaptive prepass-guided heterogeneous scheduler (see src/scheduler) vs the
+// static 50/50 split above and plain GPU-only render — across zoom levels to
+// show the CPU/GPU tile split adapting as the boundary-to-interior ratio grows.
+#[cfg(feature = "cuda")]
+fn bench_heterogeneous(c: &mut Criterion) {
+    use novafractal::gpu::cuda::CudaFractal;
+    use novafractal::scheduler::{render_heterogeneous, controller::ThresholdController, SchedulerConfig};
+
+    const ZOOMS: &[(f64, &str)] = &[(1.0, "zoom_1e0"), (1e2, "zoom_1e2"), (1e4, "zoom_1e4")];
+    const CENTER: [f64; 2] = [-0.75, 0.1];
+
+    let mut group = c.benchmark_group("hybrid/heterogeneous");
+    group.throughput(Throughput::Elements(1920 * 1080));
+    group.sample_size(10);
+
+    for &fractal in FractalType::ALL {
+        for &(zoom, label) in ZOOMS {
+            let frame_vp = Viewport { center: CENTER, zoom, width: 1920, height: 1080 };
+            let mut cuda = CudaFractal::new(1920, 1080);
+            let mut controller = ThresholdController::new(50.0);
+            let cfg = SchedulerConfig::default();
+
+            group.bench_with_input(
+                BenchmarkId::new(fractal.name(), label),
+                &frame_vp,
+                |b, frame_vp| {
+                    b.iter(|| {
+                        render_heterogeneous(
+                            black_box(frame_vp), fractal, JULIA_C, MAX_ITER,
+                            &mut cuda, &mut controller, &cfg,
+                        ).buf
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "cuda"))]
+fn bench_heterogeneous(c: &mut Criterion) { let _ = c; }
+
 // Stubs when cuda feature is off — criterion_group! needs a consistent list.
 #[cfg(not(feature = "cuda"))]
 fn bench_cuda_render(c: &mut Criterion) {
@@ -806,7 +848,8 @@ criterion_group! {
         bench_cuda_pipeline,
         bench_cuda_perturbation,
         // Hybrid CPU + CUDA
-        bench_hybrid_cpu_cuda
+        bench_hybrid_cpu_cuda,
+        bench_heterogeneous
 }
 
 criterion_main!(benches);

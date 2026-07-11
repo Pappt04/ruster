@@ -31,6 +31,7 @@ pub struct FractalApp {
     use_sa: bool,
     use_neighbor_cap: bool,
     use_multiref: bool,
+    use_heterogeneous: bool,
 }
 
 impl Default for FractalApp {
@@ -52,6 +53,7 @@ impl Default for FractalApp {
             use_sa: false,
             use_neighbor_cap: false,
             use_multiref: false,
+            use_heterogeneous: false,
         }
     }
 }
@@ -74,6 +76,7 @@ impl FractalApp {
             use_sa: self.use_sa,
             use_neighbor_cap: self.use_neighbor_cap,
             use_multiref: self.use_multiref,
+            use_heterogeneous: self.use_heterogeneous,
         });
         self.needs_render = false;
         self.needs_recolor = false;
@@ -259,6 +262,14 @@ impl FractalApp {
                         self.use_perturbation = false;
                         self.use_sa = false;
                     }
+                    self.needs_render = true;
+                }
+
+                // Heterogeneous CPU+GPU scheduler (CUDA builds only) — routes
+                // GPU-divergent boundary tiles to the CPU concurrently with
+                // the GPU handling coherent tiles. See src/scheduler.
+                #[cfg(feature = "cuda")]
+                if ui.checkbox(&mut self.use_heterogeneous, "Heterogeneous scheduler").changed() {
                     self.needs_render = true;
                 }
 

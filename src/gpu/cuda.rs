@@ -136,7 +136,9 @@ impl CudaFractal {
             ))
         }.unwrap();
 
-        self.dev.dtoh_sync_copy(self.prepass_output.as_ref().unwrap()).unwrap()
+        let mut out = self.dev.dtoh_sync_copy(self.prepass_output.as_ref().unwrap()).unwrap();
+        out.truncate(n);
+        out
     }
 
     /// Render a subset of tiles using `fractal_kernel_tiled`.
@@ -198,6 +200,12 @@ impl CudaFractal {
 
         self.dev.dtoh_sync_copy(&self.output).unwrap()
     }
+
+    /// Full-res dimensions this instance was constructed with.
+    pub fn width(&self) -> u32 { self.width }
+
+    /// Full-res dimensions this instance was constructed with.
+    pub fn height(&self) -> u32 { self.height }
 
     /// 1-D Morton launch config for a `w × h` image using 16×16 thread blocks.
     fn morton_cfg(&self, w: u32, h: u32) -> LaunchConfig {

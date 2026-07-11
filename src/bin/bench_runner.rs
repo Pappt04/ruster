@@ -32,6 +32,9 @@
 ///                                    bilinear fill — report pixel diff, tune k)
 ///   --compare-ide           render_ide_biased vs render() (derivative-bailout interior
 ///                            detection is approximate — report pixel diff)
+///   --heterogeneous         validate scheduler::render_heterogeneous vs render() (expect
+///                            max_diff == 0.0), report gpu_ms/cpu_ms/cpu_tile_frac
+///                            (requires --features cuda)
 ///   --scaling       run thread-scaling sweep      (flag)
 ///   --json          emit JSON to stdout            (flag)
 ///
@@ -76,6 +79,7 @@ struct Args {
     compare_dem_cull:     bool,
     dem_k:                f64,
     compare_ide:          bool,
+    heterogeneous:        bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -109,6 +113,7 @@ impl Default for Args {
             compare_dem_cull:     false,
             dem_k:                4.0,
             compare_ide:          false,
+            heterogeneous:        false,
         }
     }
 }
@@ -178,6 +183,7 @@ fn parse_args() -> Args {
             "--compare-dem-cull" => a.compare_dem_cull = true,
             "--dem-k" => { i += 1; a.dem_k = raw[i].parse().unwrap(); }
             "--compare-ide" => a.compare_ide = true,
+            "--heterogeneous" => a.heterogeneous = true,
             "--scaling" => a.scaling = true,
             "--json"    => a.json    = true,
             x => panic!("unknown flag: {x}"),
@@ -259,6 +265,64 @@ fn pixel_diff_stats(a: &[f32], b: &[f32]) -> (f32, f64, u64) {
     }
     let mean = if a.is_empty() { 0.0 } else { sum_diff / a.len() as f64 };
     (max_diff, mean, above)
+}
+
+/// Validate `scheduler::render_heterogeneous` against plain CPU `render()` and
+/// report the GPU/CPU tile split + timing, alongside a plain full-frame
+/// `cuda.render()` baseline for context.
+///
+/// The scheduler's own tiled dispatch (`fractal_kernel_tiled`) does not use
+/// the Morton-order dispatch that `fractal_kernel` (plain `render()`/
+/// `render_prepass()`) uses, so it isn't subject to that kernel's coverage
+/// gaps on non-power-of-2 image dimensions — the baseline column below will
+/// often show much larger divergence than the scheduler's own numbers for
+/// exactly that reason. A small residual divergence between the scheduler and
+/// CPU `render()` is still expected: escape-time fractals are chaotically
+/// sensitive near the boundary, and CPU (scalar) vs GPU (`--fmad=true`
+/// fused-multiply-add) floating point can disagree by a few ULP right at a
+/// pixel's escape iteration, occasionally flipping a boundary pixel's count
+/// by a large amount. The scheduler routes the vast majority of such pixels
+/// to the CPU (see the baseline-vs-scheduler improvement below); it cannot
+/// guarantee catching every one from a coarse 1/8-res prepass.
+#[cfg(feature = "cuda")]
+fn run_heterogeneous_check(vp: &Viewport, args: &Args) {
+    use novafractal::gpu::cuda::CudaFractal;
+    use novafractal::scheduler::{render_heterogeneous, controller::ThresholdController, SchedulerConfig};
+
+    let julia_c = [-0.4f64, 0.6];
+    let mut cuda = CudaFractal::new(vp.width, vp.height);
+    let mut controller = ThresholdController::new(50.0);
+    let cfg = SchedulerConfig::default();
+
+    for &fractal in &args.fractals {
+        let expected = render(vp, fractal, julia_c, args.max_iter);
+
+        let pg = pixel_grid(vp);
+        let plain_gpu = cuda.render(pg.re_start, pg.im_start, pg.re_step, pg.im_step, julia_c[0], julia_c[1], args.max_iter, fractal.as_u32());
+        let (base_max, base_mean, base_above) = pixel_diff_stats(&expected, &plain_gpu);
+
+        let result = render_heterogeneous(vp, fractal, julia_c, args.max_iter, &mut cuda, &mut controller, &cfg);
+        let (max_diff, mean_diff, above) = pixel_diff_stats(&expected, &result.buf);
+
+        if args.json {
+            println!(
+                "{{\"fractal\":\"{}\",\"max_diff\":{max_diff},\"mean_diff\":{mean_diff},\"above_0_01\":{above},\"baseline_max_diff\":{base_max},\"baseline_mean_diff\":{base_mean},\"baseline_above_0_01\":{base_above},\"gpu_ms\":{},\"cpu_ms\":{},\"cpu_tile_frac\":{}}}",
+                fractal.name(), result.gpu_ms, result.cpu_ms, result.cpu_tile_frac,
+            );
+        } else {
+            println!("\nheterogeneous scheduler validation: {} ({}×{}, max_iter={}, zoom={})", fractal.name(), args.width, args.height, args.max_iter, args.zoom);
+            println!("  vs CPU render()          : max_diff={max_diff:<10} mean_diff={mean_diff:<12.6} above_0.01={above}");
+            println!("  plain cuda.render() base : max_diff={base_max:<10} mean_diff={base_mean:<12.6} above_0.01={base_above}  (context, see fn doc comment)");
+            println!("  gpu_ms        : {:.2}", result.gpu_ms);
+            println!("  cpu_ms        : {:.2}", result.cpu_ms);
+            println!("  cpu_tile_frac : {:.2}%", result.cpu_tile_frac * 100.0);
+        }
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn run_heterogeneous_check(_vp: &Viewport, _args: &Args) {
+    eprintln!("[heterogeneous] cuda feature not enabled — rerun with: cargo run --release --bin bench_runner --features cuda -- --heterogeneous");
 }
 
 fn time_cpu_render(
@@ -996,6 +1060,12 @@ fn main() {
                 println!("  mean_diff : {mean_diff}");
             }
         }
+        return;
+    }
+
+    // ── heterogeneous CPU+GPU scheduler validation ───────────────────────────
+    if args.heterogeneous {
+        run_heterogeneous_check(&vp, &args);
         return;
     }
 
