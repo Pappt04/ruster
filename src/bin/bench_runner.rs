@@ -35,7 +35,26 @@
 ///   --heterogeneous         validate scheduler::render_heterogeneous vs render() (expect
 ///                            max_diff == 0.0), report gpu_ms/cpu_ms/cpu_tile_frac
 ///                            (requires --features cuda)
-///   --scaling       run thread-scaling sweep      (flag)
+///   --scaling       run thread-scaling sweep (now reports speedup + parallel efficiency
+///                   relative to the 1-thread baseline)  (flag)
+///   --fractal-dimension     box-counting dimension estimate + iteration histogram
+///                            (Mandelbrot boundary; add --box-min/--box-max to override sizes)
+///   --area-estimate         pixel-counting area estimate vs the literature constant
+///                            (~1.50659177), sweeping resolution and max_iter for convergence
+///   --glitch-stats N        perturbation glitch-rate stats over N random reference points
+///                            at a fixed deep zoom (default zoom 1e9, override with --zoom)
+///   --traversal row|hilbert select CPU traversal for the main timed throughput loop — row
+///                            (plain render()) or hilbert (render_tiled()) — lets `perf stat`
+///                            compare cache-miss rates between them    (default: row)
+///   --cuda-loop N           construct one CudaFractal and call .render() N times in a tight
+///                            loop; N=1 gives a clean single-launch target for `ncu` attachment,
+///                            larger N gives a steady-state loop for power sampling
+///                            (requires --features cuda)
+///   --scheduler-sweep       sweep tile_size x initial threshold for the heterogeneous
+///                            scheduler, report wall-time/gpu_ms/cpu_ms/cpu_tile_frac per
+///                            combination      (requires --features cuda)
+///   --first-paint           headless RenderWorker latency: request -> Preview -> Final,
+///                            across a cold render + a pan + a zoom
 ///   --json          emit JSON to stdout            (flag)
 ///
 /// Examples:
@@ -80,10 +99,22 @@ struct Args {
     dem_k:                f64,
     compare_ide:          bool,
     heterogeneous:        bool,
+    fractal_dimension:    bool,
+    box_min:              usize,
+    box_max:              usize,
+    area_estimate:        bool,
+    glitch_stats:         Option<usize>,
+    traversal:            Traversal,
+    cuda_loop:            Option<usize>,
+    scheduler_sweep:      bool,
+    first_paint:          bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Backend { Cpu, Wgpu, Hybrid }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Traversal { Row, Hilbert }
 
 impl Default for Args {
     fn default() -> Self {
@@ -114,6 +145,15 @@ impl Default for Args {
             dem_k:                4.0,
             compare_ide:          false,
             heterogeneous:        false,
+            fractal_dimension:    false,
+            box_min:              2,
+            box_max:              256,
+            area_estimate:        false,
+            glitch_stats:         None,
+            traversal:            Traversal::Row,
+            cuda_loop:            None,
+            scheduler_sweep:      false,
+            first_paint:          false,
         }
     }
 }
@@ -184,6 +224,22 @@ fn parse_args() -> Args {
             "--dem-k" => { i += 1; a.dem_k = raw[i].parse().unwrap(); }
             "--compare-ide" => a.compare_ide = true,
             "--heterogeneous" => a.heterogeneous = true,
+            "--fractal-dimension" => a.fractal_dimension = true,
+            "--box-min" => { i += 1; a.box_min = raw[i].parse().unwrap(); }
+            "--box-max" => { i += 1; a.box_max = raw[i].parse().unwrap(); }
+            "--area-estimate" => a.area_estimate = true,
+            "--glitch-stats" => { i += 1; a.glitch_stats = Some(raw[i].parse().unwrap()); }
+            "--traversal" => {
+                i += 1;
+                a.traversal = match raw[i].as_str() {
+                    "row"     => Traversal::Row,
+                    "hilbert" => Traversal::Hilbert,
+                    x => panic!("unknown traversal: {x}"),
+                };
+            }
+            "--cuda-loop" => { i += 1; a.cuda_loop = Some(raw[i].parse().unwrap()); }
+            "--scheduler-sweep" => a.scheduler_sweep = true,
+            "--first-paint" => a.first_paint = true,
             "--scaling" => a.scaling = true,
             "--json"    => a.json    = true,
             x => panic!("unknown flag: {x}"),
@@ -315,6 +371,297 @@ fn run_heterogeneous_check(_vp: &Viewport, _args: &Args) {
     eprintln!("[heterogeneous] cuda feature not enabled — rerun with: cargo run --release --bin bench_runner --features cuda -- --heterogeneous");
 }
 
+// ── Extended benchmark suite ────────────────────────────────────────────────
+// Box-counting dimension, area estimate, perturbation glitch statistics,
+// CPU traversal comparison, single-shot CUDA profiling target, scheduler
+// tunable sweep, and headless render-worker latency. See results/summary.md
+// "Stage 5 — Extended Analysis" for the numbers these flags produced.
+
+/// Box-counting dimension estimate + escape-iteration histogram (byproduct of
+/// the same render). Box sizes double from `args.box_min` to `args.box_max`.
+fn run_fractal_dimension(vp: &Viewport, args: &Args) {
+    use novafractal::fractal::{box_count_dimension, iteration_histogram};
+
+    let julia_c = [-0.4f64, 0.6];
+    let mut box_sizes = Vec::new();
+    let mut s = args.box_min.max(1);
+    while s <= args.box_max {
+        box_sizes.push(s);
+        s *= 2;
+    }
+
+    for &fractal in &args.fractals {
+        let buf = render(vp, fractal, julia_c, args.max_iter);
+        let result = box_count_dimension(&buf, vp.width as usize, vp.height as usize, args.max_iter, &box_sizes);
+        let hist = iteration_histogram(&buf, args.max_iter, 16);
+
+        if args.json {
+            let counts: Vec<String> = result.counts.iter().map(|&(s, c)| format!("[{s},{c}]")).collect();
+            println!(
+                "{{\"fractal\":\"{}\",\"dimension\":{},\"r_squared\":{},\"counts\":[{}],\"histogram\":{:?}}}",
+                fractal.name(), result.dimension, result.r_squared, counts.join(","), hist,
+            );
+        } else {
+            println!("\nbox-counting dimension: {} ({}×{}, max_iter={}, zoom={}, center={:?})",
+                fractal.name(), args.width, args.height, args.max_iter, args.zoom, args.center);
+            println!("  box_size -> occupied_count:");
+            for &(size, count) in &result.counts {
+                println!("    {size:>4}px -> {count}");
+            }
+            println!("  dimension estimate : {:.4} (R²={:.4}) — full boundary tends to 2.0 (Shishikura)", result.dimension, result.r_squared);
+            println!("  iteration histogram (16 bins, 0..=max_iter): {hist:?}");
+        }
+    }
+}
+
+/// Pixel-counting area estimate vs the literature constant (~1.50659177),
+/// sweeping resolution and max_iter independently to show convergence
+/// (resolution affects boundary/filament sampling; max_iter affects how many
+/// slow-escaping points get misclassified as "in set").
+fn run_area_estimate(args: &Args) {
+    use novafractal::fractal::estimate_area;
+
+    const LITERATURE_AREA: f64 = 1.50659177;
+    let julia_c = [-0.4f64, 0.6];
+    let center = [-0.5f64, 0.0];
+    let zoom = 1.0f64;
+
+    println!("\narea estimate vs literature constant ({LITERATURE_AREA})");
+    println!("-- resolution sweep (max_iter={}) --", args.max_iter);
+    for &(w, h) in &[(480u32, 360u32), (960, 720), (1920, 1080), (3840, 2160)] {
+        let vp = Viewport { center, zoom, width: w, height: h };
+        let aspect = w as f64 / h as f64;
+        let half = 2.0 / zoom;
+        let viewport_area = (half * aspect * 2.0) * (half * 2.0);
+        let buf = render(&vp, FractalType::Mandelbrot, julia_c, args.max_iter);
+        let area = estimate_area(&buf, args.max_iter, viewport_area);
+        let err_pct = (area - LITERATURE_AREA) / LITERATURE_AREA * 100.0;
+        if args.json {
+            println!("{{\"width\":{w},\"height\":{h},\"max_iter\":{},\"area\":{area},\"error_pct\":{err_pct}}}", args.max_iter);
+        } else {
+            println!("  {w:>5}×{h:<5} -> area={area:.6}  error={err_pct:+.3}%");
+        }
+    }
+
+    println!("-- max_iter sweep (resolution 1920×1080) --");
+    for &iters in &[100u32, 500, 1000, 5000, 20000] {
+        let vp = Viewport { center, zoom, width: 1920, height: 1080 };
+        let aspect = 1920.0 / 1080.0;
+        let half = 2.0 / zoom;
+        let viewport_area = (half * aspect * 2.0) * (half * 2.0);
+        let buf = render(&vp, FractalType::Mandelbrot, julia_c, iters);
+        let area = estimate_area(&buf, iters, viewport_area);
+        let err_pct = (area - LITERATURE_AREA) / LITERATURE_AREA * 100.0;
+        if args.json {
+            println!("{{\"width\":1920,\"height\":1080,\"max_iter\":{iters},\"area\":{area},\"error_pct\":{err_pct}}}");
+        } else {
+            println!("  max_iter={iters:<6} -> area={area:.6}  error={err_pct:+.3}%");
+        }
+    }
+}
+
+/// Tiny deterministic PRNG (SplitMix64) — avoids adding a `rand` dependency
+/// just for picking sample points; reproducible across runs given the same seed.
+struct SplitMix64(u64);
+impl SplitMix64 {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+    /// Uniform f64 in [0, 1).
+    fn next_f64(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// Perturbation glitch-rate statistics over `n` random reference points at a
+/// fixed deep zoom (`args.zoom`, default sweep value 1e9). For each reference
+/// point, computes the orbit once and counts what fraction of the frame's
+/// pixels glitch (`perturb_mandelbrot_flagged` returns `None`) against it —
+/// the same per-pixel check `bench_compare_multiref` uses, just repeated
+/// across many reference locations instead of one, to see how much glitch
+/// rate varies location-to-location rather than trusting a single sample.
+fn run_glitch_stats(args: &Args, n: usize) {
+    let w = args.width as usize;
+    let h = args.height as usize;
+    let zoom = if args.zoom == 1.0 { 1e9 } else { args.zoom };
+
+    // Sample reference centers within a fixed bounding box around the
+    // seahorse-valley region (already known to be boundary-rich at this
+    // zoom), not the whole complex plane — a uniform-random point over the
+    // whole plane would almost always land in the trivial exterior.
+    let mut rng = SplitMix64(0xC0FFEE ^ n as u64);
+    let mut rates = Vec::with_capacity(n);
+
+    for _ in 0..n {
+        let cr = -0.75 + (rng.next_f64() - 0.5) * 0.2;
+        let ci = 0.1 + (rng.next_f64() - 0.5) * 0.2;
+        let vp = Viewport { center: [cr, ci], zoom, width: args.width, height: args.height };
+        let pg = pixel_grid(&vp);
+        let orbit = compute_reference_orbit(cr, ci, args.max_iter);
+
+        let mut glitches = 0usize;
+        for y in 0..h {
+            let im = pg.im_start + y as f64 * pg.im_step;
+            for x in 0..w {
+                let re = pg.re_start + x as f64 * pg.re_step;
+                if perturb_mandelbrot_flagged(&orbit, re - cr, im - ci, args.max_iter).is_none() {
+                    glitches += 1;
+                }
+            }
+        }
+        rates.push(glitches as f64 / (w * h) as f64);
+    }
+
+    let mean = rates.iter().sum::<f64>() / n as f64;
+    let variance = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n as f64;
+    let stddev = variance.sqrt();
+    let min = rates.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = rates.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+    if args.json {
+        println!("{{\"n\":{n},\"zoom\":{zoom},\"mean\":{mean},\"stddev\":{stddev},\"min\":{min},\"max\":{max}}}");
+    } else {
+        println!("\nperturbation glitch-rate statistics ({n} random reference points, zoom={zoom})");
+        println!("  mean glitch rate   : {:.4}%", mean * 100.0);
+        println!("  stddev             : {:.4}%", stddev * 100.0);
+        println!("  min / max          : {:.4}% / {:.4}%", min * 100.0, max * 100.0);
+    }
+}
+
+/// Headless `RenderWorker` latency: sends a cold render, a pure pan, and a
+/// zoom, measuring wall time from `request()` to the first `Preview` result
+/// and to the following `Final` result via `poll()`. No GUI window is needed
+/// — `RenderWorker` only depends on the mpsc channels and the fractal/gpu
+/// modules, not `eframe`/`egui`'s windowing.
+fn run_first_paint(args: &Args) {
+    use novafractal::gui::render::{RenderWorker, RenderRequest, Quality};
+    use novafractal::gui::color::ColorScheme;
+
+    let mut worker = RenderWorker::new();
+    let base_vp = Viewport { center: [-0.5, 0.0], zoom: 1.0, width: args.width, height: args.height };
+
+    let request = |worker: &mut RenderWorker, vp: Viewport, label: &str, args: &Args| {
+        let t0 = Instant::now();
+        worker.request(RenderRequest {
+            vp, fractal: FractalType::Mandelbrot, julia_c: [-0.4, 0.6], max_iter: args.max_iter,
+            scheme: ColorScheme::Inferno, use_ms: false, use_perturbation: false, use_sa: false,
+            use_neighbor_cap: false, use_multiref: false, use_heterogeneous: false,
+        });
+
+        let mut preview_ms: Option<f64> = None;
+        let mut final_ms: Option<f64> = None;
+        while final_ms.is_none() {
+            if let Some(result) = worker.poll() {
+                let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+                match result.quality {
+                    Quality::Preview => preview_ms = Some(elapsed),
+                    Quality::Final => final_ms = Some(elapsed),
+                }
+            }
+        }
+        if args.json {
+            println!("{{\"stage\":\"{label}\",\"preview_ms\":{},\"final_ms\":{}}}",
+                preview_ms.map_or("null".into(), |v| v.to_string()), final_ms.unwrap());
+        } else {
+            println!("  {label:<12} preview={} final={:.2}ms",
+                preview_ms.map_or("n/a".into(), |v| format!("{v:.2}ms")), final_ms.unwrap());
+        }
+    };
+
+    println!("\nheadless render-worker latency ({}×{}, max_iter={})", args.width, args.height, args.max_iter);
+    request(&mut worker, base_vp.clone(), "cold", args);
+    // Exact N-pixel shift (not an arbitrary real offset) so `Viewport::delta_pixels`
+    // recognizes it as integer-aligned and the worker takes the incremental
+    // `shift_and_fill` path instead of falling back to a full recompute.
+    let pg = pixel_grid(&base_vp);
+    let mut panned = base_vp.clone();
+    panned.center[0] -= 40.0 * pg.re_step;
+    request(&mut worker, panned, "pan", args);
+    let mut zoomed = base_vp;
+    zoomed.zoom *= 2.0;
+    request(&mut worker, zoomed, "zoom", args);
+}
+
+/// Single-shot/looped CUDA render — no CPU work around it, so `ncu`/`nvprof`
+/// can attach to a clean, isolated kernel launch. `n=1` for profiling attach,
+/// larger `n` gives a steady-state loop for power sampling (`scripts/energy_bench.sh`).
+#[cfg(feature = "cuda")]
+fn run_cuda_loop(args: &Args, n: usize) {
+    use novafractal::gpu::cuda::CudaFractal;
+
+    let julia_c = [-0.4f64, 0.6];
+    let vp = Viewport { center: args.center, zoom: args.zoom, width: args.width, height: args.height };
+    let pg = pixel_grid(&vp);
+    let mut cuda = CudaFractal::new(vp.width, vp.height);
+
+    let t0 = Instant::now();
+    for _ in 0..n {
+        let _ = cuda.render(pg.re_start, pg.im_start, pg.re_step, pg.im_step, julia_c[0], julia_c[1], args.max_iter, FractalType::Mandelbrot.as_u32());
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+
+    if args.json {
+        println!("{{\"n\":{n},\"total_s\":{elapsed},\"mean_ms\":{}}}", elapsed / n as f64 * 1000.0);
+    } else {
+        println!("\ncuda-loop: {n} launches, total={:.3}s, mean={:.3}ms/launch", elapsed, elapsed / n as f64 * 1000.0);
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn run_cuda_loop(_args: &Args, _n: usize) {
+    eprintln!("[cuda-loop] cuda feature not enabled — rerun with --features cuda");
+}
+
+/// Sweeps the heterogeneous scheduler's own tunables — `tile_size` and the
+/// classification threshold's starting value — against a fixed representative
+/// viewport, reusing `render_heterogeneous`/`SchedulerConfig`/`ThresholdController`
+/// unmodified. Finds whether tuning closes the gap identified in
+/// `results/summary.md`'s Stage 3 (adaptive scheduler losing to a static split).
+#[cfg(feature = "cuda")]
+fn run_scheduler_sweep(args: &Args) {
+    use novafractal::gpu::cuda::CudaFractal;
+    use novafractal::scheduler::{render_heterogeneous, controller::ThresholdController, SchedulerConfig};
+
+    let julia_c = [-0.4f64, 0.6];
+    let vp = Viewport { center: args.center, zoom: args.zoom, width: args.width, height: args.height };
+    let mut cuda = CudaFractal::new(vp.width, vp.height);
+
+    println!("\nscheduler tile_size x threshold sweep ({}×{}, max_iter={}, zoom={}, center={:?})",
+        args.width, args.height, args.max_iter, args.zoom, args.center);
+
+    for &tile_size in &[16u32, 32, 64, 128] {
+        for &threshold in &[10.0f32, 50.0, 150.0, 500.0] {
+            let mut controller = ThresholdController::new(threshold);
+            let cfg = SchedulerConfig { tile_size };
+
+            let t0 = Instant::now();
+            let result = render_heterogeneous(&vp, FractalType::Mandelbrot, julia_c, args.max_iter, &mut cuda, &mut controller, &cfg);
+            let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            if args.json {
+                println!(
+                    "{{\"tile_size\":{tile_size},\"threshold\":{threshold},\"wall_ms\":{wall_ms},\"gpu_ms\":{},\"cpu_ms\":{},\"cpu_tile_frac\":{}}}",
+                    result.gpu_ms, result.cpu_ms, result.cpu_tile_frac,
+                );
+            } else {
+                println!(
+                    "  tile={tile_size:<4} thresh={threshold:<6} wall={wall_ms:<8.2} gpu_ms={:<8.2} cpu_ms={:<8.2} cpu_tile_frac={:.1}%",
+                    result.gpu_ms, result.cpu_ms, result.cpu_tile_frac * 100.0,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn run_scheduler_sweep(_args: &Args) {
+    eprintln!("[scheduler-sweep] cuda feature not enabled — rerun with --features cuda");
+}
+
 fn time_cpu_render(
     vp: &Viewport,
     fractal: FractalType,
@@ -374,6 +721,42 @@ fn time_cpu_render(
 
 fn bench_cpu(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize, perturbation: bool, use_sa: bool) -> Sample {
     time_cpu_render(vp, fractal, max_iter, runs, perturbation, use_sa).0
+}
+
+/// Same measurement as `time_cpu_render`, but selects `render()` (row-major)
+/// vs `render_tiled()` (64x64 Hilbert-order) for the timed loop — bit-identical
+/// output (see `--tile-check`), only the write/traversal order differs. Used to
+/// compare L1/L2 cache-miss rates between the two under `perf stat` (`--traversal`).
+fn bench_cpu_traversal(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize, traversal: Traversal) -> Sample {
+    let pixels = (vp.width * vp.height) as u64;
+    let julia_c = [-0.4f64, 0.6];
+    let render_once = || match traversal {
+        Traversal::Row     => render(vp, fractal, julia_c, max_iter),
+        Traversal::Hilbert => render_tiled(vp, fractal, julia_c, max_iter),
+    };
+
+    let _ = render_once();
+    let mut times: Vec<Duration> = Vec::with_capacity(runs);
+    let mut last_buf = Vec::new();
+    for _ in 0..runs {
+        let t = Instant::now();
+        last_buf = render_once();
+        times.push(t.elapsed());
+    }
+
+    let total_iters: u64 = last_buf.iter().map(|&v| v.min(max_iter as f32) as u64).sum();
+    let fpi = flops_per_iter(fractal);
+    times.sort();
+    let med_s = times[runs / 2].as_secs_f64();
+    let backend = match traversal { Traversal::Row => "cpu/row", Traversal::Hilbert => "cpu/hilbert" };
+
+    Sample {
+        fractal: fractal.name(), backend, threads: rayon::current_num_threads(),
+        width: vp.width, height: vp.height, max_iter, runs,
+        median_ms: med_s * 1e3, min_ms: times[0].as_secs_f64() * 1e3, max_ms: times[runs - 1].as_secs_f64() * 1e3,
+        mpix_per_sec: pixels as f64 / 1e6 / med_s, total_iters,
+        gflops: (total_iters * fpi) as f64 / med_s / 1e9, mem_traffic_mb: pixels as f64 * 8.0 / 1e6,
+    }
 }
 
 fn sa_skip_count(vp: &Viewport, max_iter: u32) -> usize {
@@ -1059,6 +1442,32 @@ fn main() {
         return;
     }
 
+    // ── extended benchmark suite ──────────────────────────────────────────────
+    if args.fractal_dimension {
+        run_fractal_dimension(&vp, &args);
+        return;
+    }
+    if args.area_estimate {
+        run_area_estimate(&args);
+        return;
+    }
+    if let Some(n) = args.glitch_stats {
+        run_glitch_stats(&args, n);
+        return;
+    }
+    if let Some(n) = args.cuda_loop {
+        run_cuda_loop(&args, n);
+        return;
+    }
+    if args.scheduler_sweep {
+        run_scheduler_sweep(&args);
+        return;
+    }
+    if args.first_paint {
+        run_first_paint(&args);
+        return;
+    }
+
     // ── single zoom scalar vs perturbation compare ───────────────────────────
     if args.compare_perturb {
         let result = bench_compare_perturb(&vp, args.max_iter, args.runs);
@@ -1098,9 +1507,13 @@ fn main() {
         for &fractal in &args.fractals {
             match args.backend {
                 Backend::Cpu => {
-                    samples.push(bench_cpu(
-                        fractal, &vp, args.max_iter, args.runs, args.perturbation, args.use_sa,
-                    ));
+                    if args.traversal == Traversal::Hilbert {
+                        samples.push(bench_cpu_traversal(fractal, &vp, args.max_iter, args.runs, args.traversal));
+                    } else {
+                        samples.push(bench_cpu(
+                            fractal, &vp, args.max_iter, args.runs, args.perturbation, args.use_sa,
+                        ));
+                    }
                 }
                 Backend::Wgpu => {
                     if args.perturbation {
@@ -1135,5 +1548,36 @@ fn main() {
         print_json(&samples);
     } else {
         print_table(&samples);
+    }
+
+    if args.scaling {
+        print_scaling_efficiency(&samples, args.json);
+    }
+}
+
+/// Speedup and parallel efficiency relative to each fractal's own 1-thread
+/// sample (Amdahl's law: efficiency = speedup / threads * 100%, 100% = perfect
+/// linear scaling, dropping efficiency shows where contention/overhead grows).
+fn print_scaling_efficiency(samples: &[Sample], json: bool) {
+    let mut fractals: Vec<&str> = samples.iter().map(|s| s.fractal).collect();
+    fractals.dedup();
+
+    if !json {
+        println!("\n-- thread-scaling speedup / efficiency --");
+    }
+    for fractal in fractals {
+        let group: Vec<&Sample> = samples.iter().filter(|s| s.fractal == fractal).collect();
+        let Some(baseline) = group.iter().find(|s| s.threads == 1) else { continue };
+        let baseline_ms = baseline.median_ms;
+
+        for s in &group {
+            let speedup = baseline_ms / s.median_ms;
+            let efficiency = speedup / s.threads as f64 * 100.0;
+            if json {
+                println!("{{\"fractal\":\"{}\",\"threads\":{},\"speedup\":{speedup},\"efficiency_pct\":{efficiency}}}", s.fractal, s.threads);
+            } else {
+                println!("  {:<12} threads={:<3} speedup={speedup:<6.2}x efficiency={efficiency:.1}%", s.fractal, s.threads);
+            }
+        }
     }
 }
