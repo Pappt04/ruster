@@ -12,16 +12,50 @@ __device__ double smooth_iter(uint32_t i, double zn_sq) {
     return (double)i + 1.0 - nu;
 }
 
+// Center (nucleus) and squared radius of the two largest period-3 bulbs
+// attached to the main cardioid. Must match src/fractal/fractal.rs's
+// PERIOD3_CENTER_RE/IM/PERIOD3_RADIUS_SQ bit-for-bit (same decimal literals)
+// so both backends classify exactly the same points as "interior".
+#define PERIOD3_CENTER_RE (-0.1225611668766536)
+#define PERIOD3_CENTER_IM (0.7448617666197442)
+#define PERIOD3_RADIUS_SQ (0.07371484375 * 0.07371484375)
+
+__device__ __forceinline__ bool in_period3_bulb(double cr, double ci) {
+    double dr     = cr - PERIOD3_CENTER_RE;
+    double di_pos = ci - PERIOD3_CENTER_IM;
+    double di_neg = ci + PERIOD3_CENTER_IM;
+    return (dr * dr + di_pos * di_pos < PERIOD3_RADIUS_SQ)
+        || (dr * dr + di_neg * di_neg < PERIOD3_RADIUS_SQ);
+}
+
+// Mirrors src/fractal/fractal.rs's `mandelbrot()` exactly, including the
+// "z0=c" fast path (skips the trivial z0=0 -> z1=c step and manually unrolls
+// z1 -> z2). This isn't just a performance match: the period-detection
+// reference orbit (zr_b/zi_b) only starts accumulating once the main loop
+// begins, so starting that loop at a different iteration index than the CPU
+// changes *which* orbit point convergence gets checked against — a pixel
+// exactly on the edge of a periodic cycle can come out "converged" on one
+// backend and "escapes 400 iterations later" on the other. Keeping the loop
+// structure identical keeps the two backends in bit-for-bit agreement.
 __device__ float mandelbrot(double cr, double ci, uint32_t max_iter) {
     double q = (cr - 0.25) * (cr - 0.25) + ci * ci;
     if (q * (q + cr - 0.25) < 0.25 * ci * ci) return (float)max_iter;
     if ((cr + 1.0) * (cr + 1.0) + ci * ci < 0.0625) return (float)max_iter;
+    if (in_period3_bulb(cr, ci)) return (float)max_iter;
 
-    double zr = 0.0, zi = 0.0;
+    double zr = cr, zi = ci;
+    if (max_iter <= 1) return (float)max_iter;
+    // iter 1: z = c² + c
+    double zr2 = zr * zr;
+    double zi2 = zi * zi;
+    zi = 2.0 * zr * zi + ci;
+    zr = zr2 - zi2 + cr;
+    if (max_iter <= 2) return (float)max_iter;
+
     double zr_b = 0.0, zi_b = 0.0;
     uint32_t period = 0, check = 8;
 
-    for (uint32_t i = 0; i < max_iter; i++) {
+    for (uint32_t i = 2; i < max_iter; i++) {
         double zr2 = zr * zr, zi2 = zi * zi;
         double zn_sq = zr2 + zi2;
         if (zn_sq > ESCAPE_SQ) return (float)smooth_iter(i, zn_sq);

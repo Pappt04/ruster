@@ -269,21 +269,11 @@ fn pixel_diff_stats(a: &[f32], b: &[f32]) -> (f32, f64, u64) {
 
 /// Validate `scheduler::render_heterogeneous` against plain CPU `render()` and
 /// report the GPU/CPU tile split + timing, alongside a plain full-frame
-/// `cuda.render()` baseline for context.
-///
-/// The scheduler's own tiled dispatch (`fractal_kernel_tiled`) does not use
-/// the Morton-order dispatch that `fractal_kernel` (plain `render()`/
-/// `render_prepass()`) uses, so it isn't subject to that kernel's coverage
-/// gaps on non-power-of-2 image dimensions — the baseline column below will
-/// often show much larger divergence than the scheduler's own numbers for
-/// exactly that reason. A small residual divergence between the scheduler and
-/// CPU `render()` is still expected: escape-time fractals are chaotically
-/// sensitive near the boundary, and CPU (scalar) vs GPU (`--fmad=true`
-/// fused-multiply-add) floating point can disagree by a few ULP right at a
-/// pixel's escape iteration, occasionally flipping a boundary pixel's count
-/// by a large amount. The scheduler routes the vast majority of such pixels
-/// to the CPU (see the baseline-vs-scheduler improvement below); it cannot
-/// guarantee catching every one from a coarse 1/8-res prepass.
+/// `cuda.render()` baseline for context. Both columns are expected to show
+/// `max_diff == 0.0` — CPU and GPU now agree bit-for-bit (see the fixes in
+/// `src/gpu/cuda.rs::morton_cfg`, `src/fractal/fractal.cu::mandelbrot`,
+/// `build.rs` (`--fmad=false`), and `src/fractal/fractal.rs::render_tile_exact`
+/// for the three independent divergence sources this closed).
 #[cfg(feature = "cuda")]
 fn run_heterogeneous_check(vp: &Viewport, args: &Args) {
     use novafractal::gpu::cuda::CudaFractal;

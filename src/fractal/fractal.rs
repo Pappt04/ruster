@@ -617,22 +617,30 @@ pub fn render_mariani_silver(vp: &Viewport, fractal: FractalType, julia_c: [f64;
     buf
 }
 
-/// Render one `[x0, y0, tw, th]` tile (in full-frame pixel coordinates) using
-/// Mariani-Silver subdivision, returning a tile-local (not full-frame) buffer.
+/// Render one `[x0, y0, tw, th]` tile (in full-frame pixel coordinates)
+/// exactly, one `compute()` call per pixel, returning a tile-local (not
+/// full-frame) buffer.
 ///
 /// Used by the heterogeneous scheduler (`crate::scheduler`) to fill CPU-routed
-/// boundary tiles — `ms_fill`'s coordinates are already local-buffer-relative,
-/// so scoping it to a small tile is exactly the generality it was written for.
-pub fn render_tile_ms(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32, tile: [u32; 4]) -> Vec<f32> {
+/// boundary tiles. This deliberately does NOT use `ms_fill`'s border-uniformity
+/// flood-fill shortcut: that check only samples a rectangle's border, so a
+/// thin escaping filament entirely contained in the interior (never touching
+/// a border at any recursion depth) can be silently flood-filled with the
+/// wrong value. The scheduler's whole point is to route exactly the tiles
+/// most likely to contain that kind of feature to the CPU, which makes this
+/// approximation's failure mode land precisely where the scheduler can least
+/// afford it — so CPU tiles pay full per-pixel cost for a bit-exact match to
+/// `render()` instead.
+pub fn render_tile_exact(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32, tile: [u32; 4]) -> Vec<f32> {
     let [x0, y0, tw, th] = tile;
-    let mut local = vec![f32::NAN; (tw * th) as usize];
-    let re_start_tile = pg.re_start + x0 as f64 * pg.re_step;
-    let im_start_tile = pg.im_start + y0 as f64 * pg.im_step;
-    ms_fill(
-        &mut local, tw as usize, fractal, julia_c, max_iter,
-        re_start_tile, im_start_tile, pg.re_step, pg.im_step,
-        0, 0, tw as usize, th as usize,
-    );
+    let mut local = vec![0.0f32; (tw * th) as usize];
+    for ly in 0..th {
+        let im = pg.im_start + (y0 + ly) as f64 * pg.im_step;
+        for lx in 0..tw {
+            let re = pg.re_start + (x0 + lx) as f64 * pg.re_step;
+            local[(ly * tw + lx) as usize] = compute(fractal, re, im, julia_c, max_iter);
+        }
+    }
     local
 }
 

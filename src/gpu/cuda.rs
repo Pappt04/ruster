@@ -208,9 +208,21 @@ impl CudaFractal {
     pub fn height(&self) -> u32 { self.height }
 
     /// 1-D Morton launch config for a `w × h` image using 16×16 thread blocks.
+    ///
+    /// `morton_decode` interleaves a fixed 16 bits each for x and y, i.e. it
+    /// bijects the codes `[0, dim*dim)` onto the square `[0,dim) x [0,dim)`
+    /// for any power-of-two `dim`. The first `w*h` codes do NOT in general
+    /// cover the `w x h` rectangle unless `w == h` and both are powers of
+    /// two — for any other shape they land in some differently-shaped subset
+    /// of the same area, silently leaving real pixels uncomputed (they keep
+    /// whatever was in the output buffer, typically 0.0 from `alloc_zeros`).
+    /// Padding to the smallest enclosing power-of-two *square* guarantees
+    /// every pixel in the rectangle is visited exactly once (the in-kernel
+    /// `x >= width || y >= height` check discards the rest of the square).
     fn morton_cfg(&self, w: u32, h: u32) -> LaunchConfig {
-        let total  = w * h;
-        let blocks = (total + 255) / 256;
+        let dim    = w.max(h).max(1).next_power_of_two();
+        let total  = dim as u64 * dim as u64;
+        let blocks = ((total + 255) / 256) as u32;
         LaunchConfig {
             block_dim: (16, 16, 1),
             grid_dim:  (blocks, 1, 1),

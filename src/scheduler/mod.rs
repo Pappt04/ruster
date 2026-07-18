@@ -1,6 +1,6 @@
 //! Adaptive prepass-guided heterogeneous CPU+GPU scheduler (see `TUTORIAL.md`
 //! Stage 3). Classifies the frame into tiles from a cheap coarse GPU prepass,
-//! routes divergent "boundary" tiles to the CPU (Mariani-Silver fill) and
+//! routes divergent "boundary" tiles to the CPU (exact per-pixel fill) and
 //! coherent tiles to the GPU (`fractal_kernel_tiled`), running both
 //! concurrently, then composites into one full-resolution buffer.
 //!
@@ -11,7 +11,7 @@ pub mod classifier;
 pub mod controller;
 
 use rayon::prelude::*;
-use crate::fractal::{pixel_grid, render_tile_ms, IterBuf};
+use crate::fractal::{pixel_grid, render_tile_exact, IterBuf};
 use crate::fractal::fractal_type::FractalType;
 use crate::gpu::cuda::CudaFractal;
 use crate::gui::viewport::Viewport;
@@ -106,7 +106,7 @@ pub fn render_heterogeneous(
             let t0 = std::time::Instant::now();
             let results: Vec<([u32; 4], Vec<f32>)> = cpu_tiles
                 .par_iter()
-                .map(|&tile| (tile, render_tile_ms(&pg, fractal, julia_c, max_iter, tile)))
+                .map(|&tile| (tile, render_tile_exact(&pg, fractal, julia_c, max_iter, tile)))
                 .collect();
             (results, t0.elapsed())
         });
