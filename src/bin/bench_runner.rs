@@ -11,7 +11,11 @@
 ///   --threads  N   rayon threads, 0 = num_cpus    (default: 0)
 ///   --backend  cpu|wgpu|hybrid                    (default: cpu)
 ///   --zoom     F                                  (default: 1.0)
-///   --center   RE,IM                              (default: -0.5,0.0)
+///   --center   RE,IM   (default: each fractal's own default_center() —
+///                       Mandelbrot -0.5,0.0; Julia/Newton/Nova 0.0,0.0 —
+///                       pass this flag to force one fixed center for every
+///                       --fractal instead, e.g. for cross-project comparisons)
+///   --julia-c  RE,IM                              (default: -0.4,0.6)
 ///   --perturbation     use render_perturbation()  (CPU only, Mandelbrot)
 ///   --compare-perturb  scalar vs perturbation timing + pixel diff (Mandelbrot)
 ///   --perturb-sweep    zoom sweep [1,1e3,1e6,1e9,1e12] at seahorse valley
@@ -67,6 +71,8 @@
 
 use std::time::{Duration, Instant};
 use novafractal::fractal::{render, render_perturbation, render_perturbation_sa, compute_reference_orbit, compute_series_approx, flops_per_iter, FractalType, render_neighbor_capped, in_period3_bulb, pixel_grid, render_tiled, shift_and_fill, render_perturbation_multiref, perturb_mandelbrot_flagged, render_perturbation_rebase, render_mariani_silver_dem, render_ide_biased};
+#[cfg(feature = "simd")]
+use novafractal::fractal::{render_simd, render_simd_f32, render_simd_f32_ilp, F32_PRECISION_THRESHOLD};
 use novafractal::gui::viewport::Viewport;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -81,7 +87,14 @@ struct Args {
     threads:    usize,
     backend:            Backend,
     zoom:               f64,
-    center:             [f64; 2],
+    /// `None` means "use each fractal's own `default_center()`" (set by
+    /// `FractalType::default_center()`) rather than one fixed value reused
+    /// across every `--fractal` — a real comparison-fairness bug fixed this
+    /// round: comparing e.g. Julia against another project's Julia numbers
+    /// while ruster renders Julia at Mandelbrot's own default center silently
+    /// produces a mostly-background, unrepresentative workload.
+    center:             Option<[f64; 2]>,
+    julia_c:            [f64; 2],
     perturbation:       bool,
     use_sa:             bool,
     compare_perturb:    bool,
@@ -127,7 +140,8 @@ impl Default for Args {
             threads:   0,
             backend:         Backend::Cpu,
             zoom:            1.0,
-            center:          [-0.5, 0.0],
+            center:          None,
+            julia_c:         [-0.4, 0.6],
             perturbation:    false,
             use_sa:          false,
             compare_perturb: false,
@@ -199,8 +213,16 @@ fn parse_args() -> Args {
                 i += 1;
                 let parts: Vec<&str> = raw[i].split(',').collect();
                 assert!(parts.len() == 2, "--center expects RE,IM");
-                a.center[0] = parts[0].trim().parse().unwrap();
-                a.center[1] = parts[1].trim().parse().unwrap();
+                let re: f64 = parts[0].trim().parse().unwrap();
+                let im: f64 = parts[1].trim().parse().unwrap();
+                a.center = Some([re, im]);
+            }
+            "--julia-c" => {
+                i += 1;
+                let parts: Vec<&str> = raw[i].split(',').collect();
+                assert!(parts.len() == 2, "--julia-c expects RE,IM");
+                a.julia_c[0] = parts[0].trim().parse().unwrap();
+                a.julia_c[1] = parts[1].trim().parse().unwrap();
             }
             "--perturbation"    => a.perturbation    = true,
             "--sa"              => a.use_sa          = true,
@@ -296,14 +318,52 @@ fn cpu_render(
     max_iter: u32,
     perturbation: bool,
     use_sa: bool,
+    fastest: bool,
 ) -> Vec<f32> {
     if perturbation && use_sa {
         render_perturbation_sa(vp, fractal, julia_c, max_iter)
     } else if perturbation {
         render_perturbation(vp, fractal, julia_c, max_iter)
+    } else if fastest {
+        cpu_render_fastest(vp, fractal, julia_c, max_iter)
     } else {
         render(vp, fractal, julia_c, max_iter)
     }
+}
+
+/// The best available CPU render path for `fractal` at `vp`'s zoom — mirrors
+/// `src/gui/render.rs`'s SIMD dispatch (fractal type + zoom-based f32/f64
+/// precision threshold) exactly, so bench_runner's `--backend cpu` numbers
+/// reflect what the live app actually renders, not an artificially-scalar
+/// path. Used only by the main throughput measurement (`bench_cpu`) — NOT by
+/// `bench_compare_perturb`'s scalar ground truth (`cpu_render(..., fastest:
+/// false)`), which must stay on plain `render()` so its perturbation-vs-scalar
+/// validation semantics don't shift underneath it.
+#[cfg(feature = "simd")]
+fn cpu_render_fastest(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> Vec<f32> {
+    match fractal {
+        FractalType::Mandelbrot => {
+            if vp.zoom < F32_PRECISION_THRESHOLD {
+                // render_simd_f32_ilp is bit-identical to render_simd_f32, only faster (2a ILP).
+                render_simd_f32_ilp(vp, fractal, julia_c, max_iter)
+            } else {
+                render_simd(vp, fractal, julia_c, max_iter)
+            }
+        }
+        FractalType::Julia => {
+            if vp.zoom < F32_PRECISION_THRESHOLD {
+                render_simd_f32(vp, fractal, julia_c, max_iter)
+            } else {
+                render_simd(vp, fractal, julia_c, max_iter)
+            }
+        }
+        _ => render(vp, fractal, julia_c, max_iter),
+    }
+}
+
+#[cfg(not(feature = "simd"))]
+fn cpu_render_fastest(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> Vec<f32> {
+    render(vp, fractal, julia_c, max_iter)
 }
 
 fn pixel_diff_stats(a: &[f32], b: &[f32]) -> (f32, f64, u64) {
@@ -665,22 +725,23 @@ fn run_scheduler_sweep(_args: &Args) {
 fn time_cpu_render(
     vp: &Viewport,
     fractal: FractalType,
+    julia_c: [f64; 2],
     max_iter: u32,
     runs: usize,
     perturbation: bool,
     use_sa: bool,
+    fastest: bool,
 ) -> (Sample, Vec<f32>) {
     let pixels = (vp.width * vp.height) as u64;
-    let julia_c = [-0.4f64, 0.6];
 
-    let _ = cpu_render(vp, fractal, julia_c, max_iter, perturbation, use_sa);
+    let _ = cpu_render(vp, fractal, julia_c, max_iter, perturbation, use_sa, fastest);
 
     let mut times: Vec<Duration> = Vec::with_capacity(runs);
     let mut last_buf = Vec::new();
 
     for _ in 0..runs {
         let t = Instant::now();
-        last_buf = cpu_render(vp, fractal, julia_c, max_iter, perturbation, use_sa);
+        last_buf = cpu_render(vp, fractal, julia_c, max_iter, perturbation, use_sa, fastest);
         times.push(t.elapsed());
     }
 
@@ -719,8 +780,11 @@ fn time_cpu_render(
 
 // ── CPU benchmarking ──────────────────────────────────────────────────────────
 
-fn bench_cpu(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize, perturbation: bool, use_sa: bool) -> Sample {
-    time_cpu_render(vp, fractal, max_iter, runs, perturbation, use_sa).0
+fn bench_cpu(fractal: FractalType, vp: &Viewport, julia_c: [f64; 2], max_iter: u32, runs: usize, perturbation: bool, use_sa: bool) -> Sample {
+    // fastest=true: this is the main --backend cpu throughput measurement, so
+    // it should reflect what the live app actually renders (SIMD when the
+    // `simd` feature is enabled — the default), not an artificially-scalar path.
+    time_cpu_render(vp, fractal, julia_c, max_iter, runs, perturbation, use_sa, true).0
 }
 
 /// Same measurement as `time_cpu_render`, but selects `render()` (row-major)
@@ -769,9 +833,15 @@ fn sa_skip_count(vp: &Viewport, max_iter: u32) -> usize {
 
 fn bench_compare_perturb(vp: &Viewport, max_iter: u32, runs: usize) -> PerturbCompare {
     let fractal = FractalType::Mandelbrot;
-    let (scalar_sample,  scalar_buf)  = time_cpu_render(vp, fractal, max_iter, runs, false, false);
-    let (perturb_sample, perturb_buf) = time_cpu_render(vp, fractal, max_iter, runs, true,  false);
-    let (sa_sample,      sa_buf)      = time_cpu_render(vp, fractal, max_iter, runs, true,  true);
+    // fastest=false: this is the scalar f64 ground truth perturbation results
+    // are validated against — must not shift to SIMD/f32 underneath this
+    // comparison's existing precision semantics.
+    // julia_c is unused by Mandelbrot (this function always benches
+    // FractalType::Mandelbrot) — any value works here.
+    let julia_c = [-0.4f64, 0.6];
+    let (scalar_sample,  scalar_buf)  = time_cpu_render(vp, fractal, julia_c, max_iter, runs, false, false, false);
+    let (perturb_sample, perturb_buf) = time_cpu_render(vp, fractal, julia_c, max_iter, runs, true,  false, false);
+    let (sa_sample,      sa_buf)      = time_cpu_render(vp, fractal, julia_c, max_iter, runs, true,  true, false);
     let (max_diff,  mean_diff,  above)  = pixel_diff_stats(&scalar_buf, &perturb_buf);
     let (max_diff2, mean_diff2, above2) = pixel_diff_stats(&scalar_buf, &sa_buf);
     let speedup_perturb = if perturb_sample.median_ms > 0.0 {
@@ -1276,8 +1346,21 @@ fn main() {
             .expect("rayon pool init");
     }
 
+    // Shared viewport used by every single-fractal / Mandelbrot-only mode
+    // below (perturbation sweeps, bulb-reject, neighbor-cap, etc.) — falls
+    // back to Mandelbrot's own default_center() when --center isn't passed,
+    // identical to this binary's previous hardcoded [-0.5, 0.0] default.
     let vp = Viewport {
-        center: args.center,
+        center: args.center.unwrap_or(FractalType::Mandelbrot.default_center()),
+        zoom:   args.zoom,
+        width:  args.width,
+        height: args.height,
+    };
+    // Per-fractal viewport for the main multi-fractal throughput sweep below
+    // — each fractal gets its own sensible default_center() unless --center
+    // was explicitly passed, instead of silently reusing Mandelbrot's.
+    let fractal_vp = |fractal: FractalType| Viewport {
+        center: args.center.unwrap_or(fractal.default_center()),
         zoom:   args.zoom,
         width:  args.width,
         height: args.height,
@@ -1286,7 +1369,11 @@ fn main() {
     if !args.json {
         eprintln!("bench_runner  git={}", git_hash());
         eprintln!("  resolution : {}×{}", args.width, args.height);
-        eprintln!("  center     : [{}, {}]", args.center[0], args.center[1]);
+        match args.center {
+            Some(c) => eprintln!("  center     : [{}, {}]", c[0], c[1]),
+            None    => eprintln!("  center     : (per-fractal default)"),
+        }
+        eprintln!("  julia_c    : [{}, {}]", args.julia_c[0], args.julia_c[1]);
         eprintln!("  zoom       : {}", args.zoom);
         eprintln!("  max_iter   : {}", args.max_iter);
         eprintln!("  runs       : {}", args.runs);
@@ -1496,8 +1583,9 @@ fn main() {
                 .expect("rayon pool");
 
             for &fractal in &args.fractals {
+                let fvp = fractal_vp(fractal);
                 let mut s = pool.install(|| {
-                    bench_cpu(fractal, &vp, args.max_iter, args.runs, args.perturbation, args.use_sa)
+                    bench_cpu(fractal, &fvp, args.julia_c, args.max_iter, args.runs, args.perturbation, args.use_sa)
                 });
                 s.threads = t;
                 samples.push(s);
@@ -1505,13 +1593,14 @@ fn main() {
         }
     } else {
         for &fractal in &args.fractals {
+            let fvp = fractal_vp(fractal);
             match args.backend {
                 Backend::Cpu => {
                     if args.traversal == Traversal::Hilbert {
-                        samples.push(bench_cpu_traversal(fractal, &vp, args.max_iter, args.runs, args.traversal));
+                        samples.push(bench_cpu_traversal(fractal, &fvp, args.max_iter, args.runs, args.traversal));
                     } else {
                         samples.push(bench_cpu(
-                            fractal, &vp, args.max_iter, args.runs, args.perturbation, args.use_sa,
+                            fractal, &fvp, args.julia_c, args.max_iter, args.runs, args.perturbation, args.use_sa,
                         ));
                     }
                 }
@@ -1520,7 +1609,7 @@ fn main() {
                         eprintln!("[wgpu] --perturbation is CPU-only — skipping");
                         continue;
                     }
-                    if let Some(s) = bench_wgpu(fractal, &vp, args.max_iter, args.runs) {
+                    if let Some(s) = bench_wgpu(fractal, &fvp, args.max_iter, args.runs) {
                         samples.push(s);
                     } else {
                         eprintln!("[wgpu] no GPU available — skipping");
@@ -1532,9 +1621,9 @@ fn main() {
                         continue;
                     }
                     samples.push(bench_cpu(
-                        fractal, &vp, args.max_iter, args.runs, false, false,
+                        fractal, &fvp, args.julia_c, args.max_iter, args.runs, false, false,
                     ));
-                    if let Some(s) = bench_hybrid(fractal, &vp, args.max_iter, args.runs) {
+                    if let Some(s) = bench_hybrid(fractal, &fvp, args.max_iter, args.runs) {
                         samples.push(s);
                     } else {
                         eprintln!("[hybrid] no GPU available — only CPU baseline shown");

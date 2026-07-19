@@ -5,6 +5,7 @@ edition = "2024"
 default-run = "novafractal"
 
 [features]
+default = ["simd"]
 simd=[]
 cuda = ["dep:cudarc"]
 
