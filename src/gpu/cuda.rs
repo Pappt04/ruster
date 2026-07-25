@@ -40,6 +40,7 @@ impl CudaFractal {
                 "fractal_kernel_f32",
                 "fractal_perturb_kernel",
                 "fractal_kernel_tiled",
+                "fractal_kernel_tiled_f32",
             ]).unwrap();
         }
 
@@ -215,26 +216,28 @@ impl CudaFractal {
     ///
     /// Used by the heterogeneous scheduler (Stage 3) to send GPU-classified tiles
     /// to the GPU while the CPU handles boundary tiles concurrently.
-    pub fn render_tiled(
-        &mut self,
-        tiles    : &[[u32; 4]],
-        re_start : f64,
-        im_start : f64,
-        re_step  : f64,
-        im_step  : f64,
-        julia_cr : f64,
-        julia_ci : f64,
-        max_iter : u32,
-        fractal  : u32,
-    ) -> Vec<f32> {
+    /// Launches `fractal_kernel_tiled` over `tiles` — launch only, no
+    /// readback. No-op if `tiles` is empty (rather than leaving it to callers
+    /// to remember not to call this with nothing to do).
+    ///
+    /// Split out from the old single-shot `render_tiled` so a caller that
+    /// needs to dispatch more than once per frame (the heterogeneous
+    /// scheduler's work-stealing mop-up, see `crate::scheduler`) can do so
+    /// without paying `readback`'s full-frame `dtoh_sync_copy` more than once
+    /// — doubling that cost would regress exactly the fixed-cost problem the
+    /// scheduler rewrite exists to fix. TODO: `readback` itself still copies
+    /// the *entire* frame back regardless of how many tiles were actually
+    /// dispatched; a real partial/windowed copy would need either per-tile-row
+    /// copies or a compacted device-side buffer — left as a follow-up, not
+    /// required for the scheduler rewrite.
+    /// Uploads `[x0,y0,w,h]` tile descriptors and computes the launch grid
+    /// shared by `dispatch_tiled`/`dispatch_tiled_f32`. Returns `None` if
+    /// `tiles` is empty (nothing to launch).
+    fn upload_tiles(&self, tiles: &[[u32; 4]]) -> Option<(CudaSlice<u32>, LaunchConfig)> {
         if tiles.is_empty() {
-            return self.dev.dtoh_sync_copy(&self.output).unwrap();
+            return None;
         }
-
-        // Flatten [x0,y0,w,h] descriptors to a u32 slice for the device.
-        let flat: Vec<u32> = tiles.iter()
-            .flat_map(|t| t.iter().copied())
-            .collect();
+        let flat: Vec<u32> = tiles.iter().flat_map(|t| t.iter().copied()).collect();
         let tile_descs_dev = self.dev.htod_sync_copy(&flat).unwrap();
 
         // Grid must be large enough to cover the widest/tallest tile; bounds checks
@@ -250,6 +253,22 @@ impl CudaFractal {
             ),
             shared_mem_bytes: 0,
         };
+        Some((tile_descs_dev, cfg))
+    }
+
+    pub fn dispatch_tiled(
+        &mut self,
+        tiles    : &[[u32; 4]],
+        re_start : f64,
+        im_start : f64,
+        re_step  : f64,
+        im_step  : f64,
+        julia_cr : f64,
+        julia_ci : f64,
+        max_iter : u32,
+        fractal  : u32,
+    ) {
+        let Some((tile_descs_dev, cfg)) = self.upload_tiles(tiles) else { return };
 
         let f = self.dev.get_func("fractal", "fractal_kernel_tiled").unwrap();
         unsafe {
@@ -262,8 +281,64 @@ impl CudaFractal {
                 self.width,
             ))
         }.unwrap();
+    }
 
+    /// Like [`Self::dispatch_tiled`] but uses `fractal_kernel_tiled_f32`
+    /// (Mandelbrot/Julia only — see that kernel's doc comment). Callers
+    /// (`crate::scheduler`, gated by `SchedulerConfig::gpu_tiles_f32`) are
+    /// responsible for only calling this for fractal ids 0/1 below
+    /// `F32_PRECISION_THRESHOLD`; this method doesn't re-check either
+    /// condition, matching `dispatch_tiled`'s "caller decides" contract.
+    pub fn dispatch_tiled_f32(
+        &mut self,
+        tiles    : &[[u32; 4]],
+        re_start : f64,
+        im_start : f64,
+        re_step  : f64,
+        im_step  : f64,
+        julia_cr : f64,
+        julia_ci : f64,
+        max_iter : u32,
+        fractal  : u32,
+    ) {
+        let Some((tile_descs_dev, cfg)) = self.upload_tiles(tiles) else { return };
+
+        let f = self.dev.get_func("fractal", "fractal_kernel_tiled_f32").unwrap();
+        unsafe {
+            f.launch(cfg, (
+                &mut self.output,
+                &tile_descs_dev,
+                re_start as f32, im_start as f32, re_step as f32, im_step as f32,
+                julia_cr as f32, julia_ci as f32,
+                max_iter, fractal,
+                self.width,
+            ))
+        }.unwrap();
+    }
+
+    /// Copies the persistent full-frame output buffer back to the host. Call
+    /// once per frame, after all of that frame's `dispatch_tiled`/
+    /// `dispatch_tiled_f32` calls.
+    pub fn readback(&self) -> Vec<f32> {
         self.dev.dtoh_sync_copy(&self.output).unwrap()
+    }
+
+    /// Convenience wrapper equivalent to a single `dispatch_tiled` +
+    /// `readback` — kept for any caller that only ever dispatches once.
+    pub fn render_tiled(
+        &mut self,
+        tiles    : &[[u32; 4]],
+        re_start : f64,
+        im_start : f64,
+        re_step  : f64,
+        im_step  : f64,
+        julia_cr : f64,
+        julia_ci : f64,
+        max_iter : u32,
+        fractal  : u32,
+    ) -> Vec<f32> {
+        self.dispatch_tiled(tiles, re_start, im_start, re_step, im_step, julia_cr, julia_ci, max_iter, fractal);
+        self.readback()
     }
 
     /// Full-res dimensions this instance was constructed with.

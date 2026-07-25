@@ -54,9 +54,9 @@
 ///                            loop; N=1 gives a clean single-launch target for `ncu` attachment,
 ///                            larger N gives a steady-state loop for power sampling
 ///                            (requires --features cuda)
-///   --scheduler-sweep       sweep tile_size x initial threshold for the heterogeneous
-///                            scheduler, report wall-time/gpu_ms/cpu_ms/cpu_tile_frac per
-///                            combination      (requires --features cuda)
+///   --scheduler-sweep       sweep max_tile_size x initial threshold for the heterogeneous
+///                            scheduler, report wall-time/gpu_ms/cpu_ms/cpu_tile_frac/steal
+///                            stats per combination      (requires --features cuda)
 ///   --first-paint           headless RenderWorker latency: request -> Preview -> Final,
 ///                            across a cold render + a pan + a zoom
 ///   --json          emit JSON to stdout            (flag)
@@ -387,19 +387,32 @@ fn pixel_diff_stats(a: &[f32], b: &[f32]) -> (f32, f64, u64) {
 /// report the GPU/CPU tile split + timing, alongside a plain full-frame
 /// `cuda.render()` baseline for context.
 ///
-/// The "vs CPU render()" column (the scheduler's actual tiled output, via
-/// `render_tiled`/`render_prepass`) is expected to show `max_diff == 0.0` —
-/// CPU and GPU agree bit-for-bit there (see the fixes in
+/// This deliberately overrides `SchedulerConfig::default()`'s
+/// `simd_cpu_tiles`/`gpu_tiles_f32` (both `true` by default, for real-usage
+/// throughput) back to `false` here — this check's whole job is to be a
+/// strict bit-exactness regression gate, so it needs the exact-only config
+/// regardless of what real usage defaults to. With both `false`, the "vs CPU
+/// render()" column (the scheduler's actual tiled output) is expected to show
+/// `max_diff == 0.0` — CPU and GPU agree bit-for-bit there (see the fixes in
 /// `src/gpu/cuda.rs::morton_cfg`, `src/fractal/fractal.cu::mandelbrot`,
 /// `build.rs` (`--fmad=false`), and `src/fractal/fractal.rs::render_tile_exact`
-/// for the three independent divergence sources this closed).
+/// for the three independent divergence sources this closed) modulo a
+/// documented handful-of-pixels residual from GPU/CPU floating-point
+/// non-determinism on isolated chaotic pixels (see `classifier`'s module
+/// doc) — not exactly zero, but categorically different from, and much
+/// smaller than, the diff either flag introduces when enabled.
 ///
 /// The "plain cuda.render() base" column is context-only and, for
-/// Mandelbrot/Julia below `F32_PRECISION_THRESHOLD`, is now expected to show a
+/// Mandelbrot/Julia below `F32_PRECISION_THRESHOLD`, is expected to show a
 /// small nonzero diff: `CudaFractal::render()` dispatches those to an f32
-/// kernel for speed (see its doc comment), while `render_tiled`/`render_prepass`
-/// — what the scheduler itself uses — stay on the f64 kernel, so this baseline
-/// no longer reflects what the scheduler dispatches.
+/// kernel for speed (see its doc comment), while the scheduler's tiled
+/// dispatch stays on the f64 kernel, so this baseline doesn't reflect what
+/// the scheduler itself computes.
+///
+/// A fresh `ThresholdController` is constructed per fractal (not reused
+/// across the loop) — different fractal types have very different
+/// escape-iteration distributions, so carrying adapted threshold state from
+/// one into the next's first frame would be a misleading coupling.
 #[cfg(feature = "cuda")]
 fn run_heterogeneous_check(vp: &Viewport, args: &Args) {
     use novafractal::gpu::cuda::CudaFractal;
@@ -407,10 +420,10 @@ fn run_heterogeneous_check(vp: &Viewport, args: &Args) {
 
     let julia_c = [-0.4f64, 0.6];
     let mut cuda = CudaFractal::new(vp.width, vp.height);
-    let mut controller = ThresholdController::new(50.0);
-    let cfg = SchedulerConfig::default();
+    let cfg = SchedulerConfig { simd_cpu_tiles: false, gpu_tiles_f32: false, ..SchedulerConfig::default() };
 
     for &fractal in &args.fractals {
+        let mut controller = ThresholdController::new(0.02);
         let expected = render(vp, fractal, julia_c, args.max_iter);
 
         let pg = pixel_grid(vp);
@@ -422,8 +435,9 @@ fn run_heterogeneous_check(vp: &Viewport, args: &Args) {
 
         if args.json {
             println!(
-                "{{\"fractal\":\"{}\",\"max_diff\":{max_diff},\"mean_diff\":{mean_diff},\"above_0_01\":{above},\"baseline_max_diff\":{base_max},\"baseline_mean_diff\":{base_mean},\"baseline_above_0_01\":{base_above},\"gpu_ms\":{},\"cpu_ms\":{},\"cpu_tile_frac\":{}}}",
+                "{{\"fractal\":\"{}\",\"max_diff\":{max_diff},\"mean_diff\":{mean_diff},\"above_0_01\":{above},\"baseline_max_diff\":{base_max},\"baseline_mean_diff\":{base_mean},\"baseline_above_0_01\":{base_above},\"gpu_ms\":{},\"cpu_ms\":{},\"cpu_tile_frac\":{},\"gpu_steal_dispatched\":{},\"cpu_stolen_tile_count\":{}}}",
                 fractal.name(), result.gpu_ms, result.cpu_ms, result.cpu_tile_frac,
+                result.gpu_steal_dispatched, result.cpu_stolen_tile_count,
             );
         } else {
             println!("\nheterogeneous scheduler validation: {} ({}×{}, max_iter={}, zoom={})", fractal.name(), args.width, args.height, args.max_iter, args.zoom);
@@ -431,7 +445,9 @@ fn run_heterogeneous_check(vp: &Viewport, args: &Args) {
             println!("  plain cuda.render() base : max_diff={base_max:<10} mean_diff={base_mean:<12.6} above_0.01={base_above}  (context, see fn doc comment)");
             println!("  gpu_ms        : {:.2}", result.gpu_ms);
             println!("  cpu_ms        : {:.2}", result.cpu_ms);
-            println!("  cpu_tile_frac : {:.2}%", result.cpu_tile_frac * 100.0);
+            println!("  cpu_tile_frac : {:.2}% (pixel-weighted, realized work)", result.cpu_tile_frac * 100.0);
+            println!("  gpu_steal_dispatched   : {}", result.gpu_steal_dispatched);
+            println!("  cpu_stolen_tile_count  : {}", result.cpu_stolen_tile_count);
         }
     }
 }
@@ -664,13 +680,14 @@ fn run_cuda_loop(args: &Args, n: usize) {
     use novafractal::gpu::cuda::CudaFractal;
 
     let julia_c = [-0.4f64, 0.6];
+    let fractal = args.fractals.first().copied().unwrap_or(FractalType::Mandelbrot);
     let vp = Viewport { center: args.center.unwrap_or([-0.5, 0.0]), zoom: args.zoom, width: args.width, height: args.height };
     let pg = pixel_grid(&vp);
     let mut cuda = CudaFractal::new(vp.width, vp.height);
 
     let t0 = Instant::now();
     for _ in 0..n {
-        let _ = cuda.render(pg.re_start, pg.im_start, pg.re_step, pg.im_step, julia_c[0], julia_c[1], args.max_iter, FractalType::Mandelbrot.as_u32());
+        let _ = cuda.render(pg.re_start, pg.im_start, pg.re_step, pg.im_step, julia_c[0], julia_c[1], args.max_iter, fractal.as_u32());
     }
     let elapsed = t0.elapsed().as_secs_f64();
 
@@ -686,41 +703,53 @@ fn run_cuda_loop(_args: &Args, _n: usize) {
     eprintln!("[cuda-loop] cuda feature not enabled — rerun with --features cuda");
 }
 
-/// Sweeps the heterogeneous scheduler's own tunables — `tile_size` and the
+/// Sweeps the heterogeneous scheduler's own tunables — `max_tile_size` and the
 /// classification threshold's starting value — against a fixed representative
 /// viewport, reusing `render_heterogeneous`/`SchedulerConfig`/`ThresholdController`
-/// unmodified. Finds whether tuning closes the gap identified in
-/// `results/summary.md`'s Stage 3 (adaptive scheduler losing to a static split).
+/// unmodified. This is the tool that determines real threshold/tile-size
+/// defaults for the corner-sampling classifier (the `[10,50,150,500]`-style
+/// values from the old prepass-variance design don't translate under the new
+/// normalized `~[0,1]` corner-spread metric).
 #[cfg(feature = "cuda")]
 fn run_scheduler_sweep(args: &Args) {
     use novafractal::gpu::cuda::CudaFractal;
     use novafractal::scheduler::{render_heterogeneous, controller::ThresholdController, SchedulerConfig};
 
     let julia_c = [-0.4f64, 0.6];
+    let fractal = args.fractals.first().copied().unwrap_or(FractalType::Mandelbrot);
     let vp = Viewport { center: args.center.unwrap_or([-0.5, 0.0]), zoom: args.zoom, width: args.width, height: args.height };
     let mut cuda = CudaFractal::new(vp.width, vp.height);
 
-    println!("\nscheduler tile_size x threshold sweep ({}×{}, max_iter={}, zoom={}, center={:?})",
+    // min_tile_size is hardware-tied to the 16x16 GPU block dim
+    // fractal_kernel_tiled uses, not really a tuning knob — held fixed here
+    // rather than swept. threshold values are starting guesses spanning the
+    // new normalized corner-spread range (~[0,1]); this sweep is what should
+    // determine real defaults, same as the old tile_size/threshold sweep did
+    // for the prepass-variance design.
+    const MIN_TILE_SIZE: u32 = 16;
+    println!("\nscheduler max_tile_size x threshold sweep ({}×{}, max_iter={}, zoom={}, center={:?}, min_tile_size={MIN_TILE_SIZE})",
         args.width, args.height, args.max_iter, args.zoom, args.center);
 
-    for &tile_size in &[16u32, 32, 64, 128] {
-        for &threshold in &[10.0f32, 50.0, 150.0, 500.0] {
+    for &max_tile_size in &[64u32, 128, 256] {
+        for &threshold in &[0.005f32, 0.02, 0.05, 0.1] {
             let mut controller = ThresholdController::new(threshold);
-            let cfg = SchedulerConfig { tile_size };
+            let cfg = SchedulerConfig { max_tile_size, min_tile_size: MIN_TILE_SIZE, ..SchedulerConfig::default() };
 
             let t0 = Instant::now();
-            let result = render_heterogeneous(&vp, FractalType::Mandelbrot, julia_c, args.max_iter, &mut cuda, &mut controller, &cfg);
+            let result = render_heterogeneous(&vp, fractal, julia_c, args.max_iter, &mut cuda, &mut controller, &cfg);
             let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
             if args.json {
                 println!(
-                    "{{\"tile_size\":{tile_size},\"threshold\":{threshold},\"wall_ms\":{wall_ms},\"gpu_ms\":{},\"cpu_ms\":{},\"cpu_tile_frac\":{}}}",
+                    "{{\"max_tile_size\":{max_tile_size},\"min_tile_size\":{MIN_TILE_SIZE},\"threshold\":{threshold},\"wall_ms\":{wall_ms},\"gpu_ms\":{},\"cpu_ms\":{},\"cpu_tile_frac\":{},\"gpu_steal_dispatched\":{},\"cpu_stolen_tile_count\":{}}}",
                     result.gpu_ms, result.cpu_ms, result.cpu_tile_frac,
+                    result.gpu_steal_dispatched, result.cpu_stolen_tile_count,
                 );
             } else {
                 println!(
-                    "  tile={tile_size:<4} thresh={threshold:<6} wall={wall_ms:<8.2} gpu_ms={:<8.2} cpu_ms={:<8.2} cpu_tile_frac={:.1}%",
+                    "  max_tile={max_tile_size:<4} thresh={threshold:<6} wall={wall_ms:<8.2} gpu_ms={:<8.2} cpu_ms={:<8.2} cpu_tile_frac={:.1}% steal(gpu={}, cpu_tiles={})",
                     result.gpu_ms, result.cpu_ms, result.cpu_tile_frac * 100.0,
+                    result.gpu_steal_dispatched, result.cpu_stolen_tile_count,
                 );
             }
         }

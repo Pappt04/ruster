@@ -653,6 +653,83 @@ pub fn render_tile_exact(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2]
     local
 }
 
+/// Like `render_tile_exact` but uses the f32 SIMD kernels (`mandelbrot_x8`/
+/// `julia_x8`) for 8-wide chunks within each row, falling back to scalar
+/// `pixel()`-equivalent math for the remainder. Mandelbrot/Julia only,
+/// mirroring `render_simd_f32`'s fractal support.
+///
+/// NOT bit-identical to `render_tile_exact`/`render()` — f32 SIMD vs f64
+/// scalar arithmetic diverge in the last bit or two on chaotic escape-time
+/// iteration, the same documented tradeoff `CudaFractal::render()`'s f32 fast
+/// path already makes for GPU. Callers that need the heterogeneous
+/// scheduler's bit-exact-vs-CPU-`render()` guarantee must not use this
+/// unconditionally — see `SchedulerConfig::simd_cpu_tiles` and
+/// `render_cpu_tile`, which gates it.
+pub fn render_tile_exact_simd(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32, tile: [u32; 4]) -> Vec<f32> {
+    use wide::f32x8;
+
+    let [x0, y0, tw, th] = tile;
+    let mut local = vec![0.0f32; (tw * th) as usize];
+
+    for ly in 0..th {
+        let y = y0 + ly;
+        let im = (pg.im_start + y as f64 * pg.im_step) as f32;
+        let im8 = f32x8::splat(im);
+        let row = &mut local[(ly * tw) as usize..(ly * tw + tw) as usize];
+        let mut lx = 0u32;
+
+        while lx + 8 <= tw {
+            let x = x0 + lx;
+            let re = f32x8::from(std::array::from_fn::<f32, 8, _>(|k| {
+                (pg.re_start + (x + k as u32) as f64 * pg.re_step) as f32
+            }));
+            let lanes = match fractal {
+                FractalType::Mandelbrot => mandelbrot_x8(re, im8, max_iter),
+                FractalType::Julia => {
+                    let cr8 = f32x8::splat(julia_c[0] as f32);
+                    let ci8 = f32x8::splat(julia_c[1] as f32);
+                    julia_x8(re, im8, cr8, ci8, max_iter)
+                }
+                _ => unreachable!("render_tile_exact_simd only supports Mandelbrot/Julia"),
+            };
+            row[lx as usize..lx as usize + 8].copy_from_slice(&lanes);
+            lx += 8;
+        }
+
+        // scalar tail (0-7 remaining columns)
+        let im_f64 = pg.im_start + y as f64 * pg.im_step;
+        while lx < tw {
+            let x = x0 + lx;
+            let re = pg.re_start + x as f64 * pg.re_step;
+            row[lx as usize] = match fractal {
+                FractalType::Mandelbrot => mandelbrot(re, im_f64, max_iter),
+                FractalType::Julia => julia(re, im_f64, julia_c[0], julia_c[1], max_iter),
+                _ => unreachable!("render_tile_exact_simd only supports Mandelbrot/Julia"),
+            };
+            lx += 1;
+        }
+    }
+
+    local
+}
+
+/// Dispatches a CPU tile render to the SIMD fast path
+/// (`render_tile_exact_simd`, Mandelbrot/Julia below `F32_PRECISION_THRESHOLD`,
+/// when `use_simd` is set) or the exact scalar path (`render_tile_exact`)
+/// otherwise. `use_simd` is `SchedulerConfig::simd_cpu_tiles` gated at the
+/// call site — see `render_tile_exact_simd`'s doc comment for why this isn't
+/// unconditional.
+pub fn render_cpu_tile(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32, tile: [u32; 4], use_simd: bool, zoom: f64) -> Vec<f32> {
+    if use_simd
+        && matches!(fractal, FractalType::Mandelbrot | FractalType::Julia)
+        && zoom < F32_PRECISION_THRESHOLD
+    {
+        render_tile_exact_simd(pg, fractal, julia_c, max_iter, tile)
+    } else {
+        render_tile_exact(pg, fractal, julia_c, max_iter, tile)
+    }
+}
+
 /// Minimum side length at which we stop subdividing and compute all pixels directly.
 const MS_MIN: usize = 2;
 

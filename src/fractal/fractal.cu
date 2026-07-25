@@ -432,3 +432,52 @@ void fractal_kernel_tiled(
 
     buf[y * full_width + x] = v;
 }
+
+// ── f32 tiled kernel (Mandelbrot / Julia only) — heterogeneous scheduler ────
+//
+// Same tile-descriptor dispatch as `fractal_kernel_tiled`, but using the f32
+// math from `mandelbrot_f32`/`julia_f32` (see the f32 fast-path section
+// above). `fractal_kernel_tiled` always ran f64 — fine for Newton/Nova (no
+// f32 path exists for them anywhere in this codebase) but, for Mandelbrot/
+// Julia, left the scheduler's GPU tiles paying the same fp64 tax on this
+// GPU tier that `CudaFractal::render()`'s plain (non-tiled) path already
+// avoids via `fractal_kernel_f32`. `CudaFractal::dispatch_tiled_f32` only
+// ever launches this for fractal ids 0/1 below `F32_PRECISION_THRESHOLD`,
+// gated by `SchedulerConfig::gpu_tiles_f32` (default off, same
+// bit-exactness-vs-speed tradeoff as `simd_cpu_tiles` on the CPU side).
+extern "C" __global__ __launch_bounds__(256, 2)
+void fractal_kernel_tiled_f32(
+    float* __restrict__          buf,
+    const uint32_t* __restrict__ tile_descs,
+    float    re_start,
+    float    im_start,
+    float    re_step,
+    float    im_step,
+    float    julia_cr,
+    float    julia_ci,
+    uint32_t max_iter,
+    uint32_t fractal,
+    uint32_t full_width
+) {
+    uint32_t tile_idx = blockIdx.z;
+    uint32_t tx0 = tile_descs[tile_idx * 4u + 0u];
+    uint32_t ty0 = tile_descs[tile_idx * 4u + 1u];
+    uint32_t tw  = tile_descs[tile_idx * 4u + 2u];
+    uint32_t th  = tile_descs[tile_idx * 4u + 3u];
+
+    uint32_t lx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t ly = blockIdx.y * blockDim.y + threadIdx.y;
+    if (lx >= tw || ly >= th) return;
+
+    uint32_t x = tx0 + lx;
+    uint32_t y = ty0 + ly;
+
+    float re = re_start + (float)x * re_step;
+    float im = im_start + (float)y * im_step;
+
+    float v = (fractal == 0)
+        ? mandelbrot_f32(re, im, max_iter)
+        : julia_f32(re, im, julia_cr, julia_ci, max_iter);
+
+    buf[y * full_width + x] = v;
+}

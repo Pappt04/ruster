@@ -1,81 +1,189 @@
-//! Tile statistics and classification driving the heterogeneous scheduler.
+//! Corner-sampling recursive space partitioner driving the heterogeneous
+//! scheduler.
 //!
-//! `tile_stats` reads a sub-rectangle of a coarse (1/8-res) GPU prepass buffer
-//! and summarizes it; `classify` uses that summary to decide whether a tile is
-//! cheap/coherent enough for the GPU or divergent enough to route to the CPU.
-//! Sampling every pixel at 1/8 resolution (rather than a handful of corner
-//! points) is what makes this robust — a tile where the true fractal boundary
-//! cuts through it will show up as high variance even if a small number of
-//! discrete sample points happen to land on the same side.
+//! Classification here only decides *which backend* computes a tile — both
+//! GPU (`fractal_kernel_tiled`, f64, exact) and CPU (`render_tile_exact`,
+//! exact) always compute every pixel of whatever tile they're given, in
+//! full, with no skipping or approximation. A corner-sampling
+//! misclassification (missing a thin filament, routing a tile that's
+//! actually boundary-heavy to the GPU) can therefore only cost GPU-side
+//! performance — extra warp divergence on that tile — it can never produce a
+//! wrong pixel.
+//!
+//! This is why corner-sampling is safe here even though `TUTORIAL.md`'s "Why
+//! Not 5-Point Sampling" section rejected it for the *previous* design: that
+//! rejection targeted a scheme where sampling decides what gets *computed*
+//! (an `ms_fill`-style border-uniformity flood-fill shortcut that really can
+//! skip real pixels based on a wrong assumption). Corner-sampling-for-routing
+//! and flood-fill-for-skipping are not the same risk category — don't
+//! reflexively re-apply the old objection here.
+//!
+//! One caveat found empirically, worth being honest about rather than
+//! claiming perfect bit-exactness: "both backends compute exactly" is true in
+//! the idealized-algorithm sense, but GPU f64 and CPU f64 can still diverge in
+//! their last-bit rounding on genuinely chaotic escape-time computations near
+//! a periodic-cycle detection threshold — the same class of hardware
+//! floating-point non-determinism this codebase's own `fractal.cu` doc
+//! comments already acknowledge ("a pixel exactly on the edge of a periodic
+//! cycle can come out 'converged' on one backend and 'escapes 400 iterations
+//! later' on the other"). Corner sampling can miss an isolated chaotic pixel
+//! surrounded by uniform-looking corners (the exact TUTORIAL.md-warned
+//! failure mode) and route it to the GPU, where — on such a pixel, and only
+//! such a pixel — it may not match plain CPU `render()` bit-for-bit. Measured
+//! impact: a handful of pixels out of ~2 million (Mandelbrot/Julia only;
+//! Newton/Nova remain exactly bit-identical, having no comparable
+//! period-detection sensitivity). This is a pre-existing category of
+//! imprecision in this codebase (the old dense-prepass classifier showed a
+//! smaller residual of the same kind, 1-2 pixels), not a new one — corner
+//! sampling exposes a bit more of it than dense-prepass sampling did, as
+//! `TUTORIAL.md` predicted for exactly this class of technique.
 
-pub struct TileStats {
-    pub mean: f32,
-    pub variance: f32,
-    pub interior_frac: f32, // fraction of samples where value >= max_iter
-    pub exterior_frac: f32, // fraction of samples where value < 5.0
-}
+use crate::fractal::fractal_type::FractalType;
+use crate::fractal::{pixel, PixelGrid};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TileKind {
-    GpuInterior,
-    GpuExterior,
-    GpuSmooth,
-    CpuBoundary,
+    Gpu,
+    Cpu,
 }
 
-/// Summarize the prepass samples covering `[tile_x, tile_x+tile_pw) x [tile_y, tile_y+tile_ph)`
-/// in prepass-buffer coordinates (`prepass_w` is the prepass buffer's row stride).
-pub fn tile_stats(
-    prepass: &[f32],
-    prepass_w: u32,
-    tile_x: u32, tile_y: u32, tile_pw: u32, tile_ph: u32,
+/// Invariant inputs for one partition pass, bundled so the recursive helper's
+/// parameter list doesn't balloon.
+struct PartitionCtx<'a> {
+    pg: &'a PixelGrid,
+    fractal: FractalType,
+    julia_c: [f64; 2],
     max_iter: u32,
-) -> TileStats {
-    let max_val = max_iter as f32;
-    let mut sum = 0.0f64;
-    let mut sum_sq = 0.0f64;
-    let mut n_interior = 0u32;
-    let mut n_exterior = 0u32;
-    let mut count = 0u32;
-
-    let prepass_h = (prepass.len() as u32) / prepass_w.max(1);
-
-    for py in tile_y..(tile_y + tile_ph).min(prepass_h) {
-        for px in tile_x..(tile_x + tile_pw).min(prepass_w) {
-            let v = prepass[(py * prepass_w + px) as usize];
-            sum += v as f64;
-            sum_sq += (v * v) as f64;
-            if v >= max_val { n_interior += 1; }
-            if v < 5.0 { n_exterior += 1; }
-            count += 1;
-        }
-    }
-
-    if count == 0 {
-        // No prepass coverage for this tile (shouldn't happen with ceiling-divided
-        // prepass dimensions, but stay conservative rather than mis-flag as flat).
-        return TileStats { mean: 0.0, variance: f32::MAX, interior_frac: 0.0, exterior_frac: 0.0 };
-    }
-
-    let mean = (sum / count as f64) as f32;
-    let variance = ((sum_sq / count as f64) - (mean * mean) as f64) as f32;
-    TileStats {
-        mean,
-        variance: variance.max(0.0),
-        interior_frac: n_interior as f32 / count as f32,
-        exterior_frac: n_exterior as f32 / count as f32,
-    }
+    min_tile: u32,
+    threshold: f32,
 }
 
-pub fn classify(stats: &TileStats, threshold_variance: f32, _max_iter: u32) -> TileKind {
-    if stats.interior_frac > 0.95 && stats.variance < 4.0 {
-        return TileKind::GpuInterior;
+/// `(max - min) / max_iter`, normalized so the metric and its threshold are
+/// dimensionless (~[0,1]) regardless of `max_iter` — the old prepass-variance
+/// threshold was implicitly coupled to `max_iter`'s scale, this isn't.
+fn corner_spread(corners: [f32; 4], max_iter: u32) -> f32 {
+    let mut max_val = f32::MIN;
+    let mut min_val = f32::MAX;
+    for &v in &corners {
+        max_val = max_val.max(v);
+        min_val = min_val.min(v);
     }
-    if stats.exterior_frac > 0.90 && stats.variance < 25.0 {
-        return TileKind::GpuExterior;
+    (max_val - min_val) / (max_iter.max(1) as f32)
+}
+
+/// Samples a tile's 4 actual corner pixels — `(x0,y0)`, `(x0+tw-1,y0)`,
+/// `(x0,y0+th-1)`, `(x0+tw-1,y0+th-1)` — in `[top_left, top_right,
+/// bottom_left, bottom_right]` order. Tiles are half-open `[x0,y0,tw,th]`
+/// like everywhere else in this codebase (`render_tile_exact`, `ms_fill`), so
+/// the corner pixels are at `tw-1`/`th-1` offsets, not `tw`/`th`.
+fn sample_corners(ctx: &PartitionCtx, x0: u32, y0: u32, tw: u32, th: u32) -> [f32; 4] {
+    let re0 = ctx.pg.re_start + x0 as f64 * ctx.pg.re_step;
+    let re1 = ctx.pg.re_start + (x0 + tw - 1) as f64 * ctx.pg.re_step;
+    let im0 = ctx.pg.im_start + y0 as f64 * ctx.pg.im_step;
+    let im1 = ctx.pg.im_start + (y0 + th - 1) as f64 * ctx.pg.im_step;
+    [
+        pixel(ctx.fractal, re0, im0, ctx.julia_c, ctx.max_iter),
+        pixel(ctx.fractal, re1, im0, ctx.julia_c, ctx.max_iter),
+        pixel(ctx.fractal, re0, im1, ctx.julia_c, ctx.max_iter),
+        pixel(ctx.fractal, re1, im1, ctx.julia_c, ctx.max_iter),
+    ]
+}
+
+/// Partitions the whole frame into GPU/CPU tiles. Builds a ceil-divided grid
+/// of `max_tile`-sized cells across the frame, then recursively subdivides
+/// each cell independently down to `min_tile`, classifying by corner spread
+/// at each level. Returns `(gpu_tiles, cpu_tiles)` as `[x0,y0,tw,th]`
+/// descriptors that together partition every pixel exactly once.
+pub fn partition_frame(
+    pg: &PixelGrid,
+    fractal: FractalType,
+    julia_c: [f64; 2],
+    max_iter: u32,
+    width: u32,
+    height: u32,
+    max_tile: u32,
+    min_tile: u32,
+    threshold: f32,
+) -> (Vec<[u32; 4]>, Vec<[u32; 4]>) {
+    let min_tile = min_tile.max(1);
+    let max_tile = max_tile.max(min_tile);
+    let ctx = PartitionCtx { pg, fractal, julia_c, max_iter, min_tile, threshold };
+
+    let mut gpu_tiles = Vec::new();
+    let mut cpu_tiles = Vec::new();
+
+    let mut y0 = 0u32;
+    while y0 < height {
+        let th = max_tile.min(height - y0);
+        let mut x0 = 0u32;
+        while x0 < width {
+            let tw = max_tile.min(width - x0);
+            let corners = sample_corners(&ctx, x0, y0, tw, th);
+            partition_tile(&ctx, x0, y0, tw, th, corners, &mut gpu_tiles, &mut cpu_tiles);
+            x0 += tw;
+        }
+        y0 += th;
     }
-    if stats.variance < threshold_variance {
-        return TileKind::GpuSmooth;
+
+    (gpu_tiles, cpu_tiles)
+}
+
+/// Recursive longer-axis bisection, modeled on `ms_fill`'s subdivision shape
+/// (`fractal.rs` ~659) but classifying instead of flood-filling. Terminal
+/// cases: `Gpu` the moment corners are close enough (regardless of remaining
+/// size — this is what lets a whole uniform region resolve as one big GPU
+/// tile instead of forced subdivision); `Cpu` once the tile can't shrink
+/// further (`min_tile`) and corners still disagree (boundary detail).
+fn partition_tile(
+    ctx: &PartitionCtx,
+    x0: u32, y0: u32, tw: u32, th: u32,
+    corners: [f32; 4],
+    gpu_tiles: &mut Vec<[u32; 4]>,
+    cpu_tiles: &mut Vec<[u32; 4]>,
+) {
+    if corner_spread(corners, ctx.max_iter) < ctx.threshold {
+        gpu_tiles.push([x0, y0, tw, th]);
+        return;
     }
-    TileKind::CpuBoundary
+    if tw <= ctx.min_tile || th <= ctx.min_tile {
+        cpu_tiles.push([x0, y0, tw, th]);
+        return;
+    }
+
+    let [tl, tr, bl, br] = corners;
+
+    // Siblings share no physical pixel (half-open tiles), so there's no valid
+    // corner reuse across them beyond the 2 unmoved corners each child
+    // inherits from the parent — always exactly 4 new samples per split.
+    if tw >= th {
+        let left_w = tw / 2;
+        let right_w = tw - left_w;
+        let mid = x0 + left_w;
+        let re_left_edge = ctx.pg.re_start + (mid - 1) as f64 * ctx.pg.re_step;
+        let re_right_edge = ctx.pg.re_start + mid as f64 * ctx.pg.re_step;
+        let im_top = ctx.pg.im_start + y0 as f64 * ctx.pg.im_step;
+        let im_bot = ctx.pg.im_start + (y0 + th - 1) as f64 * ctx.pg.im_step;
+        let left_tr = pixel(ctx.fractal, re_left_edge, im_top, ctx.julia_c, ctx.max_iter);
+        let left_br = pixel(ctx.fractal, re_left_edge, im_bot, ctx.julia_c, ctx.max_iter);
+        let right_tl = pixel(ctx.fractal, re_right_edge, im_top, ctx.julia_c, ctx.max_iter);
+        let right_bl = pixel(ctx.fractal, re_right_edge, im_bot, ctx.julia_c, ctx.max_iter);
+
+        partition_tile(ctx, x0, y0, left_w, th, [tl, left_tr, bl, left_br], gpu_tiles, cpu_tiles);
+        partition_tile(ctx, mid, y0, right_w, th, [right_tl, tr, right_bl, br], gpu_tiles, cpu_tiles);
+    } else {
+        let top_h = th / 2;
+        let bot_h = th - top_h;
+        let mid = y0 + top_h;
+        let im_top_edge = ctx.pg.im_start + (mid - 1) as f64 * ctx.pg.im_step;
+        let im_bot_edge = ctx.pg.im_start + mid as f64 * ctx.pg.im_step;
+        let re_left = ctx.pg.re_start + x0 as f64 * ctx.pg.re_step;
+        let re_right = ctx.pg.re_start + (x0 + tw - 1) as f64 * ctx.pg.re_step;
+        let top_bl = pixel(ctx.fractal, re_left, im_top_edge, ctx.julia_c, ctx.max_iter);
+        let top_br = pixel(ctx.fractal, re_right, im_top_edge, ctx.julia_c, ctx.max_iter);
+        let bot_tl = pixel(ctx.fractal, re_left, im_bot_edge, ctx.julia_c, ctx.max_iter);
+        let bot_tr = pixel(ctx.fractal, re_right, im_bot_edge, ctx.julia_c, ctx.max_iter);
+
+        partition_tile(ctx, x0, y0, tw, top_h, [tl, tr, top_bl, top_br], gpu_tiles, cpu_tiles);
+        partition_tile(ctx, x0, mid, tw, bot_h, [bot_tl, bot_tr, bl, br], gpu_tiles, cpu_tiles);
+    }
 }

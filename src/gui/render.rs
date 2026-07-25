@@ -115,7 +115,11 @@ impl RenderWorker {
                 use crate::scheduler::{self, controller::ThresholdController, SchedulerConfig};
                 let mut compute: Option<CudaFractal> = None;
                 let mut cached_size = (0u32, 0u32);
-                let mut het_controller = ThresholdController::new(50.0);
+                // Initial value is a starting guess for the new normalized
+                // corner-spread threshold (~[0,1]) — see
+                // scheduler::controller's doc comment; pending re-tuning via
+                // `bench_runner --scheduler-sweep`.
+                let mut het_controller = ThresholdController::new(0.02);
                 let scheduler_cfg = SchedulerConfig::default();
 
                 while let Ok(mut req) = req_rx.recv() {

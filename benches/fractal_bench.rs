@@ -5,7 +5,9 @@ use novafractal::gpu::unifroms::{PerturbUniforms, Uniforms};
 use novafractal::gui::color::{colorize, ColorScheme};
 use novafractal::gui::viewport::Viewport;
 use rayon::ThreadPoolBuilder;
-use std::sync::{Arc, OnceLock};
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 // ── shared constants ──────────────────────────────────────────────────────────
 
@@ -504,52 +506,12 @@ fn bench_cuda_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
-// CPU top half + CUDA bottom half, concurrent
-#[cfg(feature = "cuda")]
-fn bench_hybrid_cpu_cuda(c: &mut Criterion) {
-    use novafractal::gpu::cuda::CudaFractal;
-
-    let full_vp  = vp(1920, 1080);
-    let h_top    = full_vp.height / 2;
-    let h_bottom = full_vp.height - h_top;
-    let aspect   = full_vp.width as f64 / full_vp.height as f64;
-    let half     = 2.0 / full_vp.zoom;
-    let im_step  = half * 2.0 / full_vp.height as f64;
-    let im_start = full_vp.center[1] + (0.5 / full_vp.height as f64 - 0.5) * half * 2.0;
-    let re_start = full_vp.center[0] + (0.5 / full_vp.width as f64 - 0.5) * half * aspect * 2.0;
-    let re_step  = half * aspect * 2.0 / full_vp.width as f64;
-    let im_start_bottom = im_start + h_top as f64 * im_step;
-
-    let vp_top = Viewport { width: full_vp.width, height: h_top, ..full_vp.clone() };
-
-    let mut group = c.benchmark_group("hybrid/cpu+cuda");
-    group.throughput(Throughput::Elements(1920 * 1080));
-    group.sample_size(10);
-
-    for &fractal in FractalType::ALL {
-        let mut cuda = CudaFractal::from_device(cuda_dev(), full_vp.width, h_bottom);
-
-        group.bench_function(fractal.name(), |b| {
-            b.iter(|| {
-                std::thread::scope(|s| {
-                    let top = s.spawn(|| render(black_box(&vp_top), fractal, JULIA_C, MAX_ITER));
-                    let bottom = cuda.render(
-                        black_box(re_start), black_box(im_start_bottom),
-                        black_box(re_step), black_box(im_step),
-                        JULIA_C[0], JULIA_C[1], MAX_ITER, fractal_u32(fractal),
-                    );
-                    let _ = top.join().unwrap();
-                    bottom
-                })
-            })
-        });
-    }
-    group.finish();
-}
-
-// Adaptive prepass-guided heterogeneous scheduler (see src/scheduler) vs the
-// static 50/50 split above and plain GPU-only render — across zoom levels to
-// show the CPU/GPU tile split adapting as the boundary-to-interior ratio grows.
+// Corner-sampling, work-stealing heterogeneous scheduler (see src/scheduler)
+// vs plain GPU-only render — across zoom levels to show the CPU/GPU tile
+// split adapting as the boundary-to-interior ratio grows. (The old static
+// top/bottom-half "50/50" comparison benchmark, bench_hybrid_cpu_cuda, was
+// deleted — it wasn't part of the real scheduler design, and the meaningful
+// comparison is against plain single-backend rendering, not a dumb split.)
 #[cfg(feature = "cuda")]
 fn bench_heterogeneous(c: &mut Criterion) {
     use novafractal::gpu::cuda::CudaFractal;
@@ -566,7 +528,9 @@ fn bench_heterogeneous(c: &mut Criterion) {
         for &(zoom, label) in ZOOMS {
             let frame_vp = Viewport { center: CENTER, zoom, width: 1920, height: 1080 };
             let mut cuda = CudaFractal::from_device(cuda_dev(), 1920, 1080);
-            let mut controller = ThresholdController::new(50.0);
+            // Starting guess for the normalized corner-spread threshold
+            // (~[0,1]) — see scheduler::controller's doc comment.
+            let mut controller = ThresholdController::new(0.02);
             let cfg = SchedulerConfig::default();
 
             group.bench_with_input(
@@ -597,8 +561,6 @@ fn bench_cuda_render(c: &mut Criterion) {
 }
 #[cfg(not(feature = "cuda"))]
 fn bench_cuda_pipeline(c: &mut Criterion) { let _ = c; }
-#[cfg(not(feature = "cuda"))]
-fn bench_hybrid_cpu_cuda(c: &mut Criterion) { let _ = c; }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Perturbation theory benchmarks
@@ -866,8 +828,7 @@ criterion_group! {
         bench_cuda_render,
         bench_cuda_pipeline,
         bench_cuda_perturbation,
-        // Hybrid CPU + CUDA
-        bench_hybrid_cpu_cuda,
+        // Heterogeneous CPU+CUDA scheduler
         bench_heterogeneous
 }
 

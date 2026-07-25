@@ -1,31 +1,96 @@
-//! Adaptive prepass-guided heterogeneous CPU+GPU scheduler (see `TUTORIAL.md`
-//! Stage 3). Classifies the frame into tiles from a cheap coarse GPU prepass,
-//! routes divergent "boundary" tiles to the CPU (exact per-pixel fill) and
-//! coherent tiles to the GPU (`fractal_kernel_tiled`), running both
-//! concurrently, then composites into one full-resolution buffer.
+//! Corner-sampling, work-stealing heterogeneous CPU+GPU scheduler (see
+//! `TUTORIAL.md` Stage 3, and the rewrite notes in `results/summary.md`).
+//! Classifies the frame into variable-size tiles via cheap corner sampling
+//! (`classifier::partition_frame` — no GPU prepass dispatch needed), routes
+//! divergent "boundary" tiles to the CPU (exact per-pixel fill) and coherent
+//! tiles to the GPU (`fractal_kernel_tiled`), running both concurrently via
+//! shared work-stealing queues so whichever side finishes early picks up the
+//! other's leftover work, then composites into one full-resolution buffer.
 //!
-//! Output is bit-identical to a plain full-frame render — no tile is skipped
-//! or approximated, only *where* it's computed changes.
+//! No tile is ever skipped or approximated — only *where* (and, by default,
+//! in what precision — see `SchedulerConfig::simd_cpu_tiles`/`gpu_tiles_f32`)
+//! it's computed changes. Set both of those `false` for a strict bit-exact
+//! match to plain CPU `render()` (their default `true` trades a handful of
+//! pixels' worth of GPU/CPU floating-point non-determinism for a large
+//! throughput win — see each field's doc comment). See `classifier`'s module
+//! doc for why a corner-sampling *routing* decision on its own can never
+//! affect correctness, only performance.
 
 pub mod classifier;
 pub mod controller;
 
-use rayon::prelude::*;
-use crate::fractal::{pixel_grid, render_tile_exact, IterBuf};
+use std::collections::VecDeque;
+use std::sync::Mutex;
+
+use crate::fractal::{pixel_grid, render_cpu_tile, IterBuf, F32_PRECISION_THRESHOLD};
 use crate::fractal::fractal_type::FractalType;
 use crate::gpu::cuda::CudaFractal;
 use crate::gui::viewport::Viewport;
-use classifier::TileKind;
 use controller::ThresholdController;
 
 pub struct SchedulerConfig {
-    pub tile_size: u32,
+    /// Top-level partition tile size. Bigger than the old fixed grid (128 vs
+    /// 32) by design — a uniform region terminates early as one big GPU tile
+    /// instead of being forced into many small ones.
+    pub max_tile_size: u32,
+    /// Recursion floor; matches the 16x16 GPU block dim `fractal_kernel_tiled`
+    /// uses.
+    pub min_tile_size: u32,
+    /// Fraction of the GPU-classified tiles held back as genuinely stealable
+    /// by CPU workers, instead of being dispatched in the GPU's immediate
+    /// batch. See `render_heterogeneous`'s doc comment on why this needs to
+    /// be a real reservation, not just "CPU falls back to an empty queue."
+    pub steal_reserve_frac: f32,
+    /// Minimum number of leftover CPU-queue tiles that justifies GPU issuing
+    /// a second (mop-up) dispatch for them.
+    pub min_steal_tiles: u32,
+    /// Render CPU tiles with the f32 SIMD path (`render_tile_exact_simd`)
+    /// instead of the exact f64 scalar path, where applicable (Mandelbrot/
+    /// Julia below `F32_PRECISION_THRESHOLD`). Defaults to `true` — NOT
+    /// bit-identical to plain CPU `render()` (see `classifier`'s module doc),
+    /// but the throughput win is large enough that this is what real usage
+    /// (including the live app) wants; set `false` for a strict bit-exact
+    /// comparison (e.g. validating other changes against `render()`).
+    pub simd_cpu_tiles: bool,
+    /// Dispatch GPU tiles with `fractal_kernel_tiled_f32` instead of the
+    /// exact f64 `fractal_kernel_tiled`, where applicable (Mandelbrot/Julia
+    /// below `F32_PRECISION_THRESHOLD`). Same bit-exactness-vs-speed tradeoff
+    /// as `simd_cpu_tiles`, but the GPU-side impact is much larger in
+    /// practice: `fractal_kernel_tiled` never had the f32 fast path plain
+    /// `CudaFractal::render()` already has, so with this `false` the
+    /// scheduler's GPU tiles pay this GPU tier's full fp64 tax while plain
+    /// `cuda.render()` doesn't — measured ~6-7x slower GPU-tile throughput
+    /// than plain GPU rendering at the same viewport, which was the
+    /// difference between the hybrid scheduler losing badly to single-backend
+    /// rendering and actually beating it. Defaults to `true` for the same
+    /// reason as `simd_cpu_tiles`; set `false` for a strict bit-exact
+    /// comparison.
+    pub gpu_tiles_f32: bool,
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
-        // Multiple of the 16x16 GPU block dim used by fractal_kernel_tiled.
-        Self { tile_size: 32 }
+        Self {
+            max_tile_size: 128,
+            min_tile_size: 16,
+            steal_reserve_frac: 0.2,
+            min_steal_tiles: 64,
+            // Both default on: without them the scheduler's GPU tiles pay
+            // this GPU tier's full fp64 tax while plain `cuda.render()`
+            // doesn't (measured ~6-7x slower GPU-tile throughput), and CPU
+            // tiles leave rayon's SIMD speedup on the table — together they
+            // were the difference between the hybrid scheduler losing badly
+            // to plain single-backend rendering and actually beating it. The
+            // tradeoff (documented on each field, and in `classifier`'s
+            // module doc) is a handful of pixels out of millions that can
+            // differ from plain CPU `render()` on Mandelbrot/Julia, from
+            // genuine GPU/CPU floating-point non-determinism on isolated
+            // chaotic pixels — visually imperceptible, and the same category
+            // of pre-existing imprecision this codebase already had (just
+            // slightly more of it), not a new correctness class.
+            simd_cpu_tiles: true,
+            gpu_tiles_f32: true,
+        }
     }
 }
 
@@ -33,13 +98,24 @@ pub struct HeterogeneousResult {
     pub buf: IterBuf,
     pub gpu_ms: f32,
     pub cpu_ms: f32,
+    /// Pixel-weighted (not tile-count-weighted) fraction of the frame CPU
+    /// actually ended up computing, including anything it stole from the GPU
+    /// reserve — reflects realized work, not the pre-steal partition split.
     pub cpu_tile_frac: f32,
+    /// Whether the GPU issued a second dispatch to mop up leftover CPU-queue
+    /// tiles this frame.
+    pub gpu_steal_dispatched: bool,
+    /// How many tiles CPU workers claimed from the GPU's reserved
+    /// `steal_queue` (i.e. tiles originally classified GPU-cheap but
+    /// rendered by CPU because CPU finished its own queue first).
+    pub cpu_stolen_tile_count: u32,
 }
 
-/// Render one frame by adaptively splitting it into GPU and CPU tiles and
-/// running both concurrently. `cuda` must already be sized for `vp`'s
-/// width/height (the caller is responsible for recreating it on resize, same
-/// as the existing plain-CUDA render path).
+/// Render one frame by corner-sampling the viewport into GPU/CPU tiles and
+/// running both concurrently with fallback work-stealing in both directions.
+/// `cuda` must already be sized for `vp`'s width/height (the caller is
+/// responsible for recreating it on resize, same as the existing plain-CUDA
+/// render path).
 pub fn render_heterogeneous(
     vp: &Viewport,
     fractal: FractalType,
@@ -56,86 +132,167 @@ pub fn render_heterogeneous(
 
     let pg = pixel_grid(vp);
 
-    // --- Phase 1: coarse GPU prepass at 1/8 resolution (ceiling-divided so
-    // edge tiles still get real prepass coverage instead of falling back to
-    // the zero-sample default in `tile_stats`). ---
-    let pw = (w + 7) / 8;
-    let ph = (h + 7) / 8;
-    let prepass = cuda.render_prepass(
-        pg.re_start, pg.im_start, pg.re_step, pg.im_step,
-        julia_c[0], julia_c[1], max_iter, fractal.as_u32(),
-        pw, ph,
+    // --- Partition: cheap corner-sampling recursive classification, no GPU
+    // prepass dispatch at all. ---
+    let (mut gpu_tiles, cpu_tiles) = classifier::partition_frame(
+        &pg, fractal, julia_c, max_iter, w, h,
+        cfg.max_tile_size, cfg.min_tile_size, controller.threshold,
     );
 
-    // --- Phase 2: build the tile grid and classify each tile from the prepass. ---
-    let tile_size = cfg.tile_size.max(1);
-    let tiles_x = (w + tile_size - 1) / tile_size;
-    let tiles_y = (h + tile_size - 1) / tile_size;
+    // --- Reserve: hold back a fraction of the GPU's classified tiles as
+    // genuinely stealable by CPU. Reserving up front (rather than letting CPU
+    // fall back to an initially-full gpu queue) matters because
+    // `dispatch_tiled`'s kernel launch enqueues asynchronously and returns
+    // almost immediately — there's no real wall-clock window during which an
+    // un-reserved queue would still have anything left in it by the time
+    // freshly-spawned CPU threads get around to checking it. Reserving a
+    // fraction gives CPU workers a real window: the reserve sits available
+    // for as long as CPU is still busy on its own (likely larger) queue. ---
+    let reserve_frac = cfg.steal_reserve_frac.clamp(0.0, 1.0);
+    let reserve_count = ((gpu_tiles.len() as f32) * reserve_frac).round() as usize;
+    let split_at = gpu_tiles.len() - reserve_count.min(gpu_tiles.len());
+    let gpu_reserve: Vec<[u32; 4]> = gpu_tiles.split_off(split_at);
+    let gpu_committed = gpu_tiles;
 
-    let mut gpu_tiles: Vec<[u32; 4]> = Vec::new();
-    let mut cpu_tiles: Vec<[u32; 4]> = Vec::new();
+    let total_pixels = (w as u64) * (h as u64);
+    let cpu_queue: Mutex<VecDeque<[u32; 4]>> = Mutex::new(cpu_tiles.into_iter().collect());
+    let steal_queue: Mutex<VecDeque<[u32; 4]>> = Mutex::new(gpu_reserve.into_iter().collect());
 
-    for ty in 0..tiles_y {
-        for tx in 0..tiles_x {
-            let x0 = tx * tile_size;
-            let y0 = ty * tile_size;
-            let tw = tile_size.min(w - x0);
-            let th = tile_size.min(h - y0);
+    let use_simd = cfg.simd_cpu_tiles;
+    let zoom = vp.zoom;
+    let n_workers = rayon::current_num_threads().max(1);
+    let use_gpu_f32 = cfg.gpu_tiles_f32
+        && matches!(fractal, FractalType::Mandelbrot | FractalType::Julia)
+        && zoom < F32_PRECISION_THRESHOLD;
+    let dispatch = |cuda: &mut CudaFractal, batch: &[[u32; 4]]| {
+        if use_gpu_f32 {
+            cuda.dispatch_tiled_f32(
+                batch, pg.re_start, pg.im_start, pg.re_step, pg.im_step,
+                julia_c[0], julia_c[1], max_iter, fractal.as_u32(),
+            );
+        } else {
+            cuda.dispatch_tiled(
+                batch, pg.re_start, pg.im_start, pg.re_step, pg.im_step,
+                julia_c[0], julia_c[1], max_iter, fractal.as_u32(),
+            );
+        }
+    };
 
-            // Corresponding rect in prepass space (same tile grid, 1/8 scale).
-            let px0 = x0 / 8;
-            let py0 = y0 / 8;
-            let ptw = ((tw + 7) / 8).max(1);
-            let pth = ((th + 7) / 8).max(1);
+    // Results come back over a channel rather than `JoinHandle`s — rayon's
+    // `Scope::spawn` (unlike `std::thread::Scope::spawn`) doesn't hand back a
+    // handle, since the closures run on the pool's existing worker threads,
+    // not new ones. Each message's third field is that worker's own elapsed
+    // time from `cpu_t0` at the moment IT finished — `rayon::scope` can't
+    // return until the GPU dispatch code below (running on the calling
+    // thread) also finishes, so timing "cpu_ms" as `cpu_t0.elapsed()` taken
+    // after the scope call (and after draining this channel) would silently
+    // inflate it to match whichever of GPU/CPU was slower, rather than
+    // reflecting when the CPU workers actually finished — which would feed
+    // the adaptive threshold controller a distorted signal.
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<([u32; 4], Vec<f32>)>, u32, f32)>();
+    let cpu_t0 = std::time::Instant::now();
 
-            let stats = classifier::tile_stats(&prepass, pw, px0, py0, ptw, pth, max_iter);
-            match classifier::classify(&stats, controller.threshold, max_iter) {
-                TileKind::CpuBoundary => cpu_tiles.push([x0, y0, tw, th]),
-                TileKind::GpuInterior | TileKind::GpuExterior | TileKind::GpuSmooth => gpu_tiles.push([x0, y0, tw, th]),
+    let (gpu_buf, gpu_ms, gpu_steal_dispatched) = rayon::scope(|s| {
+        // --- CPU worker pool: spawned onto rayon's already-warm global pool
+        // (`rayon::scope`, not `std::thread::scope`) — spawning fresh OS
+        // threads every single frame was measured to eat most of the
+        // scheduler's theoretical win at this frame-time scale (low
+        // single-digit milliseconds). Each worker pulls from two shared,
+        // mutex-guarded queues — rayon's own work-stealing has no primitive
+        // for "steal from a queue owned by a different subsystem [the GPU
+        // dispatch]", so plain `Mutex<VecDeque>` is still the right data
+        // structure, just driven from pool threads instead of raw ones.
+        // Workers drain `cpu_queue` first, then fall back to `steal_queue`
+        // once it's empty. ---
+        for _ in 0..n_workers {
+            let tx = tx.clone();
+            let pg = &pg;
+            let cpu_queue = &cpu_queue;
+            let steal_queue = &steal_queue;
+            s.spawn(move |_| {
+                let mut local: Vec<([u32; 4], Vec<f32>)> = Vec::new();
+                let mut stolen = 0u32;
+                loop {
+                    let claim = {
+                        let mut cq = cpu_queue.lock().unwrap();
+                        if let Some(t) = cq.pop_front() {
+                            Some((t, false))
+                        } else {
+                            drop(cq);
+                            steal_queue.lock().unwrap().pop_front().map(|t| (t, true))
+                        }
+                    };
+                    match claim {
+                        Some((tile, is_steal)) => {
+                            if is_steal { stolen += 1; }
+                            let tile_buf = render_cpu_tile(pg, fractal, julia_c, max_iter, tile, use_simd, zoom);
+                            local.push((tile, tile_buf));
+                        }
+                        None => break,
+                    }
+                }
+                let finished_ms = cpu_t0.elapsed().as_secs_f32() * 1000.0;
+                let _ = tx.send((local, stolen, finished_ms));
+            });
+        }
+
+        // --- GPU side: coarse-grained, synchronous on this (calling) thread
+        // (cudarc's copies block anyway) — runs concurrently with the CPU
+        // workers above, which execute on rayon's pool threads. Dispatch the
+        // committed batch immediately, then mop up whatever CPU hasn't
+        // claimed from `steal_queue` if it's a big enough leftover to justify
+        // a second launch. ---
+        let gpu_t0 = std::time::Instant::now();
+        dispatch(cuda, &gpu_committed);
+
+        let leftover_len = steal_queue.lock().unwrap().len();
+        let mut gpu_steal_dispatched = false;
+        if leftover_len as u32 >= cfg.min_steal_tiles {
+            let leftover: Vec<[u32; 4]> = std::mem::take(&mut *steal_queue.lock().unwrap()).into_iter().collect();
+            if !leftover.is_empty() {
+                dispatch(cuda, &leftover);
+                gpu_steal_dispatched = true;
             }
         }
-    }
-    let total_tiles = gpu_tiles.len() + cpu_tiles.len();
 
-    // --- Phase 3: concurrent dispatch. CPU tiles run on a scoped thread (only
-    // needs Send, not 'static, so it can borrow pg/cpu_tiles/julia_c freely);
-    // the GPU call runs synchronously on this thread since it never yields
-    // anyway (cudarc's copies are blocking) and keeps `&mut cuda` local. ---
-    let (buf, gpu_ms, cpu_ms) = std::thread::scope(|s| {
-        let cpu_handle = s.spawn(|| {
-            let t0 = std::time::Instant::now();
-            let results: Vec<([u32; 4], Vec<f32>)> = cpu_tiles
-                .par_iter()
-                .map(|&tile| (tile, render_tile_exact(&pg, fractal, julia_c, max_iter, tile)))
-                .collect();
-            (results, t0.elapsed())
-        });
+        let gpu_did_anything = !gpu_committed.is_empty() || gpu_steal_dispatched;
+        // If GPU had nothing to do at all this frame (every tile ended up
+        // CPU-side), don't read back — `self.output` would be stale from a
+        // previous frame/viewport, and every pixel gets overwritten by the
+        // CPU merge below regardless.
+        let gpu_buf = if gpu_did_anything {
+            cuda.readback()
+        } else {
+            vec![0.0f32; (w * h) as usize]
+        };
+        let gpu_ms = gpu_t0.elapsed().as_secs_f32() * 1000.0;
 
-        let t1 = std::time::Instant::now();
-        let gpu_buf = cuda.render_tiled(
-            &gpu_tiles,
-            pg.re_start, pg.im_start, pg.re_step, pg.im_step,
-            julia_c[0], julia_c[1], max_iter, fractal.as_u32(),
-        );
-        let gpu_ms = t1.elapsed().as_secs_f32() * 1000.0;
+        (gpu_buf, gpu_ms, gpu_steal_dispatched)
+        // `rayon::scope` blocks here until every `s.spawn`ed worker above has
+        // finished (and sent its result) before returning this tuple.
+    });
 
-        let (cpu_results, cpu_elapsed) = cpu_handle.join().unwrap();
-        let cpu_ms = cpu_elapsed.as_secs_f32() * 1000.0;
-
-        // gpu_buf is already correct at every gpu_tile position (full w*h,
-        // dtoh-copied from the persistent device output); everything else is
-        // stale from a previous frame. Patch in each CPU tile's own buffer —
-        // together gpu_tiles/cpu_tiles partition every pixel exactly once.
-        let mut buf = gpu_buf;
-        for ([x0, y0, tw, th], local) in cpu_results {
+    let mut cpu_pixels = 0u64;
+    let mut cpu_stolen_tile_count = 0u32;
+    let mut cpu_ms = 0.0f32;
+    let mut buf = gpu_buf;
+    for _ in 0..n_workers {
+        let (results, stolen, finished_ms) = rx.recv().unwrap();
+        cpu_stolen_tile_count += stolen;
+        // The slowest worker to finish is when CPU-side work was actually
+        // done — not when we got around to draining the channel, which can
+        // happen arbitrarily later if GPU (running concurrently on the
+        // calling thread) was the one holding `rayon::scope` open.
+        cpu_ms = cpu_ms.max(finished_ms);
+        for ([x0, y0, tw, th], local) in results {
+            cpu_pixels += (tw as u64) * (th as u64);
             for row in 0..th {
                 let dst = ((y0 + row) * w + x0) as usize;
                 let src = (row * tw) as usize;
                 buf[dst..dst + tw as usize].copy_from_slice(&local[src..src + tw as usize]);
             }
         }
-        (buf, gpu_ms, cpu_ms)
-    });
+    }
 
     controller.update(gpu_ms, cpu_ms);
 
@@ -143,6 +300,8 @@ pub fn render_heterogeneous(
         buf,
         gpu_ms,
         cpu_ms,
-        cpu_tile_frac: if total_tiles > 0 { cpu_tiles.len() as f32 / total_tiles as f32 } else { 0.0 },
+        cpu_tile_frac: if total_pixels > 0 { cpu_pixels as f32 / total_pixels as f32 } else { 0.0 },
+        gpu_steal_dispatched,
+        cpu_stolen_tile_count,
     }
 }
