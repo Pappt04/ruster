@@ -5,7 +5,7 @@ use novafractal::gpu::unifroms::{PerturbUniforms, Uniforms};
 use novafractal::gui::color::{colorize, ColorScheme};
 use novafractal::gui::viewport::Viewport;
 use rayon::ThreadPoolBuilder;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 // ── shared constants ──────────────────────────────────────────────────────────
 
@@ -33,6 +33,25 @@ struct GpuState {
 }
 
 static GPU: OnceLock<Option<GpuState>> = OnceLock::new();
+
+// ── CUDA shared device (initialized once for the whole benchmark run) ─────────
+//
+// Each `bench_cuda_*` function used to construct its own `CudaFractal::new()`
+// — a fresh `CudaDevice::new(0)` (fresh primary-context retain + PTX module
+// load) per benchmark group/resolution, ~25+ over a full `cuda/` sweep.
+// Churning through that many contexts back-to-back in one process was
+// observed to destabilize the driver on this laptop's Optimus setup (a sweep
+// hung indefinitely, 0% GPU utilization, deep into the run — the same
+// operations completed in well under a second when run in isolation). One
+// shared device, mirroring `GPU`/`gpu()` above, avoids the repeated
+// retain/release/module-load churn entirely.
+#[cfg(feature = "cuda")]
+static CUDA_DEV: OnceLock<Arc<cudarc::driver::CudaDevice>> = OnceLock::new();
+
+#[cfg(feature = "cuda")]
+fn cuda_dev() -> Arc<cudarc::driver::CudaDevice> {
+    CUDA_DEV.get_or_init(|| cudarc::driver::CudaDevice::new(0).expect("no CUDA device")).clone()
+}
 
 fn gpu() -> Option<&'static GpuState> {
     GPU.get_or_init(|| {
@@ -436,7 +455,7 @@ fn bench_cuda_render(c: &mut Criterion) {
             let re_step  = half * aspect * 2.0 / w as f64;
             let im_step  = half * 2.0 / h as f64;
 
-            let mut cuda = CudaFractal::new(w, h);
+            let mut cuda = CudaFractal::from_device(cuda_dev(), w, h);
             group.throughput(Throughput::Elements(w as u64 * h as u64));
             group.bench_with_input(
                 BenchmarkId::new("cuda", label),
@@ -471,7 +490,7 @@ fn bench_cuda_pipeline(c: &mut Criterion) {
     group.sample_size(10);
 
     for &fractal in FractalType::ALL {
-        let mut cuda = CudaFractal::new(1920, 1080);
+        let mut cuda = CudaFractal::from_device(cuda_dev(), 1920, 1080);
         group.bench_function(fractal.name(), |b| {
             b.iter(|| {
                 let buf = cuda.render(
@@ -508,7 +527,7 @@ fn bench_hybrid_cpu_cuda(c: &mut Criterion) {
     group.sample_size(10);
 
     for &fractal in FractalType::ALL {
-        let mut cuda = CudaFractal::new(full_vp.width, h_bottom);
+        let mut cuda = CudaFractal::from_device(cuda_dev(), full_vp.width, h_bottom);
 
         group.bench_function(fractal.name(), |b| {
             b.iter(|| {
@@ -546,7 +565,7 @@ fn bench_heterogeneous(c: &mut Criterion) {
     for &fractal in FractalType::ALL {
         for &(zoom, label) in ZOOMS {
             let frame_vp = Viewport { center: CENTER, zoom, width: 1920, height: 1080 };
-            let mut cuda = CudaFractal::new(1920, 1080);
+            let mut cuda = CudaFractal::from_device(cuda_dev(), 1920, 1080);
             let mut controller = ThresholdController::new(50.0);
             let cfg = SchedulerConfig::default();
 
@@ -763,7 +782,7 @@ fn bench_cuda_perturbation(c: &mut Criterion) {
 
         let orbit = compute_reference_orbit(PERTURB_CENTER[0], PERTURB_CENTER[1], MAX_ITER);
 
-        let mut cuda = CudaFractal::new(1920, 1080);
+        let mut cuda = CudaFractal::from_device(cuda_dev(), 1920, 1080);
 
         group.bench_function(
             BenchmarkId::new("scalar", label),

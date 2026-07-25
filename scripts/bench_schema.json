@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ruster.local/bench_schema.json",
+  "title": "Normalized cross-project fractal-renderer benchmark record",
+  "description": "One record = one (project, impl, workload) timing measurement, normalized from whatever native benchmark tool produced it (Criterion, Google Benchmark, or a hand-rolled bench_runner). Every measurement any project produces gets a record here, including ones with no peer in any other project — those are marked project-unique rather than dropped, so the full capability surface of each renderer (especially ruster's CPU/SIMD/wgpu/CUDA/hybrid backends) stays visible in the aggregate stats.",
+  "type": "object",
+  "required": ["schema_version", "project", "impl", "language", "backend", "workload", "comparability", "status"],
+  "properties": {
+    "schema_version": { "const": "1" },
+
+    "project":  { "type": "string", "description": "Codebase this record came from, e.g. 'ruster', 'fractals-rs', 'fractalrenderercpp', 'cpp', 'zigger', 'nanobrot', 'fraqtive'." },
+    "impl":     { "type": "string", "description": "Unique identifier for the specific implementation variant within the project, e.g. 'ruster-cpu-rayon', 'ruster-simd-f32x8-ilp', 'ruster-wgpu', 'ruster-cuda', 'ruster-hybrid-cpu+wgpu', 'ruster-hybrid-cpu+cuda', 'ruster-hybrid-heterogeneous', 'ruster-perturbation-cpu'. This is the column/row key used for ruster's own multi-backend leaderboard." },
+    "language": { "type": "string", "enum": ["rust", "cpp", "zig", "unknown"] },
+
+    "git_hash":     { "type": ["string", "null"] },
+    "run_id":       { "type": ["string", "null"], "description": "Source run directory / batch identifier, e.g. 'criterion_20260622_200733_1e927cb'." },
+    "generated_at": { "type": ["string", "null"], "format": "date-time" },
+
+    "source": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["criterion", "google_benchmark", "manual", "no-data"] },
+        "tool_version": { "type": ["string", "null"] },
+        "path": { "type": ["string", "null"], "description": "Path to the native result file(s) this record was derived from, for traceability back to raw data." }
+      }
+    },
+
+    "backend": {
+      "type": "object",
+      "required": ["family"],
+      "properties": {
+        "family": { "type": "string", "enum": ["cpu-scalar", "cpu-simd", "cpu-tiled", "gpu-wgpu", "gpu-cuda", "hybrid", "unknown"] },
+        "detail": { "type": ["string", "null"], "description": "Free-text compute variant label straight from the native tool, e.g. 'rayon', 'f32x8_ilp', 'cuda', 'threads=8'." },
+        "threads": { "type": ["integer", "null"] }
+      }
+    },
+
+    "workload": {
+      "type": "object",
+      "required": ["fractal", "measurement"],
+      "properties": {
+        "fractal":     { "type": ["string", "null"], "description": "'mandelbrot' | 'julia' | 'newton' | 'nova' | null for non-fractal-specific measurements (e.g. reference_orbit)." },
+        "measurement": { "type": "string", "description": "What is actually being timed: 'pixel_kernel' | 'render' | 'render_tiled' | 'colorize' | 'pipeline' | 'thread_scaling' | 'perturbation' | 'reference_orbit' | 'series_approx' | 'unclassified'." },
+        "algorithm":   { "type": ["string", "null"], "description": "'naive' | 'perturbation' | 'perturbation_sa' | 'tiled_hilbert' | null." },
+        "resolution":  { "type": ["array", "null"], "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 },
+        "max_iter":    { "type": ["integer", "null"] },
+        "precision":   { "type": ["string", "null"], "description": "'f32' | 'f64' | 'f128' | null when not applicable." },
+        "param":       { "type": ["string", "null"], "description": "Extra free-form axis that doesn't fit elsewhere, e.g. thread count for thread_scaling, zoom level for perturbation sweeps." }
+      }
+    },
+
+    "comparability": {
+      "type": "object",
+      "required": ["class"],
+      "properties": {
+        "class": {
+          "type": "string",
+          "enum": ["baseline-common", "project-unique", "unclassified"],
+          "description": "'baseline-common': same fractal/resolution/max_iter/precision/naive-CPU-algorithm as at least one other project — goes in the fair cross-project table. 'project-unique': a real measurement but no other project has an equivalent (e.g. ruster's wgpu/CUDA/hybrid/perturbation backends) — still reported, just in the full-capability table instead. 'unclassified': the aggregator couldn't confidently classify this record (unrecognized naming convention) — still kept, flagged for manual review."
+        },
+        "baseline_key": { "type": ["string", "null"], "description": "Grouping key for the fair-comparison table, e.g. 'mandelbrot@1920x1080@iter1000@f64@naive-cpu'. Null unless class == 'baseline-common'." },
+        "note": { "type": ["string", "null"], "description": "Why this is/isn't comparable — e.g. 'Google Benchmark repetitions give stddev but not a bootstrap CI, unlike Criterion'." }
+      }
+    },
+
+    "stats": {
+      "type": ["object", "null"],
+      "description": "Null when status == 'no-data'.",
+      "properties": {
+        "mean_ms":          { "type": ["number", "null"] },
+        "mean_ci_low_ms":   { "type": ["number", "null"], "description": "Null if the native tool doesn't produce a bootstrap CI (e.g. plain Google Benchmark)." },
+        "mean_ci_high_ms":  { "type": ["number", "null"] },
+        "median_ms":        { "type": ["number", "null"] },
+        "std_dev_ms":       { "type": ["number", "null"] },
+        "confidence_level": { "type": ["number", "null"] },
+        "n_samples":        { "type": ["integer", "null"] }
+      }
+    },
+
+    "derived": {
+      "type": ["object", "null"],
+      "properties": {
+        "mpix_s":       { "type": ["number", "null"] },
+        "gflops":       { "type": ["number", "null"] },
+        "gflops_note":  { "type": ["string", "null"], "description": "Why GFLOPs is null when it is — e.g. 'iteration count not exposed by this harness'." }
+      }
+    },
+
+    "status": {
+      "type": "string",
+      "enum": ["ok", "no-data"],
+      "description": "'no-data' marks a placeholder row for a project/impl that hasn't been instrumented yet (e.g. nanobrot, fraqtive) so it still appears in the leaderboard instead of silently vanishing."
+    }
+  }
+}

@@ -15,7 +15,8 @@ struct Uniforms {
 @group(0) @binding(0) var<uniform>            uni  : Uniforms;
 @group(0) @binding(1) var<storage, read_write> buf : array<f32>;
 
-const ESCAPE_SQ : f32 = 65536.0;   // 256²
+// Must match src/fractal/fractal.rs's ESCAPE_RADIUS_SQ (bailout radius 2).
+const ESCAPE_SQ : f32 = 4.0;
 
 // ── smooth coloring helper ──────────────────────────────────────────────────
 fn smooth_iter(i: u32, zn_sq: f32) -> f32 {

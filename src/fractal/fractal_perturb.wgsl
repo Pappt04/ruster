@@ -29,7 +29,8 @@ struct Uniforms {
 @group(0) @binding(2) var<storage, read>       orbit_re : array<f32>;
 @group(0) @binding(3) var<storage, read>       orbit_im : array<f32>;
 
-const ESCAPE_SQ  : f32 = 65536.0;   // 256²
+// Must match src/fractal/fractal.rs's ESCAPE_RADIUS_SQ (bailout radius 2).
+const ESCAPE_SQ  : f32 = 4.0;
 const GLITCH_SQ  : f32 = 1e-6;      // |ε|²/|Z|² threshold
 
 fn smooth_iter(i: u32, zn_sq: f32) -> f32 {

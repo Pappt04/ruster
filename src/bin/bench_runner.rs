@@ -385,11 +385,21 @@ fn pixel_diff_stats(a: &[f32], b: &[f32]) -> (f32, f64, u64) {
 
 /// Validate `scheduler::render_heterogeneous` against plain CPU `render()` and
 /// report the GPU/CPU tile split + timing, alongside a plain full-frame
-/// `cuda.render()` baseline for context. Both columns are expected to show
-/// `max_diff == 0.0` — CPU and GPU now agree bit-for-bit (see the fixes in
+/// `cuda.render()` baseline for context.
+///
+/// The "vs CPU render()" column (the scheduler's actual tiled output, via
+/// `render_tiled`/`render_prepass`) is expected to show `max_diff == 0.0` —
+/// CPU and GPU agree bit-for-bit there (see the fixes in
 /// `src/gpu/cuda.rs::morton_cfg`, `src/fractal/fractal.cu::mandelbrot`,
 /// `build.rs` (`--fmad=false`), and `src/fractal/fractal.rs::render_tile_exact`
 /// for the three independent divergence sources this closed).
+///
+/// The "plain cuda.render() base" column is context-only and, for
+/// Mandelbrot/Julia below `F32_PRECISION_THRESHOLD`, is now expected to show a
+/// small nonzero diff: `CudaFractal::render()` dispatches those to an f32
+/// kernel for speed (see its doc comment), while `render_tiled`/`render_prepass`
+/// — what the scheduler itself uses — stay on the f64 kernel, so this baseline
+/// no longer reflects what the scheduler dispatches.
 #[cfg(feature = "cuda")]
 fn run_heterogeneous_check(vp: &Viewport, args: &Args) {
     use novafractal::gpu::cuda::CudaFractal;
@@ -654,7 +664,7 @@ fn run_cuda_loop(args: &Args, n: usize) {
     use novafractal::gpu::cuda::CudaFractal;
 
     let julia_c = [-0.4f64, 0.6];
-    let vp = Viewport { center: args.center, zoom: args.zoom, width: args.width, height: args.height };
+    let vp = Viewport { center: args.center.unwrap_or([-0.5, 0.0]), zoom: args.zoom, width: args.width, height: args.height };
     let pg = pixel_grid(&vp);
     let mut cuda = CudaFractal::new(vp.width, vp.height);
 
@@ -687,7 +697,7 @@ fn run_scheduler_sweep(args: &Args) {
     use novafractal::scheduler::{render_heterogeneous, controller::ThresholdController, SchedulerConfig};
 
     let julia_c = [-0.4f64, 0.6];
-    let vp = Viewport { center: args.center, zoom: args.zoom, width: args.width, height: args.height };
+    let vp = Viewport { center: args.center.unwrap_or([-0.5, 0.0]), zoom: args.zoom, width: args.width, height: args.height };
     let mut cuda = CudaFractal::new(vp.width, vp.height);
 
     println!("\nscheduler tile_size x threshold sweep ({}×{}, max_iter={}, zoom={}, center={:?})",

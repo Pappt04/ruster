@@ -1,7 +1,7 @@
 use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
-use crate::fractal::fractal::RefOrbit;
+use crate::fractal::fractal::{RefOrbit, F32_PRECISION_THRESHOLD};
 
 pub struct CudaFractal {
     dev:            Arc<CudaDevice>,
@@ -12,15 +12,36 @@ pub struct CudaFractal {
 }
 
 impl CudaFractal {
+    /// Creates a fresh CUDA context (`CudaDevice::new`) and loads the PTX
+    /// module into it. Fine for the one-instance-per-process cases (the live
+    /// app, `bench_runner`'s CLI subcommands) this was originally written for.
+    ///
+    /// A criterion run that constructs many `CudaFractal`s in one process
+    /// (one per benchmark group/resolution — ~25+ across a full `cuda/`
+    /// sweep) should use [`Self::from_device`] instead: repeatedly retaining
+    /// a fresh primary context and reloading the PTX module that many times
+    /// back-to-back was observed to destabilize the driver on this laptop's
+    /// Optimus setup (a sweep hung indefinitely — 0% GPU utilization — deep
+    /// into the run, while the same operations ran fine in isolation).
     pub fn new(width: u32, height: u32) -> Self {
         let dev = CudaDevice::new(0).expect("no CUDA device");
+        Self::from_device(dev, width, height)
+    }
 
-        let ptx = Ptx::from_src(include_str!(env!("FRACTAL_PTX")));
-        dev.load_ptx(ptx, "fractal", &[
-            "fractal_kernel",
-            "fractal_perturb_kernel",
-            "fractal_kernel_tiled",
-        ]).unwrap();
+    /// Like [`Self::new`], but reuses an already-constructed device/context
+    /// instead of retaining a new one. The PTX module is only loaded once per
+    /// device (guarded by `has_func`) — safe to call repeatedly with the same
+    /// `dev` for different resolutions.
+    pub fn from_device(dev: Arc<CudaDevice>, width: u32, height: u32) -> Self {
+        if !dev.has_func("fractal", "fractal_kernel") {
+            let ptx = Ptx::from_src(include_str!(env!("FRACTAL_PTX")));
+            dev.load_ptx(ptx, "fractal", &[
+                "fractal_kernel",
+                "fractal_kernel_f32",
+                "fractal_perturb_kernel",
+                "fractal_kernel_tiled",
+            ]).unwrap();
+        }
 
         let n      = (width * height) as usize;
         let output = dev.alloc_zeros::<f32>(n).unwrap();
@@ -32,6 +53,17 @@ impl CudaFractal {
     ///
     /// Launched with a 1-D grid of 16×16 blocks; each block covers 256 consecutive
     /// Morton codes.  The output buffer is still row-major — only traversal changes.
+    ///
+    /// Dispatches to the f32 kernel for Mandelbrot/Julia below
+    /// `F32_PRECISION_THRESHOLD` — mirroring `cpu_render_fastest`'s SIMD
+    /// dispatch in bench_runner.rs. Consumer GPUs (this targets Ampere
+    /// GeForce, see build.rs) run fp64 at a small fraction of fp32 throughput,
+    /// so the f64 kernel below — kept for bit-exact agreement with the CPU at
+    /// deep zoom, and reused by the heterogeneous scheduler's tiled dispatch —
+    /// was making full-frame CUDA renders dramatically slower than both wgpu
+    /// (always f32) and even the CPU at shallow zoom. Newton/Nova have no f32
+    /// fast path in this codebase (same as `cpu_render_fastest`) so they
+    /// always take the f64 kernel.
     pub fn render(
         &mut self,
         re_start : f64,
@@ -43,6 +75,14 @@ impl CudaFractal {
         max_iter : u32,
         fractal  : u32,
     ) -> Vec<f32> {
+        let f32_capable = fractal == 0 || fractal == 1;
+        if f32_capable {
+            let zoom = 4.0 / (im_step.abs() * self.height as f64);
+            if zoom < F32_PRECISION_THRESHOLD {
+                return self.render_f32(re_start, im_start, re_step, im_step, julia_cr, julia_ci, max_iter, fractal);
+            }
+        }
+
         let f   = self.dev.get_func("fractal", "fractal_kernel").unwrap();
         let cfg = self.morton_cfg(self.width, self.height);
         unsafe {
@@ -50,6 +90,31 @@ impl CudaFractal {
                 &mut self.output,
                 re_start, im_start, re_step, im_step,
                 julia_cr, julia_ci,
+                max_iter, fractal,
+                self.width, self.height,
+            ))
+        }.unwrap();
+        self.dev.dtoh_sync_copy(&self.output).unwrap()
+    }
+
+    fn render_f32(
+        &mut self,
+        re_start : f64,
+        im_start : f64,
+        re_step  : f64,
+        im_step  : f64,
+        julia_cr : f64,
+        julia_ci : f64,
+        max_iter : u32,
+        fractal  : u32,
+    ) -> Vec<f32> {
+        let f   = self.dev.get_func("fractal", "fractal_kernel_f32").unwrap();
+        let cfg = self.morton_cfg(self.width, self.height);
+        unsafe {
+            f.launch(cfg, (
+                &mut self.output,
+                re_start as f32, im_start as f32, re_step as f32, im_step as f32,
+                julia_cr as f32, julia_ci as f32,
                 max_iter, fractal,
                 self.width, self.height,
             ))

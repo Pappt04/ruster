@@ -1,7 +1,11 @@
 #include <math.h>
 #include <stdint.h>
 
-#define ESCAPE_SQ 65536.0
+// Must match src/fractal/fractal.rs's ESCAPE_RADIUS_SQ exactly (bailout
+// radius 2, radius² = 4) — anything else breaks the CPU/GPU bit-for-bit
+// agreement the heterogeneous scheduler depends on, and costs every
+// escaping pixel a few wasted iterations.
+#define ESCAPE_SQ 4.0
 
 // Precomputed 1/ln(2) — avoids repeated log(2.0) calls in smooth_iter.
 __device__ static const double INV_LN2 = 1.4426950408889634;
@@ -94,6 +98,67 @@ __device__ float julia(double zr0, double zi0, double cr, double ci, uint32_t ma
             zr_b   = zr;
             zi_b   = zi;
         }
+    }
+    return (float)max_iter;
+}
+
+// ── f32 fast path (Mandelbrot / Julia only) ──────────────────────────────────
+//
+// RTX-class consumer GPUs run fp64 at a small fraction of their fp32 rate
+// (Ampere GeForce: 1/64), so the double-precision kernel above — needed for
+// bit-exact agreement with the CPU's f64 path at deep zoom, and reused by the
+// heterogeneous scheduler's tiled dispatch — is dramatically slower than it
+// needs to be at shallow zoom, where f32 has plenty of precision. This mirrors
+// `mandelbrot_x8`/`julia_x8` in fractal.rs (the CPU's own f32 SIMD fast path):
+// same bulb pre-check, same "no period-detection in f32" trade-off, same
+// escape radius. `CudaFractal::render()` picks this kernel only for
+// Mandelbrot/Julia below `F32_PRECISION_THRESHOLD`, exactly mirroring
+// `cpu_render_fastest`'s dispatch — Newton/Nova stay on the f64 kernel above.
+#define ESCAPE_SQ_F32 4.0f
+
+__device__ float smooth_iter_f32(uint32_t i, float zn_sq, uint32_t max_iter) {
+    if (i >= max_iter) return (float)max_iter;
+    const float inv_ln2 = 1.4426950408889634f;
+    float log_zn = logf(zn_sq) * 0.5f;
+    float nu     = logf(log_zn * inv_ln2) * inv_ln2;
+    return (float)i + 1.0f - nu;
+}
+
+__device__ float mandelbrot_f32(float cr, float ci, uint32_t max_iter) {
+    float q = (cr - 0.25f) * (cr - 0.25f) + ci * ci;
+    if (q * (q + cr - 0.25f) < 0.25f * ci * ci) return (float)max_iter;
+    if ((cr + 1.0f) * (cr + 1.0f) + ci * ci < 0.0625f) return (float)max_iter;
+    // Period-3 check stays f64, same as the CPU's `bulb_precheck_x8` — it
+    // runs once per pixel, not per iteration, so it isn't the bottleneck.
+    if (in_period3_bulb((double)cr, (double)ci)) return (float)max_iter;
+
+    float zr = cr, zi = ci;
+    if (max_iter <= 1) return (float)max_iter;
+    // iter 1: z = c² + c (same fast-start as the f64 kernel).
+    float zr2 = zr * zr;
+    float zi2 = zi * zi;
+    zi = 2.0f * zr * zi + ci;
+    zr = zr2 - zi2 + cr;
+    if (max_iter <= 2) return (float)max_iter;
+
+    for (uint32_t i = 2; i < max_iter; i++) {
+        float zr2 = zr * zr, zi2 = zi * zi;
+        float zn_sq = zr2 + zi2;
+        if (zn_sq > ESCAPE_SQ_F32) return smooth_iter_f32(i, zn_sq, max_iter);
+        zi = 2.0f * zr * zi + ci;
+        zr = zr2 - zi2 + cr;
+    }
+    return (float)max_iter;
+}
+
+__device__ float julia_f32(float zr0, float zi0, float cr, float ci, uint32_t max_iter) {
+    float zr = zr0, zi = zi0;
+    for (uint32_t i = 0; i < max_iter; i++) {
+        float zr2 = zr * zr, zi2 = zi * zi;
+        float zn_sq = zr2 + zi2;
+        if (zn_sq > ESCAPE_SQ_F32) return smooth_iter_f32(i, zn_sq, max_iter);
+        zi = 2.0f * zr * zi + ci;
+        zr = zr2 - zi2 + cr;
     }
     return (float)max_iter;
 }
@@ -280,6 +345,44 @@ void fractal_kernel(
     }
 
     // Write in row-major order — CPU reads linearly.
+    buf[y * width + x] = v;
+}
+
+// ── f32 fast-path kernel (Mandelbrot / Julia, shallow zoom only) ─────────────
+//
+// Same Morton dispatch as `fractal_kernel`, but the whole per-pixel coordinate
+// + iteration loop runs in f32. `CudaFractal::render()` only ever launches
+// this for fractal ids 0/1 below `F32_PRECISION_THRESHOLD`; Newton/Nova and
+// deep-zoom Mandelbrot/Julia stay on `fractal_kernel` above.
+extern "C" __global__ __launch_bounds__(256, 2)
+void fractal_kernel_f32(
+    float* __restrict__ buf,
+    float    re_start,
+    float    im_start,
+    float    re_step,
+    float    im_step,
+    float    julia_cr,
+    float    julia_ci,
+    uint32_t max_iter,
+    uint32_t fractal,
+    uint32_t width,
+    uint32_t height
+) {
+    uint32_t morton_idx = (uint32_t)blockIdx.x * 256u
+                        + (uint32_t)threadIdx.y * 16u
+                        + (uint32_t)threadIdx.x;
+
+    uint32_t x, y;
+    morton_decode(morton_idx, &x, &y);
+    if (x >= width || y >= height) return;
+
+    float re = re_start + (float)x * re_step;
+    float im = im_start + (float)y * im_step;
+
+    float v = (fractal == 0)
+        ? mandelbrot_f32(re, im, max_iter)
+        : julia_f32(re, im, julia_cr, julia_ci, max_iter);
+
     buf[y * width + x] = v;
 }
 
