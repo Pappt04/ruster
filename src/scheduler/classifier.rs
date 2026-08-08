@@ -94,6 +94,14 @@ fn sample_corners(ctx: &PartitionCtx, x0: u32, y0: u32, tw: u32, th: u32) -> [f3
 /// each cell independently down to `min_tile`, classifying by corner spread
 /// at each level. Returns `(gpu_tiles, cpu_tiles)` as `[x0,y0,tw,th]`
 /// descriptors that together partition every pixel exactly once.
+///
+/// Top-level cells are independent (each recurses only within its own
+/// bounds), so they're classified in parallel via rayon rather than a plain
+/// loop — worth doing since this whole step runs on the calling thread before
+/// any GPU/CPU dispatch even starts, so it's pure added latency at the front
+/// of every frame. Cost is bounded (a `pixel()` call per corner, a few
+/// thousand at worst per 1920x1080 frame — see the module's cost estimate)
+/// but non-trivial at deep zoom where more cells recurse to `min_tile`.
 pub fn partition_frame(
     pg: &PixelGrid,
     fractal: FractalType,
@@ -105,24 +113,41 @@ pub fn partition_frame(
     min_tile: u32,
     threshold: f32,
 ) -> (Vec<[u32; 4]>, Vec<[u32; 4]>) {
+    use rayon::prelude::*;
+
     let min_tile = min_tile.max(1);
     let max_tile = max_tile.max(min_tile);
     let ctx = PartitionCtx { pg, fractal, julia_c, max_iter, min_tile, threshold };
 
-    let mut gpu_tiles = Vec::new();
-    let mut cpu_tiles = Vec::new();
-
+    let mut cells: Vec<(u32, u32, u32, u32)> = Vec::new();
     let mut y0 = 0u32;
     while y0 < height {
         let th = max_tile.min(height - y0);
         let mut x0 = 0u32;
         while x0 < width {
             let tw = max_tile.min(width - x0);
-            let corners = sample_corners(&ctx, x0, y0, tw, th);
-            partition_tile(&ctx, x0, y0, tw, th, corners, &mut gpu_tiles, &mut cpu_tiles);
+            cells.push((x0, y0, tw, th));
             x0 += tw;
         }
         y0 += th;
+    }
+
+    let per_cell: Vec<(Vec<[u32; 4]>, Vec<[u32; 4]>)> = cells
+        .par_iter()
+        .map(|&(x0, y0, tw, th)| {
+            let corners = sample_corners(&ctx, x0, y0, tw, th);
+            let mut gpu_tiles = Vec::new();
+            let mut cpu_tiles = Vec::new();
+            partition_tile(&ctx, x0, y0, tw, th, corners, &mut gpu_tiles, &mut cpu_tiles);
+            (gpu_tiles, cpu_tiles)
+        })
+        .collect();
+
+    let mut gpu_tiles = Vec::new();
+    let mut cpu_tiles = Vec::new();
+    for (mut g, mut c) in per_cell {
+        gpu_tiles.append(&mut g);
+        cpu_tiles.append(&mut c);
     }
 
     (gpu_tiles, cpu_tiles)

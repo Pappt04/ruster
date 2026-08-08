@@ -1,4 +1,4 @@
-use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DeviceSlice, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
 use crate::fractal::fractal::{RefOrbit, F32_PRECISION_THRESHOLD};
@@ -9,6 +9,16 @@ pub struct CudaFractal {
     prepass_output: Option<CudaSlice<f32>>,
     width:          u32,
     height:         u32,
+    // Cached kernel handles — `get_func` takes an `RwLock` read + two
+    // `BTreeMap` string lookups every call; cheap in isolation, but the
+    // heterogeneous scheduler can call `dispatch_tiled[_f32]` twice per frame
+    // (committed batch + steal mop-up), so caching removes it from what's
+    // otherwise a per-frame hot path instead of a one-shot setup cost.
+    fn_kernel:        CudaFunction,
+    fn_kernel_f32:    CudaFunction,
+    fn_perturb:       CudaFunction,
+    fn_tiled:         CudaFunction,
+    fn_tiled_f32:     CudaFunction,
 }
 
 impl CudaFractal {
@@ -47,7 +57,16 @@ impl CudaFractal {
         let n      = (width * height) as usize;
         let output = dev.alloc_zeros::<f32>(n).unwrap();
 
-        Self { dev, output, prepass_output: None, width, height }
+        let fn_kernel     = dev.get_func("fractal", "fractal_kernel").unwrap();
+        let fn_kernel_f32 = dev.get_func("fractal", "fractal_kernel_f32").unwrap();
+        let fn_perturb    = dev.get_func("fractal", "fractal_perturb_kernel").unwrap();
+        let fn_tiled      = dev.get_func("fractal", "fractal_kernel_tiled").unwrap();
+        let fn_tiled_f32  = dev.get_func("fractal", "fractal_kernel_tiled_f32").unwrap();
+
+        Self {
+            dev, output, prepass_output: None, width, height,
+            fn_kernel, fn_kernel_f32, fn_perturb, fn_tiled, fn_tiled_f32,
+        }
     }
 
     /// Full-frame render using Z-order (Morton) traversal for better L2 locality.
@@ -84,7 +103,7 @@ impl CudaFractal {
             }
         }
 
-        let f   = self.dev.get_func("fractal", "fractal_kernel").unwrap();
+        let f   = self.fn_kernel.clone();
         let cfg = self.morton_cfg(self.width, self.height);
         unsafe {
             f.launch(cfg, (
@@ -109,7 +128,7 @@ impl CudaFractal {
         max_iter : u32,
         fractal  : u32,
     ) -> Vec<f32> {
-        let f   = self.dev.get_func("fractal", "fractal_kernel_f32").unwrap();
+        let f   = self.fn_kernel_f32.clone();
         let cfg = self.morton_cfg(self.width, self.height);
         unsafe {
             f.launch(cfg, (
@@ -140,7 +159,7 @@ impl CudaFractal {
         let orbit_re_dev = self.dev.htod_sync_copy(&orbit.zr[..orbit_slice]).unwrap();
         let orbit_im_dev = self.dev.htod_sync_copy(&orbit.zi[..orbit_slice]).unwrap();
 
-        let f   = self.dev.get_func("fractal", "fractal_perturb_kernel").unwrap();
+        let f   = self.fn_perturb.clone();
         // Perturbation kernel still uses the 2-D linear launch — linear access into
         // the orbit arrays already gives good coalescing.
         let cfg = LaunchConfig {
@@ -189,7 +208,7 @@ impl CudaFractal {
             self.prepass_output = Some(self.dev.alloc_zeros::<f32>(n).unwrap());
         }
 
-        let f   = self.dev.get_func("fractal", "fractal_kernel").unwrap();
+        let f   = self.fn_kernel.clone();
         let cfg = self.morton_cfg(prepass_w, prepass_h);
         unsafe {
             f.launch(cfg, (
@@ -230,6 +249,17 @@ impl CudaFractal {
     /// dispatched; a real partial/windowed copy would need either per-tile-row
     /// copies or a compacted device-side buffer — left as a follow-up, not
     /// required for the scheduler rewrite.
+    ///
+    /// That TODO is now measured, and it is *the* reason the heterogeneous
+    /// scheduler cannot beat plain GPU rendering on this machine. At 1920x1080
+    /// the full-frame copy is 1.33 ms against a ~0.28 ms kernel — **~82% of the
+    /// frame** is fixed cost that shifting tiles to the CPU does not reduce
+    /// (and the share grew, not shrank, when the kernel got 2x faster: see the
+    /// fp64 bulb fix in fractal.cu). So the largest kernel saving the scheduler
+    /// can possibly realise is ~0.01 ms at zoom 1e0 (CPU takes 3.1% of pixels)
+    /// while its own machinery costs ~1.3 ms: two orders of magnitude
+    /// underwater before any tuning. Fixing this copy is the single change that
+    /// makes the scheduler's premise true. See results/summary.md §3.
     /// Uploads `[x0,y0,w,h]` tile descriptors and computes the launch grid
     /// shared by `dispatch_tiled`/`dispatch_tiled_f32`. Returns `None` if
     /// `tiles` is empty (nothing to launch).
@@ -270,7 +300,7 @@ impl CudaFractal {
     ) {
         let Some((tile_descs_dev, cfg)) = self.upload_tiles(tiles) else { return };
 
-        let f = self.dev.get_func("fractal", "fractal_kernel_tiled").unwrap();
+        let f = self.fn_tiled.clone();
         unsafe {
             f.launch(cfg, (
                 &mut self.output,
@@ -303,7 +333,7 @@ impl CudaFractal {
     ) {
         let Some((tile_descs_dev, cfg)) = self.upload_tiles(tiles) else { return };
 
-        let f = self.dev.get_func("fractal", "fractal_kernel_tiled_f32").unwrap();
+        let f = self.fn_tiled_f32.clone();
         unsafe {
             f.launch(cfg, (
                 &mut self.output,
@@ -359,6 +389,20 @@ impl CudaFractal {
     /// Padding to the smallest enclosing power-of-two *square* guarantees
     /// every pixel in the rectangle is visited exactly once (the in-kernel
     /// `x >= width || y >= height` check discards the rest of the square).
+    ///
+    /// The padding looks expensive and measurably isn't. At 1920x1080 it
+    /// launches a 2048x2048 grid — 4,194,304 threads for 2,073,600 pixels,
+    /// 2.02x oversubscription, against wgpu's 1.01x. Timed against the same
+    /// `mandelbrot_f32` math launched on a plain 2-D grid (via
+    /// `dispatch_tiled_f32` over one full-frame tile), the median difference
+    /// over 7 paired runs is **+1.9%**, with two runs showing Morton *ahead* —
+    /// the surplus threads land in one contiguous L-shaped dead region, so
+    /// whole blocks fail the bounds check and retire immediately. Recorded
+    /// here as a tested-and-rejected hypothesis so it doesn't get "optimized"
+    /// again: the real cost in this path is the full-frame `dtoh_sync_copy`
+    /// — 1.33 ms of a 1.61 ms frame, ~82% — now that the fp64 bulb check in
+    /// `mandelbrot_f32` has been fixed. See results/summary.md §2.1 and
+    /// `examples/gpu_probe.rs`.
     fn morton_cfg(&self, w: u32, h: u32) -> LaunchConfig {
         let dim    = w.max(h).max(1).next_power_of_two();
         let total  = dim as u64 * dim as u64;

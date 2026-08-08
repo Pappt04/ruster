@@ -32,6 +32,7 @@
       "properties": {
         "family": { "type": "string", "enum": ["cpu-scalar", "cpu-simd", "cpu-tiled", "gpu-wgpu", "gpu-cuda", "hybrid", "unknown"] },
         "detail": { "type": ["string", "null"], "description": "Free-text compute variant label straight from the native tool, e.g. 'rayon', 'f32x8_ilp', 'cuda', 'threads=8'." },
+        "device":  { "type": ["string", "null"], "description": "Physical device this backend actually executed on. Load-bearing: until 2026-08-08 this machine had no NVIDIA Vulkan ICD, so gpu-wgpu ran on the integrated AMD Vega while gpu-cuda ran on the discrete RTX 3050 — the two were never the same GPU, and rows from those runs must not be compared." },
         "threads": { "type": ["integer", "null"] }
       }
     },

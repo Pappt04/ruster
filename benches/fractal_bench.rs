@@ -430,6 +430,52 @@ fn bench_hybrid_cpu_wgpu(c: &mut Criterion) {
     group.finish();
 }
 
+// Corner-sampling, work-stealing heterogeneous scheduler (see src/scheduler),
+// driving wgpu instead of CUDA — vs plain GPU-only render, across zoom levels.
+// `bench_hybrid_cpu_wgpu` above is the OLD static top/bottom-half split, kept
+// for comparison; this is the adaptive replacement for the wgpu backend,
+// mirroring `bench_heterogeneous`'s CUDA version below.
+fn bench_heterogeneous_wgpu(c: &mut Criterion) {
+    use novafractal::scheduler::{render_heterogeneous_wgpu, controller::ThresholdController, SchedulerConfig};
+
+    let Some(g) = gpu() else {
+        eprintln!("[hybrid] no GPU — skipping hybrid/heterogeneous_wgpu benchmarks");
+        return;
+    };
+
+    const ZOOMS: &[(f64, &str)] = &[(1.0, "zoom_1e0"), (1e2, "zoom_1e2"), (1e4, "zoom_1e4")];
+    const CENTER: [f64; 2] = [-0.75, 0.1];
+
+    let mut group = c.benchmark_group("hybrid/heterogeneous_wgpu");
+    group.throughput(Throughput::Elements(1920 * 1080));
+    group.sample_size(10);
+
+    for &fractal in FractalType::ALL {
+        for &(zoom, label) in ZOOMS {
+            let frame_vp = Viewport { center: CENTER, zoom, width: 1920, height: 1080 };
+            let compute = FractalCompute::new(&g.device, 1920, 1080);
+            // Starting guess for the normalized corner-spread threshold
+            // (~[0,1]) — see scheduler::controller's doc comment.
+            let mut controller = ThresholdController::new(0.02);
+            let cfg = SchedulerConfig::default();
+
+            group.bench_with_input(
+                BenchmarkId::new(fractal.name(), label),
+                &frame_vp,
+                |b, frame_vp| {
+                    b.iter(|| {
+                        render_heterogeneous_wgpu(
+                            black_box(frame_vp), fractal, JULIA_C, MAX_ITER,
+                            &compute, &g.device, &g.queue, &mut controller, &cfg,
+                        ).buf
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // CUDA benchmarks  (only compiled and run with --features cuda)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -824,6 +870,7 @@ criterion_group! {
         bench_wgpu_perturbation,
         // Hybrid CPU + wgpu
         bench_hybrid_cpu_wgpu,
+        bench_heterogeneous_wgpu,
         // CUDA GPU  (no-op stubs when feature is off)
         bench_cuda_render,
         bench_cuda_pipeline,

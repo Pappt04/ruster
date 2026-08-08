@@ -172,6 +172,72 @@ def fractal_norm(name: Optional[str]) -> Optional[str]:
 # scalar render() vs f64x4 render_simd() vs f32x8 render_simd_f32()" — `render()`
 # is the same function used here in the cpu/render group.
 
+# ── Which physical device each GPU backend actually runs on ───────────────────
+#
+# Both GPU backends now target the discrete RTX 3050, so wgpu-vs-CUDA rows are
+# a genuine same-silicon comparison.
+#
+# This was NOT true before 2026-08-08. The NVIDIA stack had been installed
+# COMPUTE-ONLY (`libnvidia-compute-580`, no `nvidia-driver-*`/`libnvidia-gl-*`),
+# so there was no `nvidia_icd.json` and no `libGLX_nvidia` on the system;
+# Vulkan could not see the RTX 3050 at all and `PowerPreference::HighPerformance`
+# silently fell back to the integrated AMD Vega. Every wgpu number in runs up to
+# and including `criterion_20260725_215202_8d2dbdc` came from the integrated GPU
+# and must not be compared against a CUDA number. Installing `nvidia-driver-580`
+# fixed it; `cargo run --release --example adapters` verifies which device wgpu
+# selects, and the bench harness now prints it (`[wgpu] ...`) at startup.
+GPU_DEVICE = {
+    "gpu-wgpu": "NVIDIA RTX 3050 Laptop — DISCRETE (via Vulkan)",
+    "gpu-cuda": "NVIDIA RTX 3050 Laptop — DISCRETE (via CUDA)",
+    "hybrid":   "CPU + NVIDIA RTX 3050 Laptop (discrete)",
+}
+
+
+def ruster_precision(fam: str, function_id: Optional[str], fractal: Optional[str],
+                     param: Optional[str]) -> str:
+    """Actual arithmetic precision of a ruster measurement.
+
+    Previously hardcoded to "f64" for every ruster record, which mislabelled
+    every GPU and f32-SIMD row and would have let an f32 GPU number join a
+    Table A group against f64 CPU numbers. The real rules, read off the source:
+
+    * wgpu (`fractal.wgsl`): WGSL has no f64 type at all — always f32, every
+      fractal, every zoom, no exceptions.
+    * CUDA (`fractal.cu` + `CudaFractal::render`): dispatches `fractal_kernel_f32`
+      for Mandelbrot/Julia below `F32_PRECISION_THRESHOLD` (1e6) and the f64
+      `fractal_kernel` otherwise. Newton/Nova have no f32 kernel at all.
+    * SIMD (`fractal.rs`): `f32x8`/`f32x8_ilp` are f32; `f64x4`/`scalar` are f64.
+    * The perturbation groups' reference orbits are f64 or f128 (double-double
+      `Dd`), carried in function_id.
+    """
+    fid = (function_id or "").lower()
+    if fam == "wgpu":
+        return "f32"
+    if fam == "cuda":
+        if fractal_norm(fractal) not in ("mandelbrot", "julia"):
+            return "f64"
+        # Perturbation-sweep arms carry an explicit zoom label; everything else
+        # is benched at zoom=1 (see fractal_bench.rs's `vp()`).
+        if param and param.startswith("zoom="):
+            try:
+                exp = int(param.split("1e")[1])
+            except (IndexError, ValueError):
+                return "f64"
+            return "f32" if exp < 6 else "f64"
+        return "f32"
+    if fam == "simd":
+        return "f32" if fid.startswith("f32") else "f64"
+    if fam == "hybrid":
+        # CPU tiles: f32 SIMD (SchedulerConfig::simd_cpu_tiles, default true);
+        # GPU tiles: f32 (wgpu always, CUDA via gpu_tiles_f32, default true).
+        return "f32"
+    if fam == "perturbation":
+        if "f128" in fid:
+            return "f128"
+        return "f64"
+    return "f64"
+
+
 def classify_ruster(group_id: str, function_id: str, value_str: Optional[str]) -> dict:
     parts = group_id.split("/")
     fam = parts[0] if parts else "unknown"
@@ -193,6 +259,7 @@ def classify_ruster(group_id: str, function_id: str, value_str: Optional[str]) -
         "cuda": "gpu-cuda", "hybrid": "hybrid", "perturbation": "cpu-scalar",
     }
     backend_family = backend_family_map.get(fam, "unknown")
+    device = GPU_DEVICE.get(backend_family)
 
     # measurement-specific fractal / algorithm extraction. `variant_label` feeds
     # `impl` — for groups where function_id is actually the fractal name (not a
@@ -213,12 +280,13 @@ def classify_ruster(group_id: str, function_id: str, value_str: Optional[str]) -
         if measurement == "pixel_kernel":
             param = "points_per_call=5"  # SAMPLE_POINTS has 5 entries — see bench_pixel_kernels
     elif fam == "hybrid":
-        # All three hybrid groups (cpu+wgpu, cpu+cuda, heterogeneous) call
-        # bench_function(fractal.name()) / BenchmarkId::new(fractal.name(), ...) —
-        # function_id is always the fractal, never a compute variant.
+        # All hybrid groups (cpu+wgpu static split, heterogeneous [CUDA
+        # adaptive scheduler], heterogeneous_wgpu [wgpu adaptive scheduler])
+        # call bench_function(fractal.name()) / BenchmarkId::new(fractal.name(),
+        # ...) — function_id is always the fractal, never a compute variant.
         fractal = function_id
-        variant_label = measurement      # "cpu+wgpu" | "cpu+cuda" | "heterogeneous"
-        if measurement == "heterogeneous" and value_str:
+        variant_label = measurement      # "cpu+wgpu" | "heterogeneous" | "heterogeneous_wgpu"
+        if measurement in ("heterogeneous", "heterogeneous_wgpu") and value_str:
             param = f"zoom={value_str}"  # value_str is a zoom label here, not a resolution
     elif measurement == "thread_scaling":
         fractal = "mandelbrot"          # only Mandelbrot_1080p is benchmarked
@@ -269,10 +337,12 @@ def classify_ruster(group_id: str, function_id: str, value_str: Optional[str]) -
 
     return {
         "impl": impl,
-        "backend": {"family": backend_family, "detail": function_id, "threads": threads},
+        "backend": {"family": backend_family, "detail": function_id, "threads": threads,
+                    "device": device},
         "workload": {
             "fractal": fractal_norm(fractal), "measurement": measurement, "algorithm": algorithm,
-            "resolution": resolution, "max_iter": MAX_ITER_DEFAULT, "precision": "f64", "param": param,
+            "resolution": resolution, "max_iter": MAX_ITER_DEFAULT,
+            "precision": ruster_precision(fam, function_id, fractal, param), "param": param,
         },
         "comparability": comparability,
     }
@@ -281,28 +351,30 @@ def classify_ruster(group_id: str, function_id: str, value_str: Optional[str]) -
 # ── Criterion adapter (Fractals-rs, github.com/Maxime-Cllt/Fractals-rs) ────────
 #
 # Verified against benches/application_bench.rs:
-#   "full_frame_800x600"        fixed 800x600, max_iter=300, no throughput.
+#   "full_frame_800x600"        fixed 800x600, max_iter=1000, no throughput.
 #                                function_id = "<fractal>_fast" (f32 SIMD) or
 #                                "<fractal>_high" (f64 SIMD) — there is NO
 #                                scalar/non-SIMD path in this project at all.
-#   "full_frame/<Fractal>"      multi-res sweep, max_iter=300, throughput set.
+#   "full_frame/<Fractal>"      multi-res sweep, max_iter=1000, throughput set.
 #                                function_id = "fast" | "high", value_str = resolution.
 #   "thread_scaling/Mandelbrot_1080p_fast"  max_iter=1000, f32 SIMD only.
 #   "scalar_kernels" / "simd_kernels"       single-pixel kernel calls.
 #
 # max_iter is baked in per-group from source, not read from data — Criterion's
 # own output doesn't carry it. If Fractals-rs's bench consts change, update here.
+# (Both full-frame groups used to run at max_iter=300 vs ruster's 1000 — fixed
+# to 1000 in benches/application_bench.rs so iteration count now matches.)
 #
-# Nothing here reaches class == "baseline-common" against ruster today: every
-# Fractals-rs full-frame path is SIMD (f32 "fast" or f64 "high") at max_iter=300,
-# while ruster's naive-cpu baseline is scalar f64 at max_iter=1000 — different
-# algorithm class AND different iteration count, so a merge would be a false
-# equivalence. They're kept as project-unique with an explicit note instead.
-# Re-running either project's bench to match (iters, precision, algorithm) would
-# make an exact pair line up automatically — the join key is purely mechanical.
+# Nothing here reaches class == "baseline-common" against ruster today, but not
+# because of iteration count anymore: every Fractals-rs full-frame path is SIMD
+# (f32 "fast" or f64 "high"), while ruster's naive-cpu baseline is scalar f64 —
+# different algorithm class, so a merge would still be a false equivalence on
+# that axis alone. They're kept as project-unique with an explicit note instead.
+# Re-running either project's bench to match algorithm/precision too would make
+# an exact pair line up automatically — the join key is purely mechanical.
 
-FRACTALS_RS_FULLFRAME_800_MAXITER = 300
-FRACTALS_RS_MULTIRES_MAXITER = 300
+FRACTALS_RS_FULLFRAME_800_MAXITER = 1000
+FRACTALS_RS_MULTIRES_MAXITER = 1000
 FRACTALS_RS_THREAD_SCALING_MAXITER = 1000
 
 
@@ -327,8 +399,9 @@ def classify_fractals_rs(group_id: str, function_id: str, value_str: Optional[st
         fractal = group_id.split("/", 1)[1]
         max_iter = FRACTALS_RS_MULTIRES_MAXITER
         measurement = "render"
-        note = (f"max_iter={max_iter} vs ruster's 1000, {precision} SIMD vs ruster's scalar baseline — "
-                "not comparable as-is; would need a matching-params rerun on one side.")
+        note = (f"max_iter={max_iter}, matches ruster's baseline — but {precision} SIMD vs ruster's "
+                "scalar naive-cpu baseline is still a different algorithm class, not comparable as-is; "
+                "would need a matching-algorithm rerun on one side.")
     elif group_id.startswith("thread_scaling"):
         fractal = "mandelbrot"
         max_iter = FRACTALS_RS_THREAD_SCALING_MAXITER
@@ -500,10 +573,17 @@ def parse_manual_json(project: str, language: str, path: Path, git_hash: Optiona
             project=project, language=language, git_hash=git_hash,
             impl=impl,
             source={"kind": "manual", "tool_version": "bench_runner", "path": str(path)},
-            backend={"family": backend_family, "detail": backend_raw, "threads": threads},
+            backend={"family": backend_family, "detail": backend_raw, "threads": threads,
+                     "device": GPU_DEVICE.get(backend_family)},
             workload={
                 "fractal": fractal_norm(s.get("fractal")), "measurement": measurement, "algorithm": "naive",
-                "resolution": resolution, "max_iter": s.get("max_iter"), "precision": "f64",
+                "resolution": resolution, "max_iter": s.get("max_iter"),
+                # Same rules as the criterion path (see `ruster_precision`) — the
+                # backend name in bench_runner's JSON maps onto the same kernels.
+                "precision": ruster_precision(
+                    {"gpu-wgpu": "wgpu", "gpu-cuda": "cuda", "hybrid": "hybrid"}.get(backend_family, "cpu"),
+                    backend_raw, s.get("fractal"), None,
+                ),
                 "param": f"threads={threads}" if is_scaling_sweep and threads else None,
             },
             comparability={
@@ -564,16 +644,18 @@ def dedup_manual_records(records: list[dict]) -> list[dict]:
 # Benchmark's JSON carries none of max_iter/resolution/threads as data, only
 # as name path segments for the ones passed via ->Args/->Arg):
 #   BM_Evaluate/<fractal>                    max_iter=1000, single point, no threads
-#   BM_FullFrame/<fractal>/<w>/<h>            max_iter=300,  8 threads (hardcoded)
+#   BM_FullFrame/<fractal>/<w>/<h>            max_iter=1000, 8 threads (hardcoded)
 #   BM_ThreadScaling_Mandelbrot_1080p/<n>      max_iter=1000, 1920x1080, n threads
-#   BM_FullPipeline_Mandelbrot_1080p           max_iter=300,  1920x1080, 8 threads
+#   BM_FullPipeline_Mandelbrot_1080p           max_iter=1000, 1920x1080, 8 threads
 #
-# BM_Evaluate and BM_ThreadScaling land in Table A: same fractal, same max_iter,
-# same f64-scalar-naive algorithm as ruster's cpu/pixel_kernel and
-# cpu/thread_scaling. BM_FullFrame/BM_FullPipeline stay project-unique — their
-# max_iter=300 was chosen to mirror Fractals-rs's full-frame benches, not
-# ruster's 1000, so merging them into ruster's render baseline would be a false
-# equivalence for the same reason Fractals-rs's full-frame numbers are excluded.
+# All four land in Table A now: same fractal, same max_iter, same f64-scalar-
+# naive algorithm as ruster's cpu/pixel_kernel, cpu/thread_scaling, cpu/render,
+# and cpu/pipeline respectively. BM_FullFrame/BM_FullPipeline used to run at
+# max_iter=300 (chosen to mirror Fractals-rs's full-frame benches, which were
+# ALSO max_iter=300 at the time) — both were bumped to 1000 in
+# Benchmarks/criterion_bench.cpp / benches/application_bench.rs so every
+# project's full-frame numbers are now a genuine apples-to-apples iteration
+# count (algorithm/precision can still differ — see each project's own note).
 
 def classify_fractalrenderercpp(base_name: str) -> dict:
     # Real name shape (verified against an actual criterion_bench --benchmark_format=json
@@ -616,11 +698,14 @@ def classify_fractalrenderercpp(base_name: str) -> dict:
         fractal = positional
         resolution = [int(kv["width"]), int(kv["height"])]
         measurement = "render"
-        max_iter = 300
+        max_iter = 1000
         threads = 8
         param = "threads=8"
-        comparability = {"class": "project-unique", "baseline_key": None,
-                          "note": "max_iter=300 here (mirrors Fractals-rs's full-frame benches) vs ruster's cpu/render baseline at max_iter=1000 — not directly comparable."}
+        bkey = baseline_key(measurement, fractal_norm(fractal) or "unknown", max_iter, "f64", "naive", resolution=resolution)
+        comparability = {"class": "baseline-common", "baseline_key": bkey,
+                          "note": "Same fractal/resolution/max_iter/precision/algorithm as ruster's cpu/render — "
+                                   "but 8 raw std::threads spawned per call here vs a persistent rayon pool in ruster, "
+                                   "a real threading-strategy difference, not a flaw."}
     elif kind == "BM_ThreadScaling_Mandelbrot_1080p":
         fractal = "mandelbrot"
         resolution = [1920, 1080]
@@ -637,11 +722,14 @@ def classify_fractalrenderercpp(base_name: str) -> dict:
         fractal = "mandelbrot"
         resolution = [1920, 1080]
         measurement = "pipeline"
-        max_iter = 300
+        max_iter = 1000
         threads = 8
         param = "threads=8"
-        comparability = {"class": "project-unique", "baseline_key": None,
-                          "note": "max_iter=300 vs ruster's cpu/pipeline baseline at max_iter=1000 — not directly comparable."}
+        bkey = baseline_key(measurement, fractal, max_iter, "f64", "naive", resolution=resolution)
+        comparability = {"class": "baseline-common", "baseline_key": bkey,
+                          "note": "Same fractal/resolution/max_iter/precision/algorithm as ruster's cpu/pipeline — "
+                                   "but 8 raw std::threads spawned per call here vs a persistent rayon pool in ruster, "
+                                   "a real threading-strategy difference, not a flaw."}
 
     impl_suffix = kind.replace("BM_", "").replace("_Mandelbrot_1080p", "").lower()
     impl = f"fractalrenderercpp-{impl_suffix}" + (f"-{fractal}" if kind in ("BM_Evaluate", "BM_FullFrame") else "")
@@ -848,6 +936,27 @@ def build_report(records: list[dict]) -> str:
 
 Generated {now}. {n_ok} measured records, {n_nodata} project(s) with no data yet.
 
+> ## Scope and provenance of this run
+>
+> **Mandelbrot only.** The latest criterion run was filtered to Mandelbrot (plus the
+> fractal-agnostic `colorize`/`reference_orbit`/`series_approx` groups). Julia, Newton and
+> Nova entries still present in `criterion_latest` are **carry-over from the previous run**
+> and were not re-measured; the default Mandelbrot scoping of this report excludes them.
+>
+> **Both GPU backends now run on the discrete RTX 3050**, so wgpu-vs-CUDA is a genuine
+> same-silicon comparison. This was not true before 2026-08-08: the NVIDIA stack was
+> installed compute-only, there was no NVIDIA Vulkan ICD, and wgpu silently fell back to
+> the integrated AMD Vega. **Every wgpu number in runs up to and including
+> `criterion_20260725_215202_8d2dbdc` came from the integrated GPU** and must not be
+> compared against a CUDA number from those runs.
+>
+> **Cross-run CPU comparisons are unreliable.** The previous archive was recorded
+> back-to-back with another full sweep on a thermally-loaded laptop; identical CPU
+> benchmarks moved 15–30% between that run and this one with no code change. Only compare
+> CPU rows recorded in the *same* run. FractalRendererCpp and Fractals-rs numbers here
+> predate this run and were not re-measured, so cross-project ratios carry that caveat —
+> re-run all three in one session before quoting a headline speedup.
+
 ## Table A — Fair comparison (same fractal/resolution/max_iter/precision, naive CPU path)
 
 {build_fair_comparison_table(records)}
@@ -868,18 +977,30 @@ Notes:
   produced numbers yet, kept as rows instead of omitted so the comparison's *coverage*
   is visible, not just its results.
 - FractalRendererCpp (Google Benchmark, run via `./criterion_bench --benchmark_format=json`)
-  lands in Table A twice: its `BM_Evaluate` pixel-kernel and `BM_ThreadScaling_Mandelbrot_1080p`
-  benches are confirmed f64 scalar naive at max_iter=1000, matching ruster's baseline exactly
-  (see classify_fractalrenderercpp()) — the one real difference being threading strategy
-  (raw std::thread spawn/join per call vs a persistent rayon pool), which the comparison
-  reports rather than hides. Its `BM_FullFrame`/`BM_FullPipeline` groups stay project-unique:
-  they run at max_iter=300 (mirroring Fractals-rs's own full-frame benches), not ruster's 1000.
+  lands in Table A for ALL FOUR of its benchmark groups: `BM_Evaluate`, `BM_FullFrame`,
+  `BM_ThreadScaling_Mandelbrot_1080p`, and `BM_FullPipeline_Mandelbrot_1080p` are all
+  confirmed f64 scalar naive at max_iter=1000, matching ruster's baseline exactly (see
+  classify_fractalrenderercpp()) — the one real difference being threading strategy (raw
+  std::thread spawn/join per call vs a persistent rayon pool), which the comparison
+  reports rather than hides. (`BM_FullFrame`/`BM_FullPipeline` used to run at max_iter=300,
+  mirroring Fractals-rs's own full-frame benches at the time — both were bumped to 1000 in
+  Benchmarks/criterion_bench.cpp so iteration count no longer blocks the join.)
 - Fractals-rs has real Criterion data (Table B) but none of it lands in Table A: its
-  full-frame benches run SIMD-only (f32 "fast" / f64 "high") at max_iter=300, while
-  ruster's baseline is scalar f64 at max_iter=1000 — different algorithm class and
-  iteration count, so treating them as equal would be a false equivalence, not a fair
-  comparison. Re-run one side to match the other's (max_iter, precision, algorithm) and
+  full-frame benches run SIMD-only (f32 "fast" / f64 "high"), while ruster's baseline is
+  scalar f64 — different algorithm class, so treating them as equal would be a false
+  equivalence, not a fair comparison, even now that both run at max_iter=1000 (bumped
+  from 300 in benches/application_bench.rs — iteration count is no longer the blocker,
+  algorithm class still is). Re-run one side to match the other's precision/algorithm and
   the join is automatic — see the notes in classify_fractals_rs().
+- **`precision` is now derived per-record, not assumed.** Every ruster row used to be
+  stamped `f64` unconditionally, which was wrong for the majority of them: wgpu is f32
+  always (WGSL has no f64 type), CUDA takes `fractal_kernel_f32` for Mandelbrot/Julia
+  below zoom 1e6, `f32x8`/`f32x8_ilp` SIMD are f32, and the hybrid scheduler runs f32 on
+  both halves by default. The headline "GPU is 5x the CPU baseline" numbers are therefore
+  **f32 GPU vs f64 CPU** and are not a like-for-like precision comparison — the honest
+  like-for-like pairing is wgpu/CUDA against ruster's own `f32x8_ilp` SIMD row, which is
+  the same precision on the same frame. `ruster_precision()` carries the rules and the
+  source references.
 """
 
 
@@ -903,7 +1024,7 @@ def filter_by_fractal(records: list[dict], fractal: Optional[str]) -> list[dict]
 # ── CSV export ──────────────────────────────────────────────────────────────────
 
 CSV_FIELDS = [
-    "project", "impl", "language", "backend_family", "backend_detail", "threads",
+    "project", "impl", "language", "backend_family", "backend_detail", "backend_device", "threads",
     "fractal", "measurement", "algorithm", "resolution", "max_iter", "precision", "param",
     "comparability_class", "baseline_key", "comparability_note",
     "mean_ms", "mean_ci_low_ms", "mean_ci_high_ms", "median_ms", "std_dev_ms",
@@ -917,7 +1038,8 @@ def record_to_csv_row(r: dict) -> dict:
     res = f"{w['resolution'][0]}x{w['resolution'][1]}" if w.get("resolution") else ""
     return {
         "project": r["project"], "impl": r["impl"], "language": r["language"],
-        "backend_family": b["family"], "backend_detail": b.get("detail"), "threads": b.get("threads"),
+        "backend_family": b["family"], "backend_detail": b.get("detail"),
+        "backend_device": b.get("device"), "threads": b.get("threads"),
         "fractal": w.get("fractal"), "measurement": w.get("measurement"), "algorithm": w.get("algorithm"),
         "resolution": res, "max_iter": w.get("max_iter"), "precision": w.get("precision"), "param": w.get("param"),
         "comparability_class": c["class"], "baseline_key": c.get("baseline_key"), "comparability_note": c.get("note"),
@@ -1045,20 +1167,25 @@ def _chart_render_hierarchy(records: list[dict], plt, pdf, fractal_label: str) -
     project instead of backend family since they're a different axis (each
     has only one or two variants, not ruster's full backend spread).
 
-    These cross-project bars are NOT apples-to-apples with ruster's (see
-    Table A): Fractals-rs/FractalRendererCpp run at max_iter=300, ruster at
-    1000 — fewer iterations per pixel means higher Mpix/s independent of any
-    real speed difference. That's spelled out in both the bar labels and the
-    caption so it reads as "everything measured", not "ruster is slower"."""
+    All projects now run max_iter=1000 (Fractals-rs's and FractalRendererCpp's
+    full-frame benches used to run at max_iter=300 — bumped to match ruster's
+    baseline in their own bench sources, see classify_fractals_rs()/
+    classify_fractalrenderercpp()'s module comments). FractalRendererCpp's bar
+    is now a genuine same-algorithm (f64 scalar naive) apples-to-apples pair
+    with ruster's cpu-scalar bar (Table A), differing only in threading
+    strategy. Fractals-rs's bars are still a different axis (SIMD-only, no
+    scalar path in that project) rather than a different iteration count, so
+    they're kept in this "own render numbers, colored by project" bucket
+    alongside ruster's backend-family bars rather than merged into them."""
     representative = {
         "cpu-scalar": "ruster-cpu-rayon", "cpu-simd": "ruster-simd-f32x8",
         "cpu-tiled": "ruster-cpu-hilbert", "gpu-cuda": "ruster-cuda-cuda",
         "gpu-wgpu": "ruster-wgpu-gpu",
     }
     other_series = [
-        ("fractals-rs-full_frame-fast", "Fractals-rs (f32, iter=300)", PROJECT_COLOR["fractals-rs"], "//"),
-        ("fractals-rs-full_frame-high", "Fractals-rs (f64, iter=300)", PROJECT_COLOR["fractals-rs"], ".."),
-        ("fractalrenderercpp-fullframe-mandelbrot", "FractalRendererCpp (f64, iter=300)", PROJECT_COLOR["fractalrenderercpp"], None),
+        ("fractals-rs-full_frame-fast", "Fractals-rs (f32 SIMD, iter=1000)", PROJECT_COLOR["fractals-rs"], "//"),
+        ("fractals-rs-full_frame-high", "Fractals-rs (f64 SIMD, iter=1000)", PROJECT_COLOR["fractals-rs"], ".."),
+        ("fractalrenderercpp-fullframe-mandelbrot", "FractalRendererCpp (f64 scalar, iter=1000 — apples-to-apples)", PROJECT_COLOR["fractalrenderercpp"], None),
     ]
     resolutions = [[800, 600], [1920, 1080], [3840, 2160]]
     lookup = {}
@@ -1070,19 +1197,43 @@ def _chart_render_hierarchy(records: list[dict], plt, pdf, fractal_label: str) -
     families = [f for f in BACKEND_ORDER if f != "hybrid"
                 and any((representative[f], tuple(res)) in lookup for res in resolutions)]
     other_present = [s for s in other_series if any((s[0], tuple(res)) in lookup for res in resolutions)]
-    if not families and not other_present:
+
+    # The two adaptive hybrid schedulers only ever run at a fixed 1920x1080
+    # (bench_heterogeneous/bench_heterogeneous_wgpu don't sweep resolution —
+    # see their zoom-sweep-at-fixed-1920x1080 doc comments), and their records
+    # carry a zoom `param`, not a `resolution`, so they can't join the
+    # `(impl, resolution)`-keyed `lookup` above. Look them up separately and
+    # only place a bar in the 1920x1080 group (0 elsewhere — same convention
+    # `_bar_value_labels` already treats as "no bar" for `other_present`).
+    hybrid_by_impl = {}
+    for r in records:
+        w = r["workload"]
+        if w["measurement"] in ("heterogeneous", "heterogeneous_wgpu") and w.get("param") == "zoom=zoom_1e0" and r.get("derived"):
+            hybrid_by_impl[r["impl"]] = r
+    hybrid_series = [
+        ("ruster-hybrid-heterogeneous", "Hybrid CPU+CUDA (adaptive)", "xx"),
+        ("ruster-hybrid-heterogeneous_wgpu", "Hybrid CPU+wgpu (adaptive)", "oo"),
+    ]
+    hybrid_present = [s for s in hybrid_series if s[0] in hybrid_by_impl]
+
+    if not families and not other_present and not hybrid_present:
         return
 
     bars_spec = [(representative[f], BACKEND_COLOR[f], None) for f in families] + \
-                [(impl, color, hatch) for impl, _, color, hatch in other_present]
+                [(impl, color, hatch) for impl, _, color, hatch in other_present] + \
+                [(impl, BACKEND_COLOR["hybrid"], hatch) for impl, _, hatch in hybrid_present]
 
     fig, ax = plt.subplots(figsize=(13, 6.5))
     n = len(bars_spec)
     width = 0.8 / n
     x = list(range(len(resolutions)))
     for i, (impl, color, hatch) in enumerate(bars_spec):
-        ys = [lookup[(impl, tuple(res))]["derived"]["mpix_s"] if (impl, tuple(res)) in lookup else 0
-              for res in resolutions]
+        if impl in hybrid_by_impl:
+            ys = [hybrid_by_impl[impl]["derived"]["mpix_s"] if tuple(res) == (1920, 1080) else 0
+                  for res in resolutions]
+        else:
+            ys = [lookup[(impl, tuple(res))]["derived"]["mpix_s"] if (impl, tuple(res)) in lookup else 0
+                  for res in resolutions]
         xs = [xi + (i - (n - 1) / 2) * width for xi in x]
         bars = ax.bar(xs, ys, width=width * 0.9, color=color, hatch=hatch, edgecolor="white" if hatch else None)
         _bar_value_labels(ax, bars)
@@ -1092,7 +1243,8 @@ def _chart_render_hierarchy(records: list[dict], plt, pdf, fractal_label: str) -
     ax.set_xlabel("Resolution")
     ax.set_ylabel("Mpix/s")
     ax.set_title(f"{fractal_label.title()} — render throughput, every project and backend\n"
-                 "(ruster bars ordered CPU-scalar → CPU-SIMD → CPU-tiled → GPU-CUDA → GPU-wgpu, the expected hierarchy)")
+                 "(ruster bars ordered CPU-scalar → CPU-SIMD → CPU-tiled → GPU-CUDA → GPU-wgpu → Hybrid, the expected hierarchy;\n"
+                 "hybrid bars only exist at 1920×1080 — see caption)")
     ymax = ax.get_ylim()[1]
     ax.set_ylim(0, ymax * 1.32)  # headroom so the legend and callout box below don't overlap the bars
     handles = [plt.Rectangle((0, 0), 1, 1, color=BACKEND_COLOR[f]) for f in families]
@@ -1100,15 +1252,45 @@ def _chart_render_hierarchy(records: list[dict], plt, pdf, fractal_label: str) -
     for impl, label, color, hatch in other_present:
         handles.append(plt.Rectangle((0, 0), 1, 1, color=color, hatch=hatch, ec="white" if hatch else "none"))
         labels.append(label)
+    for impl, label, hatch in hybrid_present:
+        handles.append(plt.Rectangle((0, 0), 1, 1, color=BACKEND_COLOR["hybrid"], hatch=hatch, ec="white"))
+        labels.append(label)
     ax.legend(handles, labels, loc="upper left", fontsize=7.5, framealpha=0.9)
     _direction_badge(ax, "higher", "Mpix/s")
-    note = ("Note: GPU (CUDA) trails even CPU-scalar here — kernel-launch/PCIe-copy overhead dominates at\n"
-            "zoom=1 on this laptop-class RTX 3050 (see results/summary.md's Stage 3 discussion); GPU (wgpu)\n"
-            "doesn't show the same gap because its compute-shader dispatch path has different overhead.\n"
-            "Fractals-rs/FractalRendererCpp run at max_iter=300 vs ruster's 1000 — higher Mpix/s here isn't\n"
-            "a real speed advantage, it's fewer iterations/pixel. See Table A for the apples-to-apples pairs.")
-    ax.text(0.99, 0.98, note, transform=ax.transAxes, ha="right", va="top", fontsize=7.5,
-            color="#742a2a", bbox=dict(boxstyle="round,pad=0.4", fc="#fff5f5", ec="#feb2b2"))
+    # The CUDA-vs-CPU-scalar ordering used to be a real, reproducible finding
+    # (kernel-launch/PCIe-copy overhead dominating at zoom=1 on this laptop's
+    # RTX 3050) — since then CudaFractal::render() gained an f32 fast path for
+    # Mandelbrot/Julia below F32_PRECISION_THRESHOLD, which flipped this
+    # ordering. Check the CURRENT data rather than asserting a fixed claim, so
+    # this note can't silently go stale again the next time performance work
+    # changes the ordering.
+    cuda_rec = lookup.get((representative.get("gpu-cuda"), (1920, 1080)))
+    cpu_rec = lookup.get((representative.get("cpu-scalar"), (1920, 1080)))
+    note_lines = []
+    if cuda_rec and cpu_rec and cuda_rec["derived"]["mpix_s"] < cpu_rec["derived"]["mpix_s"]:
+        note_lines += [
+            "Note: GPU (CUDA) trails even CPU-scalar here — kernel-launch/PCIe-copy overhead dominates at",
+            "zoom=1 on this laptop-class RTX 3050 (see results/summary.md's Stage 3 discussion); GPU (wgpu)",
+            "doesn't show the same gap because its compute-shader dispatch path has different overhead.",
+        ]
+    fractals_rs_present = any(impl.startswith("fractals-rs-") for impl, _, _, _ in other_present)
+    if fractals_rs_present:
+        note_lines += [
+            "Fractals-rs's bars are f32/f64 SIMD (no scalar path in that project) vs ruster's scalar",
+            "cpu-bar here — same max_iter=1000 now, but still a different algorithm class, so higher",
+            "Mpix/s isn't a like-for-like speed claim. FractalRendererCpp's bar IS a genuine same-",
+            "algorithm apples-to-apples pair with ruster's cpu-scalar bar — see Table A.",
+        ]
+    if hybrid_present:
+        note_lines += [
+            "Hybrid CPU+CUDA/CPU+wgpu bars are the adaptive schedulers (corner-sampling + work-stealing —",
+            "see src/scheduler/), zoom=1e0, and only exist at 1920×1080 (their benchmarks sweep zoom at a",
+            "fixed resolution instead) — see the solo-vs-hybrid page for the full comparison, including the",
+            "still-naive static CPU+wgpu split these adaptive designs replace/complement.",
+        ]
+    if note_lines:
+        ax.text(0.99, 0.98, "\n".join(note_lines), transform=ax.transAxes, ha="right", va="top", fontsize=7.5,
+                color="#742a2a", bbox=dict(boxstyle="round,pad=0.4", fc="#fff5f5", ec="#feb2b2"))
     fig.tight_layout()
     pdf.savefig(fig)
     plt.close(fig)
@@ -1122,9 +1304,12 @@ def _chart_other_projects_render(records: list[dict], plt, pdf, fractal_label: s
     scalar-only (no SIMD/GPU at all — see RenderCore.h's module doc). Each
     gets its own panel colored by its own axis of variation rather than
     ruster's backend-family palette, since these aren't the same axis.
-    Reminder in the caption: max_iter differs from ruster's baseline (300 vs
-    1000 — see Table A notes), so this is these projects' own internal
-    comparison, not a cross-project speed claim."""
+    All three projects now run max_iter=1000 (see Table A notes) — this page
+    is still each project's own internal comparison rather than a
+    cross-project speed claim, but iteration count is no longer a caveat for
+    either panel (FractalRendererCpp is a genuine same-algorithm match with
+    ruster's cpu-scalar bar; Fractals-rs's remaining difference is SIMD vs
+    scalar, not iteration count)."""
     resolutions = [[800, 600], [1920, 1080], [3840, 2160]]
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
 
@@ -1154,7 +1339,7 @@ def _chart_other_projects_render(records: list[dict], plt, pdf, fractal_label: s
     ax.set_xticklabels([f"{w}×{h}" for w, h in resolutions])
     ax.set_xlabel("Resolution")
     ax.set_ylabel("Mpix/s")
-    ax.set_title("Fractals-rs — Mandelbrot render throughput\n(max_iter=300 — this project's own default, not ruster's 1000)")
+    ax.set_title("Fractals-rs — Mandelbrot render throughput\n(max_iter=1000, matches ruster's baseline — SIMD only, no scalar path)")
     if plotted_a:
         ax.legend(fontsize=8)
     _direction_badge(ax, "higher", "Mpix/s")
@@ -1176,7 +1361,7 @@ def _chart_other_projects_render(records: list[dict], plt, pdf, fractal_label: s
                 transform=ax.transAxes, ha="center", va="center", fontsize=9, color="#718096")
     ax.set_xlabel("Resolution")
     ax.set_ylabel("Mpix/s")
-    ax.set_title("FractalRendererCpp — Mandelbrot render throughput\n(f64 scalar naive, max_iter=300 — the only backend this project has)")
+    ax.set_title("FractalRendererCpp — Mandelbrot render throughput\n(f64 scalar naive, max_iter=1000 — apples-to-apples with ruster's cpu-scalar, see Table A)")
     _direction_badge(ax, "higher", "Mpix/s")
 
     fig.suptitle(f"{fractal_label.title()} — render throughput, other projects (their own internal comparison, not vs ruster — see Table A)")
@@ -1186,22 +1371,55 @@ def _chart_other_projects_render(records: list[dict], plt, pdf, fractal_label: s
 
 
 def _chart_hybrid_vs_solo(records: list[dict], plt, pdf, fractal_label: str) -> None:
-    """Page 2 — solo CPU/GPU backends next to the two hybrid (CPU+GPU
-    concurrent) combos, all at 1920x1080 (the only resolution hybrid
-    benchmarks run at). Expectation: hybrid should approach the sum of its
-    two concurrent halves' throughput."""
+    """Page 2 — solo CPU/GPU backends next to ruster's three hybrid designs,
+    all at 1920x1080 / zoom=1 (the only resolution/zoom the solo and
+    static-split benchmarks run at — both heterogeneous scheduler bars are
+    pinned to their own zoom=1e0 case for the same reason).
+
+    Three "hybrid" bars appear here, and they are NOT interchangeable:
+    - "CPU+wgpu (static 50/50 split)": bench_hybrid_cpu_wgpu — CPU always
+      renders the top half, GPU the bottom half, concurrently, no
+      classification at all. Still genuinely naive today — kept so the
+      adaptive wgpu scheduler bar has a "what it replaced" to compare against.
+    - "CPU+CUDA (adaptive scheduler)" / "CPU+wgpu (adaptive scheduler)":
+      scheduler::render_heterogeneous / render_heterogeneous_wgpu —
+      corner-sampling classification + work-stealing queues, on top of CUDA
+      or wgpu respectively. Both replace what used to be (or, for wgpu, still
+      is above) an equally-naive static split. Do not resurrect a
+      "Hybrid CPU+CUDA (static split)" bar here — bench_hybrid_cpu_cuda was
+      deleted from the source on purpose.
+    Expectation: the static-split bar trails solo GPU when GPU is much faster
+    than CPU (the CPU half becomes the bottleneck); the adaptive scheduler
+    bars are not expected to have that specific failure mode, since neither
+    forces a fixed 50/50 split — see `results/summary.md`'s Stage 3 discussion
+    and `src/scheduler/classifier.rs`'s module doc for why."""
     wanted = [
-        ("cpu-scalar", "ruster-cpu-rayon", "CPU\nscalar"),
-        ("cpu-simd", "ruster-simd-f32x8", "CPU\nSIMD f32x8"),
-        ("gpu-cuda", "ruster-cuda-cuda", "GPU\nCUDA (solo)"),
-        ("gpu-wgpu", "ruster-wgpu-gpu", "GPU\nwgpu (solo)"),
-        ("hybrid", "ruster-hybrid-cpu+cuda", "Hybrid\nCPU+CUDA"),
-        ("hybrid", "ruster-hybrid-cpu+wgpu", "Hybrid\nCPU+wgpu"),
+        ("cpu-scalar", "ruster-cpu-rayon", None, "CPU\nscalar"),
+        ("cpu-simd", "ruster-simd-f32x8", None, "CPU\nSIMD f32x8"),
+        ("gpu-cuda", "ruster-cuda-cuda", None, "GPU\nCUDA (solo)"),
+        ("gpu-wgpu", "ruster-wgpu-gpu", None, "GPU\nwgpu (solo)"),
+        ("hybrid", "ruster-hybrid-cpu+wgpu", None, "Hybrid CPU+wgpu\n(static 50/50 split)"),
+        ("hybrid", "ruster-hybrid-heterogeneous", "zoom=zoom_1e0", "Hybrid CPU+CUDA\n(adaptive scheduler)"),
+        ("hybrid", "ruster-hybrid-heterogeneous_wgpu", "zoom=zoom_1e0", "Hybrid CPU+wgpu\n(adaptive scheduler)"),
     ]
-    by_impl = {r["impl"]: r for r in records if r.get("derived")}
+    by_key = {}
+    for r in records:
+        if not r.get("derived"):
+            continue
+        by_key.setdefault(r["impl"], []).append(r)
+
+    def _lookup(impl: str, param: str | None):
+        rows = by_key.get(impl) or []
+        if param is None:
+            return rows[0] if rows else None
+        for r in rows:
+            if r["workload"].get("param") == param:
+                return r
+        return None
+
     labels, values, colors, families_present = [], [], [], []
-    for fam, impl, label in wanted:
-        rec = by_impl.get(impl)
+    for fam, impl, param, label in wanted:
+        rec = _lookup(impl, param)
         if not rec:
             continue
         labels.append(label)
@@ -1211,24 +1429,41 @@ def _chart_hybrid_vs_solo(records: list[dict], plt, pdf, fractal_label: str) -> 
             families_present.append(fam)
     if not labels:
         return
-    fig, ax = plt.subplots(figsize=(9, 5.5))
+    fig, ax = plt.subplots(figsize=(11, 5.5))
     ymax = max(values)
     ax.set_ylim(0, ymax * 1.3)
     bars = ax.bar(labels, values, color=colors)
     _bar_value_labels(ax, bars)
     ax.set_ylabel("Mpix/s")
-    ax.set_title(f"{fractal_label.title()} @ 1920×1080 — solo backends vs hybrid CPU+GPU")
+    ax.set_title(f"{fractal_label.title()} @ 1920×1080 — solo backends vs ruster's hybrid designs")
+    ax.tick_params(axis="x", labelsize=8)
     _direction_badge(ax, "higher", "Mpix/s")
     _backend_legend(ax, plt, sorted(families_present, key=BACKEND_ORDER.index))
-    wgpu_solo = by_impl.get("ruster-wgpu-gpu")
-    hybrid_wgpu = by_impl.get("ruster-hybrid-cpu+wgpu")
-    if wgpu_solo and hybrid_wgpu and hybrid_wgpu["derived"]["mpix_s"] < wgpu_solo["derived"]["mpix_s"]:
-        note = ("Note: hybrid CPU+GPU trails solo GPU here — this is a naive 50/50 frame split (CPU renders\n"
-                "the top half, GPU the bottom half, concurrently); since GPU alone is ~5x faster than CPU,\n"
-                "the CPU half becomes the bottleneck and the GPU half sits idle waiting for it. A load-aware\n"
-                "split (giving CPU a smaller share) is exactly what the heterogeneous scheduler targets — see\n"
-                "results/summary.md's Stage 3 discussion.")
-        ax.text(0.5, 0.98, note, transform=ax.transAxes, ha="center", va="top", fontsize=7.5,
+
+    cpu_solo = _lookup("ruster-cpu-rayon", None)
+    wgpu_solo = _lookup("ruster-wgpu-gpu", None)
+    hybrid_wgpu_static = _lookup("ruster-hybrid-cpu+wgpu", None)
+    hybrid_wgpu_adaptive = _lookup("ruster-hybrid-heterogeneous_wgpu", "zoom=zoom_1e0")
+    hybrid_cuda_adaptive = _lookup("ruster-hybrid-heterogeneous", "zoom=zoom_1e0")
+
+    note_lines = []
+    if wgpu_solo and hybrid_wgpu_static and hybrid_wgpu_static["derived"]["mpix_s"] < wgpu_solo["derived"]["mpix_s"]:
+        note_lines += [
+            "Note: \"CPU+wgpu (static 50/50 split)\" trails solo GPU here — it's a naive frame split (CPU",
+            "renders the top half, GPU the bottom half, concurrently, no classification at all); when GPU",
+            "is much faster than CPU, the CPU half becomes the bottleneck and the GPU half sits idle",
+            "waiting for it. This is specifically about the static split, NOT either adaptive-scheduler bar.",
+        ]
+    # Both adaptive bars are expected to clear the "at least beat solo CPU"
+    # bar even where the static split couldn't — that's the whole point of
+    # replacing a fixed split with corner-sampling + work-stealing. Flag it
+    # explicitly if a future change ever regresses this, rather than silently
+    # showing a worse number with no explanation.
+    for rec, label in ((hybrid_cuda_adaptive, "CPU+CUDA"), (hybrid_wgpu_adaptive, "CPU+wgpu")):
+        if cpu_solo and rec and rec["derived"]["mpix_s"] < cpu_solo["derived"]["mpix_s"]:
+            note_lines.append(f"Note: \"{label} (adaptive scheduler)\" is currently BELOW solo CPU — investigate.")
+    if note_lines:
+        ax.text(0.5, 0.98, "\n".join(note_lines), transform=ax.transAxes, ha="center", va="top", fontsize=7.5,
                 color="#742a2a", bbox=dict(boxstyle="round,pad=0.4", fc="#fff5f5", ec="#feb2b2"))
     fig.tight_layout()
     pdf.savefig(fig)
@@ -1276,59 +1511,50 @@ def _chart_pipeline_overhead(records: list[dict], plt, pdf, fractal_label: str) 
 
 
 def _chart_thread_scaling(records: list[dict], plt, pdf, fractal_label: str) -> None:
-    """Page 4 — Mpix/s vs thread count. Left panel: ruster overlaid with
-    FractalRendererCpp (both confirmed f64 scalar naive, max_iter=1000,
-    1920x1080 — the one real difference is threading strategy: rayon pool vs
-    raw std::thread spawn/join per call). Fractals-rs gets its own separate
-    right panel rather than being overlaid on the left: it runs f32 SIMD, not
-    scalar, so sharing an axis with the other two would visually imply a fair
-    comparison the precision mismatch doesn't support."""
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    """Page 4 — Mpix/s vs thread count, all three projects on one axis.
+    ruster and FractalRendererCpp are confirmed f64 scalar naive (max_iter=
+    1000, 1920x1080) — a fair pair, the one real difference being threading
+    strategy: rayon pool vs raw std::thread spawn/join per call. Fractals-rs
+    runs f32 SIMD, not scalar — NOT an apples-to-apples precision match with
+    the other two — so its line is dashed and its legend label says "f32 SIMD"
+    plainly rather than being hidden in a separate panel; a reader comparing
+    absolute heights should still notice the precision difference from the
+    label, not have it "explained away" by a physical split."""
+    fig, ax = plt.subplots(figsize=(9, 6))
 
-    ax = axes[0]
-    series = [("ruster-cpu-thread_scaling", "ruster (rayon pool, f64 scalar)", PROJECT_COLOR["ruster"]),
-              ("fractalrenderercpp-threadscaling", "FractalRendererCpp (std::thread/call, f64 scalar)", PROJECT_COLOR["fractalrenderercpp"])]
+    series = [
+        ("ruster-cpu-thread_scaling", "ruster (rayon pool, f64 scalar)", PROJECT_COLOR["ruster"], "-"),
+        ("fractalrenderercpp-threadscaling", "FractalRendererCpp (std::thread/call, f64 scalar)", PROJECT_COLOR["fractalrenderercpp"], "-"),
+        ("fractals-rs-thread_scaling-threads", "Fractals-rs (rayon pool, f32 SIMD — not a scalar pair)", PROJECT_COLOR["fractals-rs"], "--"),
+    ]
     plotted = False
-    for impl, label, color in series:
+    missing = []
+    for impl, label, color, linestyle in series:
         rows = [r for r in records if r["impl"] == impl and r["backend"].get("threads") and r.get("derived")]
         rows.sort(key=lambda r: r["backend"]["threads"])
         if not rows:
+            missing.append(label)
             continue
         xs = [r["backend"]["threads"] for r in rows]
         ys = [r["derived"]["mpix_s"] for r in rows]
-        ax.plot(xs, ys, marker="o", color=color, label=label)
+        ax.plot(xs, ys, marker="o", color=color, linestyle=linestyle, label=label)
         plotted = True
-    ax.set_xlabel("Threads")
-    ax.set_ylabel("Mpix/s (log scale)")
-    ax.set_yscale("log")
-    ax.set_title("ruster vs FractalRendererCpp\n(both f64 scalar naive — a fair pair)")
-    ax.set_xticks([1, 2, 4, 8, 16])
-    if plotted:
-        ax.legend(fontsize=8)
-    _direction_badge(ax, "higher", "Mpix/s")
 
-    ax = axes[1]
-    rows = [r for r in records if r["impl"] == "fractals-rs-thread_scaling-threads" and r["backend"].get("threads") and r.get("derived")]
-    rows.sort(key=lambda r: r["backend"]["threads"])
-    if rows:
-        xs = [r["backend"]["threads"] for r in rows]
-        ys = [r["derived"]["mpix_s"] for r in rows]
-        ax.plot(xs, ys, marker="o", color=PROJECT_COLOR["fractals-rs"], label="Fractals-rs (rayon pool, f32 SIMD)")
-        ax.legend(fontsize=8)
-    else:
-        ax.text(0.5, 0.5, "No thread_scaling data yet —\nrun `cargo bench` in other-projects/Fractals-rs",
-                transform=ax.transAxes, ha="center", va="center", fontsize=9, color="#718096")
-    ax.set_xlabel("Threads")
-    ax.set_ylabel("Mpix/s (log scale)")
-    ax.set_yscale("log")
-    ax.set_xticks([1, 2, 4, 8, 16])
-    ax.set_title("Fractals-rs, own panel\n(f32 SIMD — not scalar, kept separate on purpose)")
-    _direction_badge(ax, "higher", "Mpix/s")
-
-    if not plotted and not rows:
+    if not plotted:
         plt.close(fig)
         return
-    fig.suptitle(f"{fractal_label.title()} @ 1920×1080 — CPU thread scaling, max_iter=1000")
+
+    ax.set_xlabel("Threads")
+    ax.set_ylabel("Mpix/s (log scale)")
+    ax.set_yscale("log")
+    ax.set_xticks([1, 2, 4, 8, 16])
+    ax.legend(fontsize=8)
+    _direction_badge(ax, "higher", "Mpix/s")
+    if missing:
+        ax.text(0.02, 0.02, "No data yet: " + "; ".join(missing),
+                transform=ax.transAxes, ha="left", va="bottom", fontsize=7, color="#718096")
+    ax.set_title(f"{fractal_label.title()} @ 1920×1080 — CPU thread scaling, max_iter=1000\n"
+                 "(ruster/FractalRendererCpp: f64 scalar, a fair pair — Fractals-rs: f32 SIMD, dashed, not the same precision)")
     fig.tight_layout()
     pdf.savefig(fig)
     plt.close(fig)

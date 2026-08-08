@@ -32,6 +32,17 @@ __device__ __forceinline__ bool in_period3_bulb(double cr, double ci) {
         || (dr * dr + di_neg * di_neg < PERIOD3_RADIUS_SQ);
 }
 
+// f32 counterpart, for `mandelbrot_f32`. Ampere GeForce runs fp64 at 1/64 the
+// fp32 rate, so calling the double version above from an otherwise-f32 kernel
+// cost HALF that kernel's total runtime — see the note at its call site.
+__device__ __forceinline__ bool in_period3_bulb_f32(float cr, float ci) {
+    float dr     = cr - (float)PERIOD3_CENTER_RE;
+    float di_pos = ci - (float)PERIOD3_CENTER_IM;
+    float di_neg = ci + (float)PERIOD3_CENTER_IM;
+    return (dr * dr + di_pos * di_pos < (float)PERIOD3_RADIUS_SQ)
+        || (dr * dr + di_neg * di_neg < (float)PERIOD3_RADIUS_SQ);
+}
+
 // Mirrors src/fractal/fractal.rs's `mandelbrot()` exactly, including the
 // "z0=c" fast path (skips the trivial z0=0 -> z1=c step and manually unrolls
 // z1 -> z2). This isn't just a performance match: the period-detection
@@ -128,9 +139,25 @@ __device__ float mandelbrot_f32(float cr, float ci, uint32_t max_iter) {
     float q = (cr - 0.25f) * (cr - 0.25f) + ci * ci;
     if (q * (q + cr - 0.25f) < 0.25f * ci * ci) return (float)max_iter;
     if ((cr + 1.0f) * (cr + 1.0f) + ci * ci < 0.0625f) return (float)max_iter;
-    // Period-3 check stays f64, same as the CPU's `bulb_precheck_x8` — it
-    // runs once per pixel, not per iteration, so it isn't the bottleneck.
-    if (in_period3_bulb((double)cr, (double)ci)) return (float)max_iter;
+    // This check used to call the fp64 `in_period3_bulb`, with a comment
+    // claiming that was cheap "because it runs once per pixel, not per
+    // iteration". True on a CPU, false on this GPU: Ampere GeForce runs fp64 at
+    // 1/64 the fp32 rate, so those 8 fp64 ops (PTX census) cost about as much
+    // issue bandwidth as the entire 1000-iteration f32 loop below.
+    //
+    // Ablation (examples/ptx_variants.rs, 1920x1080, zoom 1, kernel only):
+    //     with the fp64 check ................... 0.911 ms
+    //     with this f32 check ................... 0.452 ms   (-50.4%)
+    // Absolute times drift with the laptop GPU's clock state; the ratio is
+    // measured within one process and reproduces exactly, so trust the ratio.
+    //
+    // Verified bit-identical, not just "close": zero differing pixels out of
+    // 2,073,600 on all seven viewports ptx_variants.rs checks, including three
+    // centred ON the period-3 boundary arc at zooms 1e2/1e4/1e6 (1e6 being
+    // F32_PRECISION_THRESHOLD, the deepest zoom this kernel is ever used at).
+    // `cr`/`ci` arrive already rounded to f32, so widening them for the
+    // comparison adds no information the predicate can act on.
+    if (in_period3_bulb_f32(cr, ci)) return (float)max_iter;
 
     float zr = cr, zi = ci;
     if (max_iter <= 1) return (float)max_iter;

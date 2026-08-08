@@ -11,6 +11,9 @@ pub struct FractalCompute {
     uniform_buf:      wgpu::Buffer,
     output_buf:       wgpu::Buffer,
     readback_buf:     wgpu::Buffer,
+    // ── tiled pipeline (heterogeneous scheduler) ─────────────────────────────
+    tiled_pipeline:   wgpu::ComputePipeline,
+    tiled_bgl:        wgpu::BindGroupLayout,
     // ── perturbation pipeline ─────────────────────────────────────────────────
     perturb_pipeline: wgpu::ComputePipeline,
     perturb_bgl:      wgpu::BindGroupLayout,
@@ -39,6 +42,19 @@ impl FractalCompute {
         });
 
         let pipeline = build_pipeline(device, &bgl, &shader, "main", "fractal");
+
+        // Tiled bind group layout adds one read-only storage binding (tile
+        // descriptors) over the standard layout's uniform + output buffers —
+        // reuses the same shader module (`main_tiled` alongside `main`).
+        let tiled_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                bgl_entry(0, wgpu::BufferBindingType::Uniform),
+                bgl_entry(1, wgpu::BufferBindingType::Storage { read_only: false }),
+                bgl_entry(2, wgpu::BufferBindingType::Storage { read_only: true }),
+            ],
+        });
+        let tiled_pipeline = build_pipeline(device, &tiled_bgl, &shader, "main_tiled", "fractal_tiled");
 
         let pixel_bytes = (width * height) as u64 * 4;
 
@@ -99,10 +115,17 @@ impl FractalCompute {
 
         Self {
             pipeline, bgl, uniform_buf, output_buf, readback_buf,
+            tiled_pipeline, tiled_bgl,
             perturb_pipeline, perturb_bgl, perturb_uni_buf, orbit_re_buf, orbit_im_buf,
             width, height,
         }
     }
+
+    /// Full-res dimensions this instance was constructed with.
+    pub fn width(&self) -> u32 { self.width }
+
+    /// Full-res dimensions this instance was constructed with.
+    pub fn height(&self) -> u32 { self.height }
 
     pub fn render(&self, device: &wgpu::Device, queue: &wgpu::Queue, uniforms: Uniforms) -> Vec<f32> {
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
@@ -148,6 +171,84 @@ impl FractalCompute {
         });
 
         self.dispatch_and_readback(device, queue, &self.perturb_pipeline, &bg)
+    }
+
+    /// Launches `main_tiled` over `tiles` — dispatch only, no readback (mirrors
+    /// `CudaFractal::dispatch_tiled`, split from readback for the same reason:
+    /// a caller doing work-stealing may need to dispatch more than once per
+    /// frame before reading anything back). No-op if `tiles` is empty.
+    ///
+    /// `uniforms.width`/`uniforms.height` must be the FULL frame dimensions
+    /// (used for the output buffer's row stride), not any single tile's —
+    /// same convention as the CUDA tiled kernel.
+    pub fn dispatch_tiled(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tiles: &[[u32; 4]],
+        uniforms: Uniforms,
+    ) {
+        if tiles.is_empty() {
+            return;
+        }
+
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+
+        let flat: Vec<u32> = tiles.iter().flat_map(|t| t.iter().copied()).collect();
+        let tile_descs_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tile_descs"),
+            size: (flat.len() * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&tile_descs_buf, 0, bytemuck::cast_slice(&flat));
+
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.tiled_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.output_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: tile_descs_buf.as_entire_binding() },
+            ],
+        });
+
+        // Grid must be large enough to cover the widest/tallest tile; bounds
+        // checks inside the shader discard threads beyond the actual tile
+        // extent — same approach as `fractal_kernel_tiled`'s CUDA grid sizing.
+        let max_tw = tiles.iter().map(|t| t[2]).max().unwrap_or(1);
+        let max_th = tiles.iter().map(|t| t[3]).max().unwrap_or(1);
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None, timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.tiled_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((max_tw + 15) / 16, (max_th + 15) / 16, tiles.len() as u32);
+        }
+        queue.submit(std::iter::once(enc.finish()));
+    }
+
+    /// Copies the persistent full-frame output buffer back to the host. Call
+    /// once per frame, after all of that frame's `dispatch_tiled` calls.
+    pub fn readback(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(
+            &self.output_buf, 0, &self.readback_buf, 0,
+            (self.width * self.height * 4) as u64,
+        );
+        queue.submit(std::iter::once(enc.finish()));
+
+        let slice = self.readback_buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::MaintainBase::Wait);
+
+        let data   = slice.get_mapped_range();
+        let result = bytemuck::cast_slice(&*data).to_vec();
+        drop(data);
+        self.readback_buf.unmap();
+        result
     }
 
     fn dispatch_and_readback(

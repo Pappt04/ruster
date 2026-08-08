@@ -57,6 +57,18 @@ fn julia(zr0: f32, zi0: f32, cr: f32, ci: f32, max_iter: u32) -> f32 {
 }
 
 // ── Newton ──────────────────────────────────────────────────────────────────
+//
+// NOTE: the two update lines below spell out `.../denom` four times per
+// iteration, where the CPU (`fractal.rs`) and CUDA (`fractal.cu:176-177`)
+// versions factor the identical algebra into two divides:
+//     zr - ((z3r - 1.0) * d_re + z3i * d_im) / denom
+// The results are algebraically the same; only the divide count differs, and
+// division is expensive. This is the most likely reason Newton was wgpu's
+// worst fractal by a wide margin when last measured (32.9 ms at 1080p vs
+// 22.3 ms on CUDA in f64 and 19.4 ms on the CPU) — though that measurement
+// predates both the driver fix that moved wgpu onto the RTX 3050 and the
+// current Mandelbrot-only benchmark scope, so it needs re-measuring before
+// the claim is quoted. Same applies to `nova` below.
 fn newton(cr: f32, ci: f32, max_iter: u32) -> f32 {
     var zr = cr;  var zi = ci;
     for (var i = 0u; i < max_iter; i++) {
@@ -103,6 +115,45 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let y = gid.y;
     if x >= uni.width || y >= uni.height { return; }
 
+    let re = uni.re_start + f32(x) * uni.re_step;
+    let im = uni.im_start + f32(y) * uni.im_step;
+
+    var v: f32;
+    switch uni.fractal {
+        case 0u: { v = mandelbrot(re, im, uni.max_iter); }
+        case 1u: { v = julia(re, im, uni.julia_cr, uni.julia_ci, uni.max_iter); }
+        case 2u: { v = newton(re, im, uni.max_iter); }
+        default: { v = nova(re, im, uni.max_iter); }
+    }
+
+    buf[y * uni.width + x] = v;
+}
+
+// ── Tiled entry point — for the wgpu heterogeneous scheduler ─────────────────
+//
+// Same per-pixel math as `main`, but dispatched over a caller-supplied list of
+// `[x0,y0,w,h]` tile descriptors instead of the whole frame — mirrors
+// `fractal_kernel_tiled` in `fractal.cu`. `uni` still carries the full-frame
+// re_start/re_step/width/height (needed for both coordinate mapping and the
+// output buffer's row stride); `tile_descs` holds one flattened descriptor
+// per workgroup-z-slice. `workgroup_id.z` selects the tile since
+// `workgroup_size.z == 1` makes it equal to `global_invocation_id.z`.
+@group(0) @binding(2) var<storage, read> tile_descs : array<u32>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main_tiled(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tile_idx = gid.z;
+    let tx0 = tile_descs[tile_idx * 4u + 0u];
+    let ty0 = tile_descs[tile_idx * 4u + 1u];
+    let tw  = tile_descs[tile_idx * 4u + 2u];
+    let th  = tile_descs[tile_idx * 4u + 3u];
+
+    let lx = gid.x;
+    let ly = gid.y;
+    if lx >= tw || ly >= th { return; }
+
+    let x = tx0 + lx;
+    let y = ty0 + ly;
     let re = uni.re_start + f32(x) * uni.re_step;
     let im = uni.im_start + f32(y) * uni.im_step;
 

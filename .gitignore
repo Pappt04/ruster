@@ -6,3 +6,4 @@ TUTORIAL.md
 bench_results/
 OPTIMIZATIONS.md
 /results
+__pycache__/

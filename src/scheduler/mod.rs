@@ -25,6 +25,8 @@ use std::sync::Mutex;
 use crate::fractal::{pixel_grid, render_cpu_tile, IterBuf, F32_PRECISION_THRESHOLD};
 use crate::fractal::fractal_type::FractalType;
 use crate::gpu::cuda::CudaFractal;
+use crate::gpu::fractal_compute::FractalCompute;
+use crate::gpu::unifroms::Uniforms;
 use crate::gui::viewport::Viewport;
 use controller::ThresholdController;
 
@@ -283,6 +285,160 @@ pub fn render_heterogeneous(
         // done — not when we got around to draining the channel, which can
         // happen arbitrarily later if GPU (running concurrently on the
         // calling thread) was the one holding `rayon::scope` open.
+        cpu_ms = cpu_ms.max(finished_ms);
+        for ([x0, y0, tw, th], local) in results {
+            cpu_pixels += (tw as u64) * (th as u64);
+            for row in 0..th {
+                let dst = ((y0 + row) * w + x0) as usize;
+                let src = (row * tw) as usize;
+                buf[dst..dst + tw as usize].copy_from_slice(&local[src..src + tw as usize]);
+            }
+        }
+    }
+
+    controller.update(gpu_ms, cpu_ms);
+
+    HeterogeneousResult {
+        buf,
+        gpu_ms,
+        cpu_ms,
+        cpu_tile_frac: if total_pixels > 0 { cpu_pixels as f32 / total_pixels as f32 } else { 0.0 },
+        gpu_steal_dispatched,
+        cpu_stolen_tile_count,
+    }
+}
+
+/// Like [`render_heterogeneous`], but drives `FractalCompute` (wgpu) instead
+/// of `CudaFractal`. Same corner-sampling partition, same reserve/queue/
+/// work-stealing structure, same `SchedulerConfig`/`ThresholdController` —
+/// only the GPU dispatch mechanics differ (a `Uniforms` struct + tile
+/// descriptors over a wgpu compute pass, instead of discrete f64 args over a
+/// CUDA kernel launch).
+///
+/// wgpu compute shaders have no f64 support at all — `main_tiled` is always
+/// f32, for every fractal, unconditionally. There is no `gpu_tiles_f32`-style
+/// choice to make on this backend: `SchedulerConfig::gpu_tiles_f32` is simply
+/// not consulted here. `simd_cpu_tiles` still applies to the CPU side, same
+/// as the CUDA path.
+pub fn render_heterogeneous_wgpu(
+    vp: &Viewport,
+    fractal: FractalType,
+    julia_c: [f64; 2],
+    max_iter: u32,
+    compute: &FractalCompute,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    controller: &mut ThresholdController,
+    cfg: &SchedulerConfig,
+) -> HeterogeneousResult {
+    let w = vp.width;
+    let h = vp.height;
+    debug_assert_eq!(w, compute.width(), "FractalCompute not sized for this viewport");
+    debug_assert_eq!(h, compute.height(), "FractalCompute not sized for this viewport");
+
+    let pg = pixel_grid(vp);
+
+    let (mut gpu_tiles, cpu_tiles) = classifier::partition_frame(
+        &pg, fractal, julia_c, max_iter, w, h,
+        cfg.max_tile_size, cfg.min_tile_size, controller.threshold,
+    );
+
+    let reserve_frac = cfg.steal_reserve_frac.clamp(0.0, 1.0);
+    let reserve_count = ((gpu_tiles.len() as f32) * reserve_frac).round() as usize;
+    let split_at = gpu_tiles.len() - reserve_count.min(gpu_tiles.len());
+    let gpu_reserve: Vec<[u32; 4]> = gpu_tiles.split_off(split_at);
+    let gpu_committed = gpu_tiles;
+
+    let total_pixels = (w as u64) * (h as u64);
+    let cpu_queue: Mutex<VecDeque<[u32; 4]>> = Mutex::new(cpu_tiles.into_iter().collect());
+    let steal_queue: Mutex<VecDeque<[u32; 4]>> = Mutex::new(gpu_reserve.into_iter().collect());
+
+    let use_simd = cfg.simd_cpu_tiles;
+    let zoom = vp.zoom;
+    let n_workers = rayon::current_num_threads().max(1);
+
+    let uniforms = Uniforms {
+        re_start: pg.re_start as f32, im_start: pg.im_start as f32,
+        re_step: pg.re_step as f32, im_step: pg.im_step as f32,
+        julia_cr: julia_c[0] as f32, julia_ci: julia_c[1] as f32,
+        max_iter, fractal: fractal.as_u32(),
+        width: w, height: h,
+        _pad: [0; 2],
+    };
+    let dispatch = |batch: &[[u32; 4]]| {
+        compute.dispatch_tiled(device, queue, batch, uniforms);
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<([u32; 4], Vec<f32>)>, u32, f32)>();
+    let cpu_t0 = std::time::Instant::now();
+
+    let (gpu_buf, gpu_ms, gpu_steal_dispatched) = rayon::scope(|s| {
+        for _ in 0..n_workers {
+            let tx = tx.clone();
+            let pg = &pg;
+            let cpu_queue = &cpu_queue;
+            let steal_queue = &steal_queue;
+            s.spawn(move |_| {
+                let mut local: Vec<([u32; 4], Vec<f32>)> = Vec::new();
+                let mut stolen = 0u32;
+                loop {
+                    let claim = {
+                        let mut cq = cpu_queue.lock().unwrap();
+                        if let Some(t) = cq.pop_front() {
+                            Some((t, false))
+                        } else {
+                            drop(cq);
+                            steal_queue.lock().unwrap().pop_front().map(|t| (t, true))
+                        }
+                    };
+                    match claim {
+                        Some((tile, is_steal)) => {
+                            if is_steal { stolen += 1; }
+                            let tile_buf = render_cpu_tile(pg, fractal, julia_c, max_iter, tile, use_simd, zoom);
+                            local.push((tile, tile_buf));
+                        }
+                        None => break,
+                    }
+                }
+                let finished_ms = cpu_t0.elapsed().as_secs_f32() * 1000.0;
+                let _ = tx.send((local, stolen, finished_ms));
+            });
+        }
+
+        // --- GPU side: coarse-grained, synchronous on this (calling) thread —
+        // wgpu's `device.poll(Wait)` inside `readback()` blocks the same way
+        // cudarc's copies do. Runs concurrently with the CPU workers above. ---
+        let gpu_t0 = std::time::Instant::now();
+        dispatch(&gpu_committed);
+
+        let leftover_len = steal_queue.lock().unwrap().len();
+        let mut gpu_steal_dispatched = false;
+        if leftover_len as u32 >= cfg.min_steal_tiles {
+            let leftover: Vec<[u32; 4]> = std::mem::take(&mut *steal_queue.lock().unwrap()).into_iter().collect();
+            if !leftover.is_empty() {
+                dispatch(&leftover);
+                gpu_steal_dispatched = true;
+            }
+        }
+
+        let gpu_did_anything = !gpu_committed.is_empty() || gpu_steal_dispatched;
+        let gpu_buf = if gpu_did_anything {
+            compute.readback(device, queue)
+        } else {
+            vec![0.0f32; (w * h) as usize]
+        };
+        let gpu_ms = gpu_t0.elapsed().as_secs_f32() * 1000.0;
+
+        (gpu_buf, gpu_ms, gpu_steal_dispatched)
+    });
+
+    let mut cpu_pixels = 0u64;
+    let mut cpu_stolen_tile_count = 0u32;
+    let mut cpu_ms = 0.0f32;
+    let mut buf = gpu_buf;
+    for _ in 0..n_workers {
+        let (results, stolen, finished_ms) = rx.recv().unwrap();
+        cpu_stolen_tile_count += stolen;
         cpu_ms = cpu_ms.max(finished_ms);
         for ([x0, y0, tw, th], local) in results {
             cpu_pixels += (tw as u64) * (th as u64);
