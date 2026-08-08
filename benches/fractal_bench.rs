@@ -599,6 +599,95 @@ fn bench_heterogeneous(c: &mut Criterion) {
 #[cfg(not(feature = "cuda"))]
 fn bench_heterogeneous(c: &mut Criterion) { let _ = c; }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Deep-zoom heterogeneous scheduler  (--features cuda)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// `bench_heterogeneous` above is deliberately LEFT ALONE: its 1e0..1e4 sweep is
+// the evidence for when the scheduler is *not* viable, and that is a result
+// worth keeping verbatim.
+//
+// This group extends the sweep across `F32_PRECISION_THRESHOLD` (1e6), which is
+// the boundary that decides everything. Below it, Mandelbrot takes
+// `fractal_kernel_f32` and the GPU is ~4x the CPU, so no scheduler can win — the
+// best it can do is lose by less. Above it the GPU falls back to the f64 kernel,
+// which Ampere GeForce runs at 1/64 the fp32 rate, the CPU becomes competitive,
+// and a split has something real to exploit.
+//
+// Two design changes over the shallow group, both aimed at making the result
+// interpretable rather than just fast:
+//
+//   1. **Solo-backend reference arms in the same group.** Each zoom benchmarks
+//      `cuda`, `cpu` and `hybrid` side by side. The shallow group has no
+//      reference arm at all, which is exactly why its numbers looked acceptable
+//      in isolation while actually being 20-30% worse than just using the GPU.
+//      A hybrid number is meaningless without the two it must beat.
+//   2. **`render_heterogeneous_into` with a `PinnedBuf`**, i.e. the form a real
+//      render loop would use, rather than allocating a frame per call.
+#[cfg(feature = "cuda")]
+fn bench_heterogeneous_deep(c: &mut Criterion) {
+    use novafractal::gpu::cuda::{CudaFractal, PinnedBuf};
+    use novafractal::scheduler::{render_heterogeneous_into, controller::ThresholdController, SchedulerConfig};
+
+    // Straddles F32_PRECISION_THRESHOLD (1e6). 1e15 is past f64's ability to
+    // resolve individual pixels, where perturbation becomes the only correct
+    // path — included to show the scheduler's behaviour there rather than
+    // stopping short of it.
+    const ZOOMS: &[(f64, &str)] = &[
+        (1e4, "zoom_1e4"), (1e5, "zoom_1e5"), (1e6, "zoom_1e6"),
+        (1e7, "zoom_1e7"), (1e9, "zoom_1e9"), (1e12, "zoom_1e12"), (1e15, "zoom_1e15"),
+    ];
+    const CENTER: [f64; 2] = [-0.745, 0.113];
+
+    let mut group = c.benchmark_group("hybrid/heterogeneous_deep");
+    group.throughput(Throughput::Elements(1920 * 1080));
+    // Deep-zoom frames run 60-200 ms, so the default 100 samples would push
+    // this group past 20 s per arm.
+    group.sample_size(10);
+
+    let mut cuda = CudaFractal::from_device(cuda_dev(), 1920, 1080);
+    let mut pinned = PinnedBuf::new(1920 * 1080);
+    assert!(pinned.is_pinned(), "page-locking failed — deep-zoom readback numbers would not be representative");
+    let cfg = SchedulerConfig::default();
+
+    for &(zoom, label) in ZOOMS {
+        let vp = Viewport { center: CENTER, zoom, width: 1920, height: 1080 };
+        let pg = novafractal::fractal::pixel_grid(&vp);
+
+        // Solo GPU.
+        group.bench_function(BenchmarkId::new("cuda", label), |b| {
+            b.iter(|| black_box(cuda.render(
+                pg.re_start, pg.im_start, pg.re_step, pg.im_step,
+                JULIA_C[0], JULIA_C[1], MAX_ITER, 0,
+            )))
+        });
+
+        // Solo CPU.
+        group.bench_function(BenchmarkId::new("cpu", label), |b| {
+            b.iter(|| black_box(render(black_box(&vp), FractalType::Mandelbrot, JULIA_C, MAX_ITER)))
+        });
+
+        // Hybrid. The adaptive threshold is converged before timing — an
+        // unconverged controller measures the transient, not the scheduler.
+        let mut controller = ThresholdController::new(0.02);
+        for _ in 0..25 {
+            render_heterogeneous_into(&vp, FractalType::Mandelbrot, JULIA_C, MAX_ITER,
+                                      &mut cuda, &mut controller, &cfg, &mut pinned);
+        }
+        group.bench_function(BenchmarkId::new("hybrid", label), |b| {
+            b.iter(|| black_box(render_heterogeneous_into(
+                black_box(&vp), FractalType::Mandelbrot, JULIA_C, MAX_ITER,
+                &mut cuda, &mut controller, &cfg, &mut pinned,
+            )))
+        });
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "cuda"))]
+fn bench_heterogeneous_deep(c: &mut Criterion) { let _ = c; }
+
 // Stubs when cuda feature is off — criterion_group! needs a consistent list.
 #[cfg(not(feature = "cuda"))]
 fn bench_cuda_render(c: &mut Criterion) {
@@ -876,7 +965,8 @@ criterion_group! {
         bench_cuda_pipeline,
         bench_cuda_perturbation,
         // Heterogeneous CPU+CUDA scheduler
-        bench_heterogeneous
+        bench_heterogeneous,
+        bench_heterogeneous_deep
 }
 
 criterion_main!(benches);

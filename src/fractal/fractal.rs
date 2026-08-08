@@ -641,16 +641,34 @@ pub fn render_mariani_silver(vp: &Viewport, fractal: FractalType, julia_c: [f64;
 /// afford it — so CPU tiles pay full per-pixel cost for a bit-exact match to
 /// `render()` instead.
 pub fn render_tile_exact(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32, tile: [u32; 4]) -> Vec<f32> {
-    let [x0, y0, tw, th] = tile;
+    let [_, _, tw, th] = tile;
     let mut local = vec![0.0f32; (tw * th) as usize];
+    render_tile_exact_into(pg, fractal, julia_c, max_iter, tile, &mut local);
+    local
+}
+
+/// `render_tile_exact` writing into a caller-owned `out` (row-major, `tw*th`
+/// long) instead of allocating. Exists so the heterogeneous scheduler can hand
+/// workers a reused buffer: allocating one `Vec` per tile was measured at
+/// 1.0-3.9 ms per frame — dominated by page faults on freshly-mapped pages,
+/// and an order of magnitude above every other piece of scheduler machinery
+/// (see results/summary.md §3.4 and `examples/sched_overhead.rs`).
+///
+/// # Panics
+/// If `out.len() != tw * th`.
+pub fn render_tile_exact_into(
+    pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32,
+    tile: [u32; 4], out: &mut [f32],
+) {
+    let [x0, y0, tw, th] = tile;
+    assert_eq!(out.len(), (tw * th) as usize, "tile buffer size mismatch");
     for ly in 0..th {
         let im = pg.im_start + (y0 + ly) as f64 * pg.im_step;
         for lx in 0..tw {
             let re = pg.re_start + (x0 + lx) as f64 * pg.re_step;
-            local[(ly * tw + lx) as usize] = compute(fractal, re, im, julia_c, max_iter);
+            out[(ly * tw + lx) as usize] = compute(fractal, re, im, julia_c, max_iter);
         }
     }
-    local
 }
 
 /// Like `render_tile_exact` but uses the f32 SIMD kernels (`mandelbrot_x8`/
@@ -666,10 +684,26 @@ pub fn render_tile_exact(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2]
 /// unconditionally — see `SchedulerConfig::simd_cpu_tiles` and
 /// `render_cpu_tile`, which gates it.
 pub fn render_tile_exact_simd(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32, tile: [u32; 4]) -> Vec<f32> {
+    let [_, _, tw, th] = tile;
+    let mut local = vec![0.0f32; (tw * th) as usize];
+    render_tile_exact_simd_into(pg, fractal, julia_c, max_iter, tile, &mut local);
+    local
+}
+
+/// `render_tile_exact_simd` writing into a caller-owned `out` instead of
+/// allocating — see `render_tile_exact_into` for why.
+///
+/// # Panics
+/// If `out.len() != tw * th`.
+pub fn render_tile_exact_simd_into(
+    pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32,
+    tile: [u32; 4], out: &mut [f32],
+) {
     use wide::f32x8;
 
     let [x0, y0, tw, th] = tile;
-    let mut local = vec![0.0f32; (tw * th) as usize];
+    assert_eq!(out.len(), (tw * th) as usize, "tile buffer size mismatch");
+    let local = out;
 
     for ly in 0..th {
         let y = y0 + ly;
@@ -709,8 +743,6 @@ pub fn render_tile_exact_simd(pg: &PixelGrid, fractal: FractalType, julia_c: [f6
             lx += 1;
         }
     }
-
-    local
 }
 
 /// Dispatches a CPU tile render to the SIMD fast path
@@ -720,13 +752,29 @@ pub fn render_tile_exact_simd(pg: &PixelGrid, fractal: FractalType, julia_c: [f6
 /// call site — see `render_tile_exact_simd`'s doc comment for why this isn't
 /// unconditional.
 pub fn render_cpu_tile(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32, tile: [u32; 4], use_simd: bool, zoom: f64) -> Vec<f32> {
+    let [_, _, tw, th] = tile;
+    let mut out = vec![0.0f32; (tw * th) as usize];
+    render_cpu_tile_into(pg, fractal, julia_c, max_iter, tile, use_simd, zoom, &mut out);
+    out
+}
+
+/// `render_cpu_tile` writing into a caller-owned `out` instead of allocating.
+/// This is what the heterogeneous scheduler calls; see `render_tile_exact_into`.
+///
+/// # Panics
+/// If `out.len() != tw * th`.
+#[allow(clippy::too_many_arguments)]
+pub fn render_cpu_tile_into(
+    pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32,
+    tile: [u32; 4], use_simd: bool, zoom: f64, out: &mut [f32],
+) {
     if use_simd
         && matches!(fractal, FractalType::Mandelbrot | FractalType::Julia)
         && zoom < F32_PRECISION_THRESHOLD
     {
-        render_tile_exact_simd(pg, fractal, julia_c, max_iter, tile)
+        render_tile_exact_simd_into(pg, fractal, julia_c, max_iter, tile, out)
     } else {
-        render_tile_exact(pg, fractal, julia_c, max_iter, tile)
+        render_tile_exact_into(pg, fractal, julia_c, max_iter, tile, out)
     }
 }
 

@@ -3,6 +3,67 @@ use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
 use crate::fractal::fractal::{RefOrbit, F32_PRECISION_THRESHOLD};
 
+/// A host buffer whose pages are locked (via `cuMemHostRegister`) so CUDA can
+/// DMA into it directly rather than staging through the driver's own internal
+/// pinned bounce buffer.
+///
+/// Registration is not free — it walks and locks the page table — so this is
+/// worth it only for a buffer reused across many frames, which is exactly the
+/// render-target case. Allocate one per resolution and keep it; do not create
+/// one per frame.
+///
+/// Derefs to `[f32]`, so it drops into any `&mut [f32]` slot (e.g.
+/// [`CudaFractal::readback_into`]). Unregisters on drop; if registration fails
+/// (page-locked memory is a limited system resource) it degrades silently to a
+/// plain heap buffer rather than failing the render, and [`Self::is_pinned`]
+/// reports which happened.
+pub struct PinnedBuf {
+    buf: Vec<f32>,
+    pinned: bool,
+}
+
+impl PinnedBuf {
+    pub fn new(len: usize) -> Self {
+        let mut buf = vec![0.0f32; len];
+        let rc = unsafe {
+            cudarc::driver::sys::lib().cuMemHostRegister_v2(
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                len * std::mem::size_of::<f32>(),
+                0,
+            )
+        };
+        let pinned = rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+        Self { buf, pinned }
+    }
+
+    /// Whether page-locking actually succeeded. False means the buffer still
+    /// works, just at pageable-transfer speed.
+    pub fn is_pinned(&self) -> bool { self.pinned }
+
+    /// Hands out the underlying data without unregistering — cloning here
+    /// rather than moving keeps the registered allocation alive for reuse.
+    pub fn to_vec(&self) -> Vec<f32> { self.buf.clone() }
+}
+
+impl std::ops::Deref for PinnedBuf {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] { &self.buf }
+}
+impl std::ops::DerefMut for PinnedBuf {
+    fn deref_mut(&mut self) -> &mut [f32] { &mut self.buf }
+}
+
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        if self.pinned {
+            unsafe {
+                cudarc::driver::sys::lib()
+                    .cuMemHostUnregister(self.buf.as_mut_ptr() as *mut std::ffi::c_void);
+            }
+        }
+    }
+}
+
 pub struct CudaFractal {
     dev:            Arc<CudaDevice>,
     output:         CudaSlice<f32>,
@@ -349,8 +410,34 @@ impl CudaFractal {
     /// Copies the persistent full-frame output buffer back to the host. Call
     /// once per frame, after all of that frame's `dispatch_tiled`/
     /// `dispatch_tiled_f32` calls.
+    ///
+    /// Allocates a fresh `Vec` per call. Prefer [`Self::readback_into`] with a
+    /// [`PinnedBuf`] where the destination can be reused — that is ~7.5%
+    /// faster, and on a readback-bound frame (§2 of results/summary.md, ~82%
+    /// of a CUDA frame) that is the cheapest win available.
     pub fn readback(&self) -> Vec<f32> {
         self.dev.dtoh_sync_copy(&self.output).unwrap()
+    }
+
+    /// Copies the full-frame output buffer into a caller-owned destination.
+    ///
+    /// The transfer is measurably faster when `dst` is page-locked (see
+    /// [`PinnedBuf`]): the driver can DMA straight into it instead of staging
+    /// through its own internal pinned bounce buffer. Measured at 1920x1080
+    /// (8.29 MB) over this machine's PCIe 3.0 x8 link: 1.336 ms into a
+    /// pageable `Vec`, 1.235 ms into a page-locked one (-7.5%, 6.2 -> 6.7
+    /// GB/s against a 7.9 GB/s theoretical ceiling). Reusing a *pageable*
+    /// buffer is worth nothing on its own — the allocator keeps handing back
+    /// the same mapped pages — so the win here is the pinning, not the reuse.
+    ///
+    /// # Panics
+    /// If `dst.len()` is not `width * height`.
+    pub fn readback_into(&self, dst: &mut [f32]) {
+        assert_eq!(
+            dst.len(), (self.width * self.height) as usize,
+            "readback destination must be exactly width*height",
+        );
+        self.dev.dtoh_sync_copy_into(&self.output, dst).unwrap();
     }
 
     /// Convenience wrapper equivalent to a single `dispatch_tiled` +

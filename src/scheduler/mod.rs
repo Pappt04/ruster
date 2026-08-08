@@ -22,7 +22,7 @@ pub mod controller;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use crate::fractal::{pixel_grid, render_cpu_tile, IterBuf, F32_PRECISION_THRESHOLD};
+use crate::fractal::{pixel_grid, render_cpu_tile_into, IterBuf, F32_PRECISION_THRESHOLD};
 use crate::fractal::fractal_type::FractalType;
 use crate::gpu::cuda::CudaFractal;
 use crate::gpu::fractal_compute::FractalCompute;
@@ -96,6 +96,21 @@ impl Default for SchedulerConfig {
     }
 }
 
+/// Per-frame telemetry from the heterogeneous scheduler, without the frame
+/// buffer itself — returned by [`render_heterogeneous_into`], where the caller
+/// owns the destination.
+#[derive(Debug, Clone, Copy)]
+pub struct HeterogeneousStats {
+    pub gpu_ms: f32,
+    /// Pixel-weighted (not tile-count-weighted) fraction of the frame CPU
+    /// actually ended up computing, including anything it stole from the GPU
+    /// reserve — reflects realized work, not the pre-steal partition split.
+    pub cpu_ms: f32,
+    pub cpu_tile_frac: f32,
+    pub gpu_steal_dispatched: bool,
+    pub cpu_stolen_tile_count: u32,
+}
+
 pub struct HeterogeneousResult {
     pub buf: IterBuf,
     pub gpu_ms: f32,
@@ -127,6 +142,45 @@ pub fn render_heterogeneous(
     controller: &mut ThresholdController,
     cfg: &SchedulerConfig,
 ) -> HeterogeneousResult {
+    let mut buf = vec![0.0f32; (vp.width * vp.height) as usize];
+    let s = render_heterogeneous_into(vp, fractal, julia_c, max_iter, cuda, controller, cfg, &mut buf);
+    HeterogeneousResult {
+        buf,
+        gpu_ms: s.gpu_ms,
+        cpu_ms: s.cpu_ms,
+        cpu_tile_frac: s.cpu_tile_frac,
+        gpu_steal_dispatched: s.gpu_steal_dispatched,
+        cpu_stolen_tile_count: s.cpu_stolen_tile_count,
+    }
+}
+
+/// Like [`render_heterogeneous`], but renders into a caller-owned `out`
+/// instead of allocating a frame buffer per call.
+///
+/// This is the form to use in a render loop. Keeping one destination alive
+/// across frames is what makes page-locking worthwhile: pass a
+/// [`crate::gpu::cuda::PinnedBuf`] and the GPU readback — the dominant cost of
+/// the whole frame — DMAs straight into it, ~7.5% faster than into pageable
+/// memory. Registering a buffer is only worth it when amortized over many
+/// frames, so this cannot be done inside a per-call API.
+///
+/// # Panics
+/// If `out.len() != vp.width * vp.height`.
+#[allow(clippy::too_many_arguments)]
+pub fn render_heterogeneous_into(
+    vp: &Viewport,
+    fractal: FractalType,
+    julia_c: [f64; 2],
+    max_iter: u32,
+    cuda: &mut CudaFractal,
+    controller: &mut ThresholdController,
+    cfg: &SchedulerConfig,
+    out: &mut [f32],
+) -> HeterogeneousStats {
+    assert_eq!(
+        out.len(), (vp.width * vp.height) as usize,
+        "heterogeneous render destination must be exactly width*height",
+    );
     let w = vp.width;
     let h = vp.height;
     debug_assert_eq!(w, cuda.width(), "CudaFractal not sized for this viewport");
@@ -191,10 +245,18 @@ pub fn render_heterogeneous(
     // inflate it to match whichever of GPU/CPU was slower, rather than
     // reflecting when the CPU workers actually finished — which would feed
     // the adaptive threshold controller a distorted signal.
-    let (tx, rx) = std::sync::mpsc::channel::<(Vec<([u32; 4], Vec<f32>)>, u32, f32)>();
+    // Each worker reports one flat scratch buffer holding all the tiles it
+    // rendered, back to back, plus the (tile, offset) index needed to scatter
+    // them. This replaces one `Vec<f32>` allocation *per tile* — measured at
+    // 1.0-3.9 ms per frame, the single largest piece of scheduler overhead and
+    // an order of magnitude above everything else (results/summary.md §3.4).
+    // The cost was page faults on freshly-mapped pages, not the copying, so
+    // one geometrically-grown buffer per worker removes essentially all of it.
+    type WorkerOut = (Vec<f32>, Vec<([u32; 4], usize)>, u32, f32);
+    let (tx, rx) = std::sync::mpsc::channel::<WorkerOut>();
     let cpu_t0 = std::time::Instant::now();
 
-    let (gpu_buf, gpu_ms, gpu_steal_dispatched) = rayon::scope(|s| {
+    let (gpu_ms, gpu_steal_dispatched) = rayon::scope(|s| {
         // --- CPU worker pool: spawned onto rayon's already-warm global pool
         // (`rayon::scope`, not `std::thread::scope`) — spawning fresh OS
         // threads every single frame was measured to eat most of the
@@ -212,7 +274,8 @@ pub fn render_heterogeneous(
             let cpu_queue = &cpu_queue;
             let steal_queue = &steal_queue;
             s.spawn(move |_| {
-                let mut local: Vec<([u32; 4], Vec<f32>)> = Vec::new();
+                let mut scratch: Vec<f32> = Vec::new();
+                let mut index: Vec<([u32; 4], usize)> = Vec::new();
                 let mut stolen = 0u32;
                 loop {
                     let claim = {
@@ -227,14 +290,21 @@ pub fn render_heterogeneous(
                     match claim {
                         Some((tile, is_steal)) => {
                             if is_steal { stolen += 1; }
-                            let tile_buf = render_cpu_tile(pg, fractal, julia_c, max_iter, tile, use_simd, zoom);
-                            local.push((tile, tile_buf));
+                            let [_, _, tw, th] = tile;
+                            let offset = scratch.len();
+                            let n = (tw * th) as usize;
+                            scratch.resize(offset + n, 0.0);
+                            render_cpu_tile_into(
+                                pg, fractal, julia_c, max_iter, tile, use_simd, zoom,
+                                &mut scratch[offset..offset + n],
+                            );
+                            index.push((tile, offset));
                         }
                         None => break,
                     }
                 }
                 let finished_ms = cpu_t0.elapsed().as_secs_f32() * 1000.0;
-                let _ = tx.send((local, stolen, finished_ms));
+                let _ = tx.send((scratch, index, stolen, finished_ms));
             });
         }
 
@@ -262,14 +332,14 @@ pub fn render_heterogeneous(
         // CPU-side), don't read back — `self.output` would be stale from a
         // previous frame/viewport, and every pixel gets overwritten by the
         // CPU merge below regardless.
-        let gpu_buf = if gpu_did_anything {
-            cuda.readback()
-        } else {
-            vec![0.0f32; (w * h) as usize]
-        };
+        // DMA straight into the caller's frame buffer. When that buffer is a
+        // `PinnedBuf` the driver can write into it directly instead of staging
+        // through its own bounce buffer — on a readback-bound frame (~82% of a
+        // CUDA frame, §2) that is the cheapest win available.
+        if gpu_did_anything { cuda.readback_into(out); } else { out.fill(0.0); }
         let gpu_ms = gpu_t0.elapsed().as_secs_f32() * 1000.0;
 
-        (gpu_buf, gpu_ms, gpu_steal_dispatched)
+        (gpu_ms, gpu_steal_dispatched)
         // `rayon::scope` blocks here until every `s.spawn`ed worker above has
         // finished (and sent its result) before returning this tuple.
     });
@@ -277,29 +347,32 @@ pub fn render_heterogeneous(
     let mut cpu_pixels = 0u64;
     let mut cpu_stolen_tile_count = 0u32;
     let mut cpu_ms = 0.0f32;
-    let mut buf = gpu_buf;
+    let buf = &mut *out;
     for _ in 0..n_workers {
-        let (results, stolen, finished_ms) = rx.recv().unwrap();
+        let (scratch, index, stolen, finished_ms) = rx.recv().unwrap();
         cpu_stolen_tile_count += stolen;
         // The slowest worker to finish is when CPU-side work was actually
         // done — not when we got around to draining the channel, which can
         // happen arbitrarily later if GPU (running concurrently on the
         // calling thread) was the one holding `rayon::scope` open.
         cpu_ms = cpu_ms.max(finished_ms);
-        for ([x0, y0, tw, th], local) in results {
+        // Scatter this worker's tiles into the frame. Only CPU tiles are
+        // copied here (3-23% of pixels in practice), so this is tens of
+        // microseconds; the GPU's share arrived already in place via the
+        // readback below/above.
+        for ([x0, y0, tw, th], offset) in index {
             cpu_pixels += (tw as u64) * (th as u64);
             for row in 0..th {
                 let dst = ((y0 + row) * w + x0) as usize;
-                let src = (row * tw) as usize;
-                buf[dst..dst + tw as usize].copy_from_slice(&local[src..src + tw as usize]);
+                let src = offset + (row * tw) as usize;
+                buf[dst..dst + tw as usize].copy_from_slice(&scratch[src..src + tw as usize]);
             }
         }
     }
 
     controller.update(gpu_ms, cpu_ms);
 
-    HeterogeneousResult {
-        buf,
+    HeterogeneousStats {
         gpu_ms,
         cpu_ms,
         cpu_tile_frac: if total_pixels > 0 { cpu_pixels as f32 / total_pixels as f32 } else { 0.0 },
@@ -369,7 +442,10 @@ pub fn render_heterogeneous_wgpu(
         compute.dispatch_tiled(device, queue, batch, uniforms);
     };
 
-    let (tx, rx) = std::sync::mpsc::channel::<(Vec<([u32; 4], Vec<f32>)>, u32, f32)>();
+    // Same flat per-worker scratch as `render_heterogeneous` — see the comment
+    // there for why one `Vec` per tile was the scheduler's dominant cost.
+    type WorkerOut = (Vec<f32>, Vec<([u32; 4], usize)>, u32, f32);
+    let (tx, rx) = std::sync::mpsc::channel::<WorkerOut>();
     let cpu_t0 = std::time::Instant::now();
 
     let (gpu_buf, gpu_ms, gpu_steal_dispatched) = rayon::scope(|s| {
@@ -379,7 +455,8 @@ pub fn render_heterogeneous_wgpu(
             let cpu_queue = &cpu_queue;
             let steal_queue = &steal_queue;
             s.spawn(move |_| {
-                let mut local: Vec<([u32; 4], Vec<f32>)> = Vec::new();
+                let mut scratch: Vec<f32> = Vec::new();
+                let mut index: Vec<([u32; 4], usize)> = Vec::new();
                 let mut stolen = 0u32;
                 loop {
                     let claim = {
@@ -394,14 +471,21 @@ pub fn render_heterogeneous_wgpu(
                     match claim {
                         Some((tile, is_steal)) => {
                             if is_steal { stolen += 1; }
-                            let tile_buf = render_cpu_tile(pg, fractal, julia_c, max_iter, tile, use_simd, zoom);
-                            local.push((tile, tile_buf));
+                            let [_, _, tw, th] = tile;
+                            let offset = scratch.len();
+                            let n = (tw * th) as usize;
+                            scratch.resize(offset + n, 0.0);
+                            render_cpu_tile_into(
+                                pg, fractal, julia_c, max_iter, tile, use_simd, zoom,
+                                &mut scratch[offset..offset + n],
+                            );
+                            index.push((tile, offset));
                         }
                         None => break,
                     }
                 }
                 let finished_ms = cpu_t0.elapsed().as_secs_f32() * 1000.0;
-                let _ = tx.send((local, stolen, finished_ms));
+                let _ = tx.send((scratch, index, stolen, finished_ms));
             });
         }
 
@@ -437,15 +521,15 @@ pub fn render_heterogeneous_wgpu(
     let mut cpu_ms = 0.0f32;
     let mut buf = gpu_buf;
     for _ in 0..n_workers {
-        let (results, stolen, finished_ms) = rx.recv().unwrap();
+        let (scratch, index, stolen, finished_ms) = rx.recv().unwrap();
         cpu_stolen_tile_count += stolen;
         cpu_ms = cpu_ms.max(finished_ms);
-        for ([x0, y0, tw, th], local) in results {
+        for ([x0, y0, tw, th], offset) in index {
             cpu_pixels += (tw as u64) * (th as u64);
             for row in 0..th {
                 let dst = ((y0 + row) * w + x0) as usize;
-                let src = (row * tw) as usize;
-                buf[dst..dst + tw as usize].copy_from_slice(&local[src..src + tw as usize]);
+                let src = offset + (row * tw) as usize;
+                buf[dst..dst + tw as usize].copy_from_slice(&scratch[src..src + tw as usize]);
             }
         }
     }
