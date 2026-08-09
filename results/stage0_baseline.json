@@ -1,0 +1,6 @@
+[
+  {"fractal":"Nova","backend":"cpu","threads":16,"width":1920,"height":1080,"max_iter":1000,"runs":5,"median_ms":76.9486,"min_ms":73.9839,"max_ms":80.9595,"mpix_per_sec":26.9479,"total_iters":79786651,"gflops":27.9958,"mem_traffic_mb":16.59},
+  {"fractal":"Newton","backend":"cpu","threads":16,"width":1920,"height":1080,"max_iter":1000,"runs":5,"median_ms":15.0408,"min_ms":14.8375,"max_ms":15.6201,"mpix_per_sec":137.8651,"total_iters":15434034,"gflops":25.6536,"mem_traffic_mb":16.59},
+  {"fractal":"Mandelbrot","backend":"cpu","threads":16,"width":1920,"height":1080,"max_iter":1000,"runs":5,"median_ms":7.9770,"min_ms":7.7598,"max_ms":8.1792,"mpix_per_sec":259.9485,"total_iters":114924369,"gflops":115.2562,"mem_traffic_mb":16.59},
+  {"fractal":"Julia Set","backend":"cpu","threads":16,"width":1920,"height":1080,"max_iter":1000,"runs":5,"median_ms":8.7523,"min_ms":8.1679,"max_ms":9.6995,"mpix_per_sec":236.9201,"total_iters":10989383,"gflops":10.0448,"mem_traffic_mb":16.59}
+]

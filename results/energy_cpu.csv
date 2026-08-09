@@ -1,0 +1,4 @@
+backend,fractal,width,height,iters,wall_s,energy_j,avg_watts,gflops,gflops_per_watt
+cpu,mandelbrot,1920,1080,1000,1.876643365,63.4812,33.82,100.3534,2.967
+backend,fractal,width,height,iters,wall_s,avg_watts,gflops,gflops_per_watt
+gpu,mandelbrot,1920,1080,1000,5.341483300,13.49,54.3743,4.030

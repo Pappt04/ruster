@@ -1,0 +1,27 @@
+bench_runner  git=074b6f4
+  resolution : 1920×1080
+  center     : [-0.5, 0]
+  zoom       : 1
+  max_iter   : 1000
+  runs       : 5
+  backend    : Cpu
+  rayon cpus : 16
+
+── Analytical FLOP budget (lower bound, no FMA fusion) ──────────
+Kernel       FLOPs/iter FLOPs @ max_iter
+Nova                 27            27000
+Newton               25            25000
+Mandelbrot            8             8000
+Julia Set             8             8000
+smooth_iter() (ln-based) adds ~6 FLOPs per escaped pixel.
+────────────────────────────────────────────────────────────────
+
+
+----------------------------------------------------------------------------------------------------
+Fractal      Backend   Threads     Mpix/s     GFLOPs     Med ms       Min ms       Max ms        MemMB
+----------------------------------------------------------------------------------------------------
+Nova         cpu            16      26.69     27.725      77.70        73.21        84.58         16.6
+Newton       cpu            16     131.68     24.503      15.75        15.00        16.69         16.6
+Mandelbrot   cpu            16     262.85    116.541       7.89         7.23         8.53         16.6
+Julia Set    cpu            16     231.39      9.810       8.96         8.50         9.08         16.6
+----------------------------------------------------------------------------------------------------

@@ -1,9 +1,7 @@
 /target
 /.zed
 /.claude
-CLAUDE.md
 TUTORIAL.md
 bench_results/
 OPTIMIZATIONS.md
-/results
 __pycache__/
