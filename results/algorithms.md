@@ -225,6 +225,32 @@ whole frame is invalid relative to it.
 The `MAX_REFS` cap exists specifically so termination does not depend on the
 glitch pattern.
 
+**Measured cost of robustness (1920×1080, `max_iter=1000`, seahorse valley):**
+
+| zoom | scalar | single-ref | multi-ref | rebase |
+|---|---:|---:|---:|---:|
+| 1e0 | 8.8 ms | 8.8 ms | 45.3 ms | 119.4 ms |
+| 1e3 | 59.9 ms | 60.4 ms | 124.3 ms | 180.3 ms |
+| 1e6 | **25.1 ms** | 59.7 ms | 313.3 ms | 68.0 ms |
+| 1e9 | **25.1 ms** | 42.8 ms | 45.4 ms | 69.4 ms |
+| 1e12 | **25.0 ms** | 43.2 ms | 43.3 ms | 68.8 ms |
+
+**Both robustness strategies are expensive — 1.6× to 5.2× over single-reference,
+and plain scalar beats all three at every zoom from 1e6 up.** Multi-reference is
+worst at 1e6 (5.2× single-reference) and converges toward it by 1e12, which fits
+the mechanism: at moderate zoom the glitch sites are scattered and each new
+reference orbit costs a full high-precision computation, whereas at extreme zoom
+one or two references cover the frame.
+
+**What this measurement does and does not show.** It measures *cost only*. The
+benefit — fewer glitched pixels — is not measured here; §5.8 of `summary.md`
+measured the underlying glitch rate separately (6.67% mean, 24.94% stddev,
+0–100% range across 15 random references). So the honest statement is: these
+strategies buy variance reduction at 1.6–5.2× the runtime, and whether that
+trade is worth taking depends on a glitch rate this benchmark does not observe.
+Quantifying correctness-per-millisecond would need a pixel-accuracy metric
+against a high-precision ground truth — a clear piece of future work.
+
 ---
 
 ## Stage 5 — Work-skipping algorithms
@@ -237,29 +263,52 @@ Trace a rectangle's border; if every border pixel shares a value the interior
 must too (the escape-time field has no holes), so flood-fill it. Otherwise
 subdivide.
 
-**Measured — and the first measurement was wrong.** Against the default
-16-thread `render()` it looked ~10× slower. But `render_mariani_silver` is
-**inherently sequential** — its recursive subdivision carries a data dependency
-this implementation does not parallelise — so that number reported the thread
-count, not the algorithm. Against a **1-thread** baseline:
+**The first measurement of this was wrong, and the way it was wrong matters.**
+Against the default 16-thread `render()` it looked ~10× slower. But
+`render_mariani_silver` is **inherently sequential** — its recursive subdivision
+carries a data dependency this implementation does not parallelise — so that
+number reported the thread count, not the algorithm. The suite now runs two
+baselines and the sequential arms are compared against the 1-thread one.
 
-| viewport | baseline 1T | Mariani–Silver | verdict |
-|---|---:|---:|---|
-| whole set | 54.3 ms | 66.1 ms | 1.22× slower |
-| boundary (zoom 1e2) | 361.5 ms | **311.6 ms** | **1.16× faster** |
+Full run, 1920×1080, `max_iter=1000`:
 
-**Conclusion:** the work-skipping is real — it wins where large uniform
-high-iteration regions exist — but on a 16-thread CPU, *parallelism beats
-work-skipping*. To be competitive here it would need parallelising, which its
-data dependency makes non-trivial. This is a genuinely interesting result and a
-good illustration that an algorithmic win can be erased by an execution-model
-loss.
+| viewport | baseline 16T | baseline 1T | Mariani–Silver | vs 1T | vs 16T |
+|---|---:|---:|---:|---:|---:|
+| whole set | 9.1 ms | 55.8 ms | 67.3 ms | 0.83× | 0.14× |
+| boundary (1e2) | 50.5 ms | 368.2 ms | **304.2 ms** | **1.21×** | 0.17× |
+| deep boundary (1e4) | 88.9 ms | 721.9 ms | 744.9 ms | 0.97× | 0.12× |
+
+**Conclusion:** the work-skipping is real but narrow — it wins only where large
+uniform high-iteration regions exist (the boundary view, 1.21×), and even there
+a 16-thread parallel render is 6× faster. **On a multi-core CPU, parallelism
+beats work-skipping.** To compete it would need parallelising, which its data
+dependency makes non-trivial. A good illustration that an algorithmic win can be
+entirely erased by an execution-model loss.
 
 ### 5.2 Mariani–Silver + distance estimation
 
-Same, but the subdivision floor is set by an exterior distance estimate rather
-than a fixed minimum tile size — subdivide only until the estimate proves the
-rectangle cannot contain boundary.
+Same border-tracing, but the subdivision floor is set by an exterior distance
+estimate rather than a fixed minimum tile size: stop subdividing once the
+estimate proves the rectangle cannot contain boundary.
+
+**This is the best work-skipping result in the project, and it was the surprise
+of the run:**
+
+| viewport | baseline 1T | MS + DEM | vs 1T | vs plain MS |
+|---|---:|---:|---:|---:|
+| whole set | 55.8 ms | **33.2 ms** | **1.68×** | **2.03×** |
+| boundary (1e2) | 368.2 ms | 329.6 ms | 1.12× | 0.92× |
+| deep boundary (1e4) | 721.9 ms | 715.5 ms | 1.01× | 1.04× |
+
+The distance estimate is worth **2.03× over plain Mariani–Silver** on the
+whole-set view, and it inverts that view's verdict from a 0.83× loss to a 1.68×
+win. The mechanism is intuitive: on the whole-set view most of the frame is far
+from the boundary, so the estimator terminates recursion early over large areas.
+At deep zoom nearly everything is near the boundary and the advantage vanishes.
+
+Still ~1.7× slower than a 16-thread parallel render, so the same conclusion
+holds — but this is the one work-skipping technique whose algorithmic value is
+unambiguous.
 
 ### 5.3 Interior distance estimation
 
@@ -268,16 +317,32 @@ derivative of the attracting cycle, proving interiority without iterating to
 `max_iter`. Unlike Mariani–Silver this **is** rayon-parallel, so it compares
 fairly against the 16-thread baseline.
 
+| viewport | baseline 16T | IDE | ratio |
+|---|---:|---:|---:|
+| whole set | 9.1 ms | 8.6 ms | 1.05× |
+| boundary | 50.5 ms | 52.3 ms | 0.96× |
+| deep boundary | 88.9 ms | 90.5 ms | 0.98× |
+
+**Verdict: neutral.** Within noise at every viewport. The derivative tracking
+costs about what the saved iterations return. The closed-form cardioid/bulb
+tests in §2.1 already catch the cheap interior cases, so IDE is left proving
+interiority only for the awkward ones — where it is no cheaper than iterating.
+
 ### 5.4 Neighbour capping
 
 A pixel's iteration count differs from its left neighbour's by a bounded amount
 in smooth regions, so cap the loop at `neighbour + 16` and recompute exactly only
 when the cap is hit.
 
-**Measured:** ~11–15% **slower** than baseline at every viewport. The bookkeeping
-and the recompute-on-miss cost more than the iterations saved.
+| viewport | baseline 16T | capped | ratio |
+|---|---:|---:|---:|
+| whole set | 9.1 ms | 10.4 ms | 0.87× |
+| boundary | 50.5 ms | 50.6 ms | 1.00× |
+| deep boundary | 88.9 ms | 103.5 ms | 0.86× |
 
----
+**Verdict: loses.** 13–14% slower where it differs at all. The bookkeeping plus
+the recompute-on-miss costs more than the iterations it avoids, and it breaks
+the row-level SIMD the baseline gets.
 
 ## Stage 6 — Frame-to-frame reuse
 
@@ -288,14 +353,21 @@ valid: memmove the overlap, compute only the newly exposed strip.
 
 **Measured — the largest unmeasured effect in the project:**
 
-| pan distance | time | vs 39 ms full render |
+| pan distance | time | vs 44.6 ms full render |
 |---|---:|---:|
-| 1 px | 0.18 ms | **215×** |
-| 32 px | 0.14 ms | 275× |
-| 192 px | 0.26 ms | 148× |
-| 960 px (half frame) | 0.65 ms | **60×** |
+| 1 px | 0.549 ms | 81× |
+| 32 px | 0.120 ms | **370×** |
+| 192 px | 0.215 ms | 208× |
+| 960 px (half frame) | 0.742 ms | 60× |
 
-Cost scales with the exposed strip, not the frame — exactly as designed.
+The effect size is unambiguous — one to two orders of magnitude — but the
+ordering across distances is **not monotonic**, and it should be. A 1 px pan
+recomputes a 1-pixel strip and cannot legitimately cost 4.5× a 32 px pan. At
+these magnitudes the measurement is dominated by the `iter_batched` clone of the
+8.29 MB frame buffer (~0.36 ms as a flat memcpy) rather than by the strip work,
+so the per-distance numbers should not be read as a scaling curve. The
+comparison against a full render is sound; the shape is not. Isolating the strip
+cost would need the clone moved out of the measured region.
 
 **The precondition that makes it fragile:** `Viewport::delta_pixels` requires the
 shift to round to within `1e-6` of a whole pixel. An arbitrary real-valued centre
@@ -433,17 +505,37 @@ scheduler (7%). It is the highest-leverage work left in the project.
 | Brent cycle detection | kernel | **Win**, cheaper than Floyd |
 | f32 fast path below zoom 1e6 | precision | **Win** — and creates the scheduler's win regime |
 | SIMD f32x8 + ILP | CPU | **1.87×**; ILP itself only +4% |
-| Incremental pan | reuse | **60–215×** — largest measured effect |
+| Incremental pan | reuse | **60–370×** — largest measured effect in the project |
+| Mariani–Silver **+ distance estimation** | work-skipping | **1.68× vs 1 thread** on the whole-set view; 2.03× over plain MS |
 | Heterogeneous scheduler | scheduling | **Wins only above zoom 1e6** (1.71×); loses below |
+| Mariani–Silver (plain) | work-skipping | **Narrow** — 1.21× vs 1 thread at the boundary only |
 | Morton dispatch | GPU | **Neutral** (+1.9%) — tested, rejected |
-| Mariani–Silver | work-skipping | **Wins vs 1 thread at boundary, loses to 16** |
-| Neighbour capping | work-bounding | **Loses** (~11–15% slower) |
+| Interior distance estimation | work-skipping | **Neutral** (0.96–1.05×) |
+| Neighbour capping | work-bounding | **Loses** (13–14% slower) |
 | Hilbert traversal | memory order | **Loses** (39% slower, worse cache misses) |
 | Perturbation | deep zoom | **Correctness win, throughput loss** (0.42–0.95×) |
+| Multi-reference / rebasing | glitch handling | **Costs 1.6–5.2×**; benefit unmeasured |
 | Series approximation | deep zoom | **Marginal** — skips 2–36 of 1000 iterations |
 | GPU-side colouring | colour | **Not implemented — the biggest remaining win (2.18×)** |
 
-> Numbers in this document come from the archives and probes described in
-> `results/summary.md`. The work-skipping and incremental-pan figures are from
-> the first measured run of those groups; they will be superseded by the current
-> full re-benchmark, and any that shift materially should be updated here.
+## Two results worth putting in the discussion chapter
+
+**Parallelism beat work-skipping.** Every sequential work-skipping technique
+here loses to a 16-thread parallel render even when it demonstrably does less
+arithmetic — Mariani-Silver at the boundary saves 17% of the work and is still
+6× slower than the parallel baseline. On a many-core CPU, the cost of *not*
+parallelising exceeds the benefit of *not computing*. Whether that generalises
+depends on core count: on a 2-core machine the verdict would likely invert.
+
+**Almost none of the frame is fractal iteration.** Of a 4.76 ms CUDA pipeline,
+~0.3 ms is the escape-time loop. The rest is a PCIe readback (1.33 ms) and CPU
+colour mapping (2.29 ms). Every optimisation in Stage 2 and Stage 3 — the bulb
+rejection, the SIMD widths, the f32 fast path, the fp64 bulb fix — competes for
+that 6%. The two largest untaken wins (GPU colouring, eliminating the readback)
+are both in stages that do no fractal mathematics at all.
+
+> Numbers from `bench_results/criterion_20260809_204455_2174b94_full`
+> (240 benchmarks, one session). Scheduler deep-zoom figures come from
+> `criterion_20260808_210551_fc5ca0d_sched_improved`, which the current run did
+> not re-execute. See `results/summary.md` for methodology and the standing
+> caveat that cross-session comparisons on this machine are unreliable.
