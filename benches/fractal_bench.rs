@@ -600,6 +600,189 @@ fn bench_heterogeneous(c: &mut Criterion) {
 fn bench_heterogeneous(c: &mut Criterion) { let _ = c; }
 
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Algorithmic optimisations that skip or reuse work
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Everything above measures how fast a full per-pixel evaluation runs. These
+// groups measure techniques that try to avoid doing it: proving a region is
+// uniform and flood-filling it, bounding a pixel's iteration count from its
+// neighbour, or reusing the previous frame outright. They were all implemented
+// but never benchmarked, so their value in this renderer was unknown.
+//
+// All are compared against plain `render()` on the SAME viewport, since the
+// question is only ever "is this cheaper than just computing every pixel?".
+// Every one of them returns a full IterBuf, so a slower result means the
+// bookkeeping cost more than the arithmetic it avoided.
+//
+// TWO baselines, and the distinction is load-bearing. `render()`,
+// `render_ide_biased` and `render_neighbor_capped` are rayon-parallel over rows;
+// `render_mariani_silver[_dem]` is inherently SEQUENTIAL — its recursive
+// rectangle subdivision carries a data dependency that this implementation does
+// not parallelise. Measuring it against a 16-thread baseline therefore reports
+// the thread count, not the algorithm, and would make a work-skipping technique
+// look ~10x worse than it is. So:
+//
+//   baseline_16t  — "should I use this in this renderer?"  (engineering answer)
+//   baseline_1t   — "does this technique save work at all?" (algorithmic answer)
+//
+// Compare the sequential techniques against `baseline_1t` and the parallel ones
+// against `baseline_16t`.
+
+fn bench_work_skipping(c: &mut Criterion) {
+    use novafractal::fractal::{
+        render_mariani_silver, render_mariani_silver_dem, render_ide_biased,
+        render_neighbor_capped,
+    };
+    let pool1 = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+
+    // Three viewports with deliberately different interior/boundary ratios —
+    // these techniques all exploit large uniform regions, so a whole-set view
+    // (much interior) and a boundary-dominated crop should behave differently.
+    const VIEWS: &[(f64, [f64; 2], &str)] = &[
+        (1.0, [-0.5, 0.0], "whole_set"),          // large interior + large exterior
+        (1e2, [-0.745, 0.113], "boundary"),       // seahorse valley, boundary-heavy
+        (1e4, [-0.745, 0.113], "deep_boundary"),
+    ];
+
+    let mut group = c.benchmark_group("skipping/mandelbrot_1080p");
+    group.throughput(Throughput::Elements(1920 * 1080));
+    group.sample_size(10);
+
+    for &(zoom, center, label) in VIEWS {
+        let v = Viewport { center, zoom, width: 1920, height: 1080 };
+        group.bench_with_input(BenchmarkId::new("baseline_16t", label), &v, |b, v| {
+            b.iter(|| black_box(render(black_box(v), FractalType::Mandelbrot, JULIA_C, MAX_ITER)))
+        });
+        // The comparison point for the sequential techniques below.
+        group.bench_with_input(BenchmarkId::new("baseline_1t", label), &v, |b, v| {
+            b.iter(|| pool1.install(|| black_box(
+                render(black_box(v), FractalType::Mandelbrot, JULIA_C, MAX_ITER))))
+        });
+        // Mariani-Silver: trace a rectangle's border; if every border pixel has
+        // the same value the interior must too (the escape-time field has no
+        // holes), so flood-fill it. Otherwise subdivide.
+        group.bench_with_input(BenchmarkId::new("mariani_silver_SEQ", label), &v, |b, v| {
+            b.iter(|| black_box(render_mariani_silver(black_box(v), FractalType::Mandelbrot, JULIA_C, MAX_ITER)))
+        });
+        // Same, but the subdivision floor is driven by a distance estimate
+        // rather than a fixed minimum size.
+        group.bench_with_input(BenchmarkId::new("mariani_silver_dem_SEQ", label), &v, |b, v| {
+            b.iter(|| black_box(render_mariani_silver_dem(black_box(v), FractalType::Mandelbrot, JULIA_C, MAX_ITER, 1.0)))
+        });
+        // Interior distance estimation: prove a point is interior without
+        // iterating to max_iter, by tracking the derivative of the cycle.
+        group.bench_with_input(BenchmarkId::new("interior_dist_est", label), &v, |b, v| {
+            b.iter(|| black_box(render_ide_biased(black_box(v), FractalType::Mandelbrot, JULIA_C, MAX_ITER)))
+        });
+        // Neighbour capping: a pixel's iteration count differs from its
+        // left neighbour's by a bounded amount in smooth regions, so cap the
+        // loop at neighbour+slack and only recompute exactly when the cap is hit.
+        group.bench_with_input(BenchmarkId::new("neighbour_capped", label), &v, |b, v| {
+            b.iter(|| black_box(render_neighbor_capped(black_box(v), FractalType::Mandelbrot, JULIA_C, MAX_ITER, 16)))
+        });
+    }
+    group.finish();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Perturbation glitch-handling strategies
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// `bench_perturbation_render` above measures single-reference perturbation, whose
+// weakness is glitches: pixels where the chosen reference orbit stops being a
+// valid linearisation and which must fall back to full-precision iteration.
+// Measured glitch rate across 15 random references at zoom 1e9 was 6.67% mean
+// with a 24.94% standard deviation and a full 0-100% range (results/summary.md
+// §5.8), i.e. a single reference is a lottery. These two strategies exist to
+// remove that variance; this group measures what they cost.
+fn bench_perturbation_strategies(c: &mut Criterion) {
+    use novafractal::fractal::{render_perturbation_multiref, render_perturbation_rebase};
+
+    let mut group = c.benchmark_group("perturbation/glitch_strategy");
+    group.throughput(Throughput::Elements(1920 * 1080));
+    group.sample_size(10);
+
+    for &(zoom, label) in PERTURB_ZOOMS {
+        let vp = Viewport { center: PERTURB_CENTER, zoom, width: 1920, height: 1080 };
+        group.bench_with_input(BenchmarkId::new("scalar", label), &vp, |b, vp| {
+            b.iter(|| black_box(render(black_box(vp), FractalType::Mandelbrot, JULIA_C, MAX_ITER)))
+        });
+        group.bench_with_input(BenchmarkId::new("single_ref", label), &vp, |b, vp| {
+            b.iter(|| black_box(render_perturbation(black_box(vp), FractalType::Mandelbrot, JULIA_C, MAX_ITER)))
+        });
+        // Several reference orbits; each pixel uses the nearest valid one, so a
+        // single bad reference no longer poisons the frame.
+        group.bench_with_input(BenchmarkId::new("multi_ref", label), &vp, |b, vp| {
+            b.iter(|| black_box(render_perturbation_multiref(black_box(vp), FractalType::Mandelbrot, JULIA_C, MAX_ITER)))
+        });
+        // Rebasing: when a pixel's epsilon grows too large relative to the
+        // reference, restart the perturbation from the current orbit point
+        // instead of falling back to full-precision iteration.
+        group.bench_with_input(BenchmarkId::new("rebase", label), &vp, |b, vp| {
+            b.iter(|| black_box(render_perturbation_rebase(black_box(vp), FractalType::Mandelbrot, JULIA_C, MAX_ITER)))
+        });
+    }
+    group.finish();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Frame-to-frame reuse: incremental pan
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// `shift_and_fill` exploits the fact that panning by a whole number of pixels
+// leaves most of the previous frame valid: memmove the overlap and compute only
+// the newly exposed strip. Cost should scale with the strip, not the frame, so
+// this sweeps pan distance to check that it does.
+//
+// The pan MUST be an exact integer pixel count. `Viewport::delta_pixels`
+// requires the shift to round to within 1e-6 of a whole pixel; an arbitrary
+// real-valued centre shift silently falls through to a full recompute, which
+// would make this benchmark measure `render()` under another name. The
+// viewports here are constructed from the pixel step so that cannot happen,
+// and the assertion below fails loudly if it ever does.
+fn bench_incremental_pan(c: &mut Criterion) {
+    use novafractal::fractal::{pixel_grid, shift_and_fill};
+
+    let base = Viewport { center: [-0.745, 0.113], zoom: 1e2, width: 1920, height: 1080 };
+    let pg = pixel_grid(&base);
+
+    let mut group = c.benchmark_group("incremental_pan/1080p");
+    group.throughput(Throughput::Elements(1920 * 1080));
+    group.sample_size(20);
+
+    group.bench_function("full_render", |b| {
+        b.iter(|| black_box(render(black_box(&base), FractalType::Mandelbrot, JULIA_C, MAX_ITER)))
+    });
+
+    // Pan distances as a fraction of the frame: a 1px nudge, a slow drag, a
+    // fast fling. The last is close to "most of the frame is new".
+    for &dx in &[1i32, 32, 192, 960] {
+        let panned = Viewport {
+            center: [base.center[0] + dx as f64 * pg.re_step, base.center[1]],
+            ..base
+        };
+        let delta = base.delta_pixels(&panned)
+            .expect("pan must round to a whole pixel or shift_and_fill degrades to a full render");
+        assert_eq!(delta.0.abs(), dx, "constructed pan did not land on the intended pixel offset");
+
+        let seed = render(&base, FractalType::Mandelbrot, JULIA_C, MAX_ITER);
+        group.bench_with_input(BenchmarkId::new("shift_and_fill", dx), &dx, |b, _| {
+            b.iter_batched(
+                || seed.clone(),
+                |mut buf| {
+                    shift_and_fill(&mut buf, 1920, 1080, delta.0, delta.1,
+                                   &panned, FractalType::Mandelbrot, JULIA_C, MAX_ITER);
+                    black_box(buf)
+                },
+                criterion::BatchSize::LargeInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Deep-zoom heterogeneous scheduler  (--features cuda)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -966,7 +1149,11 @@ criterion_group! {
         bench_cuda_perturbation,
         // Heterogeneous CPU+CUDA scheduler
         bench_heterogeneous,
-        bench_heterogeneous_deep
+        bench_heterogeneous_deep,
+        // Algorithmic work-skipping and reuse
+        bench_work_skipping,
+        bench_perturbation_strategies,
+        bench_incremental_pan
 }
 
 criterion_main!(benches);
