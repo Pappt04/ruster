@@ -1,7 +1,8 @@
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DeviceSlice, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
-use crate::fractal::fractal::{RefOrbit, F32_PRECISION_THRESHOLD};
+use crate::fractal::fractal::F32_PRECISION_THRESHOLD;
+use crate::fractal::perturburation_theory::RefOrbit;
 
 /// A host buffer whose pages are locked (via `cuMemHostRegister`) so CUDA can
 /// DMA into it directly rather than staging through the driver's own internal
