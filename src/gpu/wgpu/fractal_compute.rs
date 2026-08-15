@@ -1,4 +1,4 @@
-use crate::gpu::unifroms::{PerturbUniforms, Uniforms};
+use crate::gpu::wgpu::unifroms::{PerturbUniforms, Uniforms};
 
 const MAX_ORBIT: u64 = 8193;
 

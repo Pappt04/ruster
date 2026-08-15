@@ -29,7 +29,7 @@ fn main() {
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/ptx_variants");
     std::fs::create_dir_all(&dir).unwrap();
     let stock = std::fs::read_to_string(
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/gpu/fractal.cu"),
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/gpu/cuda/fractal.cu"),
     ).unwrap();
     // The line under test. `mandelbrot_f32` now uses the f32 predicate (that is
     // the fix); the comparison variant reverts it to the fp64 one so the

@@ -1159,8 +1159,8 @@ fn init_wgpu() -> Option<(wgpu::Device, wgpu::Queue)> {
 }
 
 fn bench_wgpu(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize) -> Option<Sample> {
-    use novafractal::gpu::fractal_compute::FractalCompute;
-    use novafractal::gpu::unifroms::Uniforms;
+    use novafractal::gpu::wgpu::fractal_compute::FractalCompute;
+    use novafractal::gpu::wgpu::unifroms::Uniforms;
 
     let (device, queue) = init_wgpu()?;
     let compute = FractalCompute::new(&device, vp.width, vp.height);
@@ -1235,8 +1235,8 @@ fn fractal_to_u32(f: FractalType) -> u32 {
 // concurrently, and combines the buffers.  The wall time is max(t_cpu, t_gpu).
 
 fn bench_hybrid(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize) -> Option<Sample> {
-    use novafractal::gpu::fractal_compute::FractalCompute;
-    use novafractal::gpu::unifroms::Uniforms;
+    use novafractal::gpu::wgpu::fractal_compute::FractalCompute;
+    use novafractal::gpu::wgpu::unifroms::Uniforms;
 
     let (device, queue) = init_wgpu()?;
 

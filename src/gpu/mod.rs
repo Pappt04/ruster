@@ -1,5 +1,4 @@
-pub mod fractal_compute;
-pub mod unifroms;
+pub mod wgpu;
 
 #[cfg(feature = "cuda")]
 pub mod cuda;

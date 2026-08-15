@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use novafractal::fractal::{pixel, render, render_perturbation, render_perturbation_sa, compute_reference_orbit, compute_reference_orbit_f128, compute_series_approx, flops_per_iter, FractalType};
-use novafractal::gpu::fractal_compute::FractalCompute;
-use novafractal::gpu::unifroms::{PerturbUniforms, Uniforms};
+use novafractal::gpu::wgpu::fractal_compute::FractalCompute;
+use novafractal::gpu::wgpu::unifroms::{PerturbUniforms, Uniforms};
 use novafractal::gui::color::{colorize, ColorScheme};
 use novafractal::gui::viewport::Viewport;
 use rayon::ThreadPoolBuilder;
