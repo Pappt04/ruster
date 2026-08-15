@@ -1,5 +1,8 @@
-use crate::fractal::fractal::{ESCAPE_RADIUS_SQ, ESCAPE_RADIUS_SQ_F32, smooth_iter, smooth_iter_f32};
+use crate::fractal::fractal::{render, pixel_grid, IterBuf, ESCAPE_RADIUS_SQ, ESCAPE_RADIUS_SQ_F32, smooth_iter, smooth_iter_f32};
 use crate::fractal::bulb_precheck::{bulb_precheck_x4, bulb_precheck_x8, in_cardioid_or_period2, in_period3_bulb};
+use crate::fractal::fractal_type::FractalType;
+use crate::gui::viewport::Viewport;
+use rayon::prelude::*;
 
 pub fn mandelbrot_x8(cr: wide::f32x8, ci: wide::f32x8, max_iter: u32) -> [f32; 8] {
     use wide::{f32x8, CmpGt};
@@ -313,4 +316,64 @@ pub(crate) fn mandelbrot(cr: f64, ci: f64, max_iter: u32) -> f32 {
         }
     }
     max_iter as f32
+}
+
+const IDE_DER_SQ: f64 = 1e-24;
+
+pub fn mandelbrot_ide(cr: f64, ci: f64, max_iter: u32) -> f32 {
+    if in_cardioid_or_period2(cr, ci) || in_period3_bulb(cr, ci) {
+        return max_iter as f32;
+    }
+
+    let mut zr = cr;
+    let mut zi = ci;
+    let mut der_r = 1.0f64;
+    let mut der_i = 0.0f64;
+
+    for i in 1..max_iter {
+        let zr2 = zr * zr;
+        let zi2 = zi * zi;
+        let zn_sq = zr2 + zi2;
+        if zn_sq > ESCAPE_RADIUS_SQ {
+            return smooth_iter(i, zn_sq, max_iter);
+        }
+        // der ← 2·z·der (pre-update z)
+        let new_der_r = 2.0 * (zr * der_r - zi * der_i);
+        let new_der_i = 2.0 * (zr * der_i + zi * der_r);
+        der_r = new_der_r;
+        der_i = new_der_i;
+        if der_r * der_r + der_i * der_i < IDE_DER_SQ {
+            return max_iter as f32; // attracting cycle → interior
+        }
+        zi = 2.0 * zr * zi + ci;
+        zr = zr2 - zi2 + cr;
+    }
+    max_iter as f32
+}
+
+pub fn render_ide_biased(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
+    if fractal != FractalType::Mandelbrot {
+        return render(vp, fractal, julia_c, max_iter);
+    }
+    let w = vp.width as usize;
+    let h = vp.height as usize;
+    let pg = pixel_grid(vp);
+    let mut buf = vec![0.0f32; w * h];
+
+    buf.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let im = pg.im_start + y as f64 * pg.im_step;
+        let mut prev_interior = false;
+        for x in 0..w {
+            let re = pg.re_start + x as f64 * pg.re_step;
+            let v = if prev_interior {
+                mandelbrot_ide(re, im, max_iter)
+            } else {
+                mandelbrot(re, im, max_iter)
+            };
+            prev_interior = v >= max_iter as f32;
+            row[x] = v;
+        }
+    });
+
+    buf
 }

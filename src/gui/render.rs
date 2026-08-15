@@ -201,10 +201,14 @@ impl RenderWorker {
 
             #[cfg(not(feature = "cuda"))]
             {
-                use crate::fractal::fractal::{render as cpu_render, render_mariani_silver, render_neighbor_capped, shift_and_fill};
+                use crate::fractal::fractal::{render as cpu_render, render_neighbor_capped};
+                use crate::fractal::mariani_silver::render_mariani_silver;
+                use crate::fractal::pan::shift_and_fill;
                 use crate::fractal::perturburation_theory::{render_perturbation, render_perturbation_sa, render_perturbation_multiref};
                 #[cfg(feature = "simd")]
-                use crate::fractal::fractal::{render_simd, render_simd_f32, render_simd_f32_ilp, F32_PRECISION_THRESHOLD};
+                use crate::fractal::fractal::F32_PRECISION_THRESHOLD;
+                #[cfg(feature = "simd")]
+                use crate::fractal::simd::{render_simd, render_simd_f32, render_simd_f32_ilp};
                 #[cfg(feature = "simd")]
                 use crate::fractal::fractal_type::FractalType;
 
