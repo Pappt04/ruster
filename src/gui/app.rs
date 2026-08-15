@@ -26,9 +26,9 @@ pub struct FractalApp {
     // — adaptive iteration depth
     auto_iter: bool,
 
-    use_ms: bool,
+    use_mariani_silver: bool,
     use_perturbation: bool,
-    use_sa: bool,
+    use_series_approx: bool,
     use_neighbor_cap: bool,
     use_multiref: bool,
     use_heterogeneous: bool,
@@ -48,9 +48,9 @@ impl Default for FractalApp {
             needs_render: true,
             needs_recolor: false,
             auto_iter: true,
-            use_ms: false,
+            use_mariani_silver: false,
             use_perturbation: false,
-            use_sa: false,
+            use_series_approx: false,
             use_neighbor_cap: false,
             use_multiref: false,
             use_heterogeneous: false,
@@ -71,9 +71,9 @@ impl FractalApp {
             julia_c: self.julia_c,
             max_iter: self.max_iter,
             scheme: self.scheme,
-            use_ms: self.use_ms,
+            use_mariani_silver: self.use_mariani_silver,
             use_perturbation: self.use_perturbation,
-            use_sa: self.use_sa,
+            use_series_approx: self.use_series_approx,
             use_neighbor_cap: self.use_neighbor_cap,
             use_multiref: self.use_multiref,
             use_heterogeneous: self.use_heterogeneous,
@@ -218,8 +218,8 @@ impl FractalApp {
                 ui.separator();
 
                 // Mariani-Silver subdivision
-                if ui.checkbox(&mut self.use_ms, "Mariani-Silver fill").changed() {
-                    if self.use_ms { self.use_neighbor_cap = false; }
+                if ui.checkbox(&mut self.use_mariani_silver, "Mariani-Silver fill").changed() {
+                    if self.use_mariani_silver { self.use_neighbor_cap = false; }
                     self.needs_render = true;
                 }
 
@@ -227,7 +227,7 @@ impl FractalApp {
                 if self.fractal == FractalType::Mandelbrot {
                     if ui.checkbox(&mut self.use_perturbation, "Perturbation theory").changed() {
                         if !self.use_perturbation {
-                            self.use_sa = false;
+                            self.use_series_approx = false;
                             self.use_multiref = false;
                         }
                         if self.use_perturbation { self.use_neighbor_cap = false; }
@@ -235,13 +235,13 @@ impl FractalApp {
                     }
                     if self.use_perturbation {
                         ui.indent("sa_indent", |ui| {
-                            if ui.checkbox(&mut self.use_sa, "Series approx (SA)").changed() {
+                            if ui.checkbox(&mut self.use_series_approx, "Series approx (SA)").changed() {
                                 // Multi-ref + SA is not implemented in v1 (see
                                 // CURSOR_OPTIMIZATIONS.md 4a) — mutually exclusive.
-                                if self.use_sa { self.use_multiref = false; }
+                                if self.use_series_approx { self.use_multiref = false; }
                                 self.needs_render = true;
                             }
-                            if !self.use_sa {
+                            if !self.use_series_approx {
                                 if ui.checkbox(&mut self.use_multiref, "Multi-reference glitch correction").changed() {
                                     self.needs_render = true;
                                 }
@@ -250,7 +250,7 @@ impl FractalApp {
                     }
                 } else {
                     self.use_perturbation = false;
-                    self.use_sa = false;
+                    self.use_series_approx = false;
                     self.use_multiref = false;
                 }
 
@@ -258,9 +258,9 @@ impl FractalApp {
                 // exclusive with MS/perturbation (see CURSOR_OPTIMIZATIONS.md 1d).
                 if ui.checkbox(&mut self.use_neighbor_cap, "Neighbor iteration cap").changed() {
                     if self.use_neighbor_cap {
-                        self.use_ms = false;
+                        self.use_mariani_silver = false;
                         self.use_perturbation = false;
-                        self.use_sa = false;
+                        self.use_series_approx = false;
                     }
                     self.needs_render = true;
                 }

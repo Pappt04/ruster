@@ -96,7 +96,7 @@ struct Args {
     center:             Option<[f64; 2]>,
     julia_c:            [f64; 2],
     perturbation:       bool,
-    use_sa:             bool,
+    use_series_approx:             bool,
     compare_perturb:    bool,
     perturb_sweep:      bool,
     scaling:            bool,
@@ -143,7 +143,7 @@ impl Default for Args {
             center:          None,
             julia_c:         [-0.4, 0.6],
             perturbation:    false,
-            use_sa:          false,
+            use_series_approx:          false,
             compare_perturb: false,
             perturb_sweep:   false,
             scaling:         false,
@@ -225,7 +225,7 @@ fn parse_args() -> Args {
                 a.julia_c[1] = parts[1].trim().parse().unwrap();
             }
             "--perturbation"    => a.perturbation    = true,
-            "--sa"              => a.use_sa          = true,
+            "--sa"              => a.use_series_approx          = true,
             "--compare-perturb" => a.compare_perturb = true,
             "--perturb-sweep"   => a.perturb_sweep   = true,
             "--compare-bulb-reject" => a.compare_bulb_reject = true,
@@ -317,10 +317,10 @@ fn cpu_render(
     julia_c: [f64; 2],
     max_iter: u32,
     perturbation: bool,
-    use_sa: bool,
+    use_series_approx: bool,
     fastest: bool,
 ) -> Vec<f32> {
-    if perturbation && use_sa {
+    if perturbation && use_series_approx {
         render_perturbation_sa(vp, fractal, julia_c, max_iter)
     } else if perturbation {
         render_perturbation(vp, fractal, julia_c, max_iter)
@@ -634,7 +634,7 @@ fn run_first_paint(args: &Args) {
         let t0 = Instant::now();
         worker.request(RenderRequest {
             vp, fractal: FractalType::Mandelbrot, julia_c: [-0.4, 0.6], max_iter: args.max_iter,
-            scheme: ColorScheme::Inferno, use_ms: false, use_perturbation: false, use_sa: false,
+            scheme: ColorScheme::Inferno, use_mariani_silver: false, use_perturbation: false, use_series_approx: false,
             use_neighbor_cap: false, use_multiref: false, use_heterogeneous: false,
         });
 
@@ -768,19 +768,19 @@ fn time_cpu_render(
     max_iter: u32,
     runs: usize,
     perturbation: bool,
-    use_sa: bool,
+    use_series_approx: bool,
     fastest: bool,
 ) -> (Sample, Vec<f32>) {
     let pixels = (vp.width * vp.height) as u64;
 
-    let _ = cpu_render(vp, fractal, julia_c, max_iter, perturbation, use_sa, fastest);
+    let _ = cpu_render(vp, fractal, julia_c, max_iter, perturbation, use_series_approx, fastest);
 
     let mut times: Vec<Duration> = Vec::with_capacity(runs);
     let mut last_buf = Vec::new();
 
     for _ in 0..runs {
         let t = Instant::now();
-        last_buf = cpu_render(vp, fractal, julia_c, max_iter, perturbation, use_sa, fastest);
+        last_buf = cpu_render(vp, fractal, julia_c, max_iter, perturbation, use_series_approx, fastest);
         times.push(t.elapsed());
     }
 
@@ -791,7 +791,7 @@ fn time_cpu_render(
 
     times.sort();
     let med_s = times[runs / 2].as_secs_f64();
-    let backend = match (perturbation, use_sa) {
+    let backend = match (perturbation, use_series_approx) {
         (true,  true)  => "cpu+perturb+sa",
         (true,  false) => "cpu+perturb",
         (false, _)     => "cpu",
@@ -819,11 +819,11 @@ fn time_cpu_render(
 
 // ── CPU benchmarking ──────────────────────────────────────────────────────────
 
-fn bench_cpu(fractal: FractalType, vp: &Viewport, julia_c: [f64; 2], max_iter: u32, runs: usize, perturbation: bool, use_sa: bool) -> Sample {
+fn bench_cpu(fractal: FractalType, vp: &Viewport, julia_c: [f64; 2], max_iter: u32, runs: usize, perturbation: bool, use_series_approx: bool) -> Sample {
     // fastest=true: this is the main --backend cpu throughput measurement, so
     // it should reflect what the live app actually renders (SIMD when the
     // `simd` feature is enabled — the default), not an artificially-scalar path.
-    time_cpu_render(vp, fractal, julia_c, max_iter, runs, perturbation, use_sa, true).0
+    time_cpu_render(vp, fractal, julia_c, max_iter, runs, perturbation, use_series_approx, true).0
 }
 
 /// Same measurement as `time_cpu_render`, but selects `render()` (row-major)
@@ -1160,7 +1160,7 @@ fn init_wgpu() -> Option<(wgpu::Device, wgpu::Queue)> {
 
 fn bench_wgpu(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize) -> Option<Sample> {
     use novafractal::gpu::wgpu::fractal_compute::FractalCompute;
-    use novafractal::gpu::wgpu::unifroms::Uniforms;
+    use novafractal::gpu::wgpu::uniforms::Uniforms;
 
     let (device, queue) = init_wgpu()?;
     let compute = FractalCompute::new(&device, vp.width, vp.height);
@@ -1236,7 +1236,7 @@ fn fractal_to_u32(f: FractalType) -> u32 {
 
 fn bench_hybrid(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize) -> Option<Sample> {
     use novafractal::gpu::wgpu::fractal_compute::FractalCompute;
-    use novafractal::gpu::wgpu::unifroms::Uniforms;
+    use novafractal::gpu::wgpu::uniforms::Uniforms;
 
     let (device, queue) = init_wgpu()?;
 
@@ -1418,7 +1418,7 @@ fn main() {
         eprintln!("  runs       : {}", args.runs);
         eprintln!("  backend    : {:?}", args.backend);
         if args.perturbation {
-            eprintln!("  mode       : {}", if args.use_sa { "perturbation+SA" } else { "perturbation" });
+            eprintln!("  mode       : {}", if args.use_series_approx { "perturbation+SA" } else { "perturbation" });
         }
         eprintln!("  rayon cpus : {}", rayon::current_num_threads());
         if !args.perturb_sweep && !args.compare_perturb {
@@ -1548,9 +1548,9 @@ fn main() {
     if args.tile_check {
         for &fractal in &args.fractals {
             let julia_c = [-0.4f64, 0.6];
-            let a = render(&vp, fractal, julia_c, args.max_iter);
-            let b = render_tiled(&vp, fractal, julia_c, args.max_iter);
-            let (max_diff, mean_diff, above) = pixel_diff_stats(&a, &b);
+            let scalar_buf = render(&vp, fractal, julia_c, args.max_iter);
+            let tiled_buf = render_tiled(&vp, fractal, julia_c, args.max_iter);
+            let (max_diff, mean_diff, above) = pixel_diff_stats(&scalar_buf, &tiled_buf);
             if args.json {
                 println!("{{\"fractal\":\"{}\",\"max_diff\":{max_diff},\"mean_diff\":{mean_diff},\"above_0_01\":{above}}}", fractal.name());
             } else {
@@ -1624,7 +1624,7 @@ fn main() {
             for &fractal in &args.fractals {
                 let fvp = fractal_vp(fractal);
                 let mut s = pool.install(|| {
-                    bench_cpu(fractal, &fvp, args.julia_c, args.max_iter, args.runs, args.perturbation, args.use_sa)
+                    bench_cpu(fractal, &fvp, args.julia_c, args.max_iter, args.runs, args.perturbation, args.use_series_approx)
                 });
                 s.threads = t;
                 samples.push(s);
@@ -1639,7 +1639,7 @@ fn main() {
                         samples.push(bench_cpu_traversal(fractal, &fvp, args.max_iter, args.runs, args.traversal));
                     } else {
                         samples.push(bench_cpu(
-                            fractal, &fvp, args.julia_c, args.max_iter, args.runs, args.perturbation, args.use_sa,
+                            fractal, &fvp, args.julia_c, args.max_iter, args.runs, args.perturbation, args.use_series_approx,
                         ));
                     }
                 }

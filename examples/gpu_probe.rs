@@ -7,7 +7,7 @@
 
 use novafractal::fractal::{pixel_grid, FractalType};
 use novafractal::gpu::wgpu::fractal_compute::FractalCompute;
-use novafractal::gpu::wgpu::unifroms::Uniforms;
+use novafractal::gpu::wgpu::uniforms::Uniforms;
 use novafractal::gui::viewport::Viewport;
 use std::time::Instant;
 

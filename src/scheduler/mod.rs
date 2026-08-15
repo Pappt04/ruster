@@ -9,7 +9,7 @@ use crate::fractal::{pixel_grid, render_cpu_tile_into, IterBuf, F32_PRECISION_TH
 use crate::fractal::fractal_type::FractalType;
 use crate::gpu::cuda::CudaFractal;
 use crate::gpu::wgpu::fractal_compute::FractalCompute;
-use crate::gpu::wgpu::unifroms::Uniforms;
+use crate::gpu::wgpu::uniforms::Uniforms;
 use crate::gui::viewport::Viewport;
 use controller::ThresholdController;
 

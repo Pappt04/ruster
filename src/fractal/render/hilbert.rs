@@ -6,7 +6,7 @@ use rayon::prelude::*;
 pub const TILE: usize = 64;
 const ORDER: u32 = 6;
 
-pub fn d2xy(d: usize) -> (u32, u32) {
+pub fn hilbert_d_to_xy(d: usize) -> (u32, u32) {
     let mut rx: u32;
     let mut ry: u32;
     let mut t = d as u32;
@@ -33,7 +33,7 @@ pub fn d2xy(d: usize) -> (u32, u32) {
 }
 
 pub fn tile_order() -> Vec<(u32, u32)> {
-    (0..TILE * TILE).map(d2xy).collect()
+    (0..TILE * TILE).map(hilbert_d_to_xy).collect()
 }
 
 pub fn render_tiled(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {

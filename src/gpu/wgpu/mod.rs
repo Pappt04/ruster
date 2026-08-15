@@ -1,2 +1,2 @@
 pub mod fractal_compute;
-pub mod unifroms;
+pub mod uniforms;

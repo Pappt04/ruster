@@ -146,17 +146,17 @@ fn main() {
     ];
     for &(label, center, zoom) in views {
         let vp = Viewport { center, zoom, width: W, height: H };
-        let a = render("f64bulb_fmadfalse", &vp);
-        let b = render("stock_fmadfalse", &vp);
+        let bulb_variant = render("f64bulb_fmadfalse", &vp);
+        let stock_variant = render("stock_fmadfalse", &vp);
         let mut diff = 0usize;
         let mut maxd = 0.0f32;
-        for (x, y) in a.iter().zip(b.iter()) {
+        for (x, y) in bulb_variant.iter().zip(stock_variant.iter()) {
             if x != y {
                 diff += 1;
                 maxd = maxd.max((x - y).abs());
             }
         }
-        let total = a.len();
+        let total = bulb_variant.len();
         println!("  {label:<28} {diff:>10} {total:>10} {:>11.5}% {maxd:>10.2}",
                  diff as f64 / total as f64 * 100.0);
     }

@@ -18,9 +18,9 @@ struct CacheKey {
     fractal: FractalType,
     julia_c_bits: [u64; 2],
     max_iter: u32,
-    use_ms: bool,
+    use_mariani_silver: bool,
     use_perturbation: bool,
-    use_sa: bool,
+    use_series_approx: bool,
     use_neighbor_cap: bool,
     use_multiref: bool,
 }
@@ -33,9 +33,9 @@ impl CacheKey {
             fractal: req.fractal,
             julia_c_bits: [req.julia_c[0].to_bits(), req.julia_c[1].to_bits()],
             max_iter: req.max_iter,
-            use_ms: req.use_ms,
+            use_mariani_silver: req.use_mariani_silver,
             use_perturbation: req.use_perturbation,
-            use_sa: req.use_sa,
+            use_series_approx: req.use_series_approx,
             use_neighbor_cap: req.use_neighbor_cap,
             use_multiref: req.use_multiref,
         }
@@ -45,9 +45,9 @@ impl CacheKey {
         self.fractal == other.fractal
             && self.julia_c_bits == other.julia_c_bits
             && self.max_iter == other.max_iter
-            && !self.use_ms && !other.use_ms
+            && !self.use_mariani_silver && !other.use_mariani_silver
             && !self.use_perturbation && !other.use_perturbation
-            && !self.use_sa && !other.use_sa
+            && !self.use_series_approx && !other.use_series_approx
             && !self.use_neighbor_cap && !other.use_neighbor_cap
     }
 }
@@ -71,9 +71,9 @@ pub struct RenderRequest {
     pub julia_c: [f64; 2],
     pub max_iter: u32,
     pub scheme: ColorScheme,
-    pub use_ms: bool,
+    pub use_mariani_silver: bool,
     pub use_perturbation: bool,
-    pub use_sa: bool,
+    pub use_series_approx: bool,
     pub use_neighbor_cap: bool,
     pub use_multiref: bool,
     pub use_heterogeneous: bool,
@@ -105,7 +105,7 @@ impl RenderWorker {
             #[cfg(feature = "cuda")]
             {
                 use crate::gpu::cuda::CudaFractal;
-                use crate::fractal::perturbation::perturburation_theory::{compute_reference_orbit, compute_reference_orbit_f128, F128_ZOOM_THRESHOLD};
+                use crate::fractal::perturbation::perturbation_theory::{compute_reference_orbit, compute_reference_orbit_f128, F128_ZOOM_THRESHOLD};
                 use crate::fractal::fractal_type::FractalType;
                 use crate::gui::color::lut_bytes;
                 use crate::scheduler::{self, controller::ThresholdController, SchedulerConfig};
@@ -179,7 +179,7 @@ impl RenderWorker {
                 use crate::fractal::fractal::{render as cpu_render, render_neighbor_capped};
                 use crate::fractal::render::mariani_silver::render_mariani_silver;
                 use crate::fractal::render::pan::shift_and_fill;
-                use crate::fractal::perturbation::perturburation_theory::{render_perturbation, render_perturbation_sa, render_perturbation_multiref};
+                use crate::fractal::perturbation::perturbation_theory::{render_perturbation, render_perturbation_sa, render_perturbation_multiref};
                 #[cfg(feature = "simd")]
                 use crate::fractal::fractal::F32_PRECISION_THRESHOLD;
                 #[cfg(feature = "simd")]
@@ -190,13 +190,13 @@ impl RenderWorker {
                 let mut cache = FrameCache::new();
 
                 let compute_buf = |req: &RenderRequest, target_vp: &Viewport| -> IterBuf {
-                    if req.use_perturbation && req.use_sa {
+                    if req.use_perturbation && req.use_series_approx {
                         render_perturbation_sa(target_vp, req.fractal, req.julia_c, req.max_iter)
                     } else if req.use_perturbation && req.use_multiref {
                         render_perturbation_multiref(target_vp, req.fractal, req.julia_c, req.max_iter)
                     } else if req.use_perturbation {
                         render_perturbation(target_vp, req.fractal, req.julia_c, req.max_iter)
-                    } else if req.use_ms {
+                    } else if req.use_mariani_silver {
                         render_mariani_silver(target_vp, req.fractal, req.julia_c, req.max_iter)
                     } else if req.use_neighbor_cap {
                         render_neighbor_capped(target_vp, req.fractal, req.julia_c, req.max_iter, NEIGHBOR_CAP_SLACK)
