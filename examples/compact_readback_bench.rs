@@ -1,19 +1,27 @@
-//! Benchmarks the heterogeneous scheduler's compact-buffer readback
-//! (`CudaFractal::dispatch_tiled_compact` + `readback_compact`) against the
-//! full-frame readback (`dispatch_tiled` + `readback_into`) it replaced.
+//! Benchmarks the D2H copy alone: `CudaFractal::dispatch_tiled_compact` +
+//! `readback_compact` (compact buffer, sized to dispatched pixels only)
+//! against `dispatch_tiled` + `readback_into` (full-frame).
 //!
 //! This is the follow-up to `windowed_readback_bench.rs`'s finding (see git
 //! history): a row-banded readback window couldn't shrink the transfer
 //! because `classifier::partition_frame`'s GPU-tagged cells at the frame's
 //! own top/bottom edges pin the band to full frame height regardless of how
 //! little of the frame is actually GPU work. The compact buffer sidesteps
-//! that entirely — tiles are written back-to-back in dispatch order instead
-//! of at their frame position, so the readback is sized to the dispatched
-//! pixel count no matter how those pixels are scattered across the frame.
+//! that — tiles are written back-to-back in dispatch order instead of at
+//! their frame position, so the readback *itself* is sized to the dispatched
+//! pixel count. And indeed this file shows that D2H copy getting smaller.
 //!
-//! For each zoom level this reports the real GPU tile fraction the
-//! classifier produces, then times a full-frame readback against a compact
-//! readback of just those pixels, at the same dispatched tile set.
+//! **But this is not the whole picture, and reading only this file will give
+//! the wrong conclusion.** A compact readback still has to be placed back
+//! into a full-resolution frame buffer — unlike a direct `readback_into`,
+//! which DMAs straight into the caller's buffer. That placement is a
+//! mandatory host-side scatter this file does not measure. Once it's
+//! included (`examples/readback_scatter_ab.rs`), the smaller copy shown here
+//! is *not* a net win: the scatter costs more than the copy saves at every
+//! GPU-tile fraction tested, so `crate::scheduler` does not use the compact
+//! path. Read that file for the real end-to-end number; this one exists only
+//! to show which piece of the cost the compact buffer does and doesn't
+//! address.
 //!
 //! Run: cargo run --release --features cuda --example compact_readback_bench
 

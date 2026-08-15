@@ -429,22 +429,39 @@ impl CudaFractal {
     /// — doubling that cost would regress exactly the fixed-cost problem the
     /// scheduler rewrite exists to fix.
     ///
-    /// `readback`/`readback_into` still copy the *entire* frame regardless of
-    /// how many tiles were actually dispatched, which was measured as *the*
-    /// reason the heterogeneous scheduler couldn't beat plain GPU rendering
-    /// on this machine — at 1920x1080 the full-frame copy is 1.33 ms against
-    /// a ~0.28 ms kernel, ~82% of the frame as fixed cost shifting tiles to
-    /// the CPU does nothing to reduce (results/summary.md §3). A row-banded
-    /// readback window doesn't fix it either: GPU-classified cells at the
-    /// frame's own top/bottom edges pin the band to full height in practice
-    /// (measured against this classifier). The actual fix is
-    /// `dispatch_tiled_compact`/
-    /// `dispatch_tiled_f32_compact` below, which write tiles contiguously
-    /// into a compact buffer instead of at their frame position, so
-    /// `readback_compact` only ever pays for pixels actually dispatched.
-    /// `dispatch_tiled`/`dispatch_tiled_f32` (and `render_tiled`) are kept for
-    /// any caller that wants the simpler full-frame-position contract (e.g. a
-    /// one-shot single-tile render where compaction buys nothing).
+    /// `readback`/`readback_into` copy the *entire* frame regardless of how
+    /// many tiles were actually dispatched. That ~82%-of-frame fixed cost is
+    /// real for `render`'s plain full-frame path (results/summary.md §3,
+    /// 1.33 ms copy against a ~0.28 ms f64 Morton kernel) — but it is *not*
+    /// the bottleneck here: `crate::scheduler`'s tiled dispatch uses the f32
+    /// kernel (`SchedulerConfig::gpu_tiles_f32`, on by default), where a
+    /// full-frame D2H copy at 1080p only costs ~1.6-1.7 ms total including
+    /// the kernel, not 82% of it.
+    ///
+    /// Two fixes for the *general* "copy only what was dispatched" problem
+    /// were tried here and both measured as net losses for this specific
+    /// tiled-f32 case, so `crate::scheduler` deliberately keeps using a plain
+    /// `dispatch_tiled`/`readback_into` pair:
+    /// - A row-banded readback window: doesn't even get the chance to help,
+    ///   because GPU-classified cells at the frame's own top/bottom edges pin
+    ///   the band to full height regardless of the real CPU-tile fraction.
+    /// - `dispatch_tiled_compact`/`dispatch_tiled_f32_compact` below (write
+    ///   tiles contiguously into a compact buffer instead of at their frame
+    ///   position, so `readback_compact` only pays for dispatched pixels):
+    ///   the smaller D2H copy is real, but placing compacted tiles back into
+    ///   a full-frame buffer needs a host-side scatter that a direct DMA into
+    ///   `out` never needed — measured 30-69% *slower* end-to-end across
+    ///   85-100% GPU-tile fractions, even with the scatter parallelized over
+    ///   rayon (`examples/readback_scatter_ab.rs`). Worst at 100% GPU, where
+    ///   there is nothing to save and the scatter is pure added cost.
+    ///
+    /// Kept as available primitives (correct, and the underlying premise —
+    /// PCIe scales with bytes copied — isn't wrong, just outweighed by the
+    /// scatter here) rather than deleted, in case a future caller has a
+    /// shape where the scatter is cheap relative to what it saves — e.g. one
+    /// or two large contiguous tiles rather than the ~100-250 small ones this
+    /// classifier produces. Recorded here so this isn't "optimized" back into
+    /// the scheduler without re-reading this.
     /// Uploads `[x0,y0,w,h]` tile descriptors and computes the launch grid
     /// shared by `dispatch_tiled`/`dispatch_tiled_f32`. Returns `None` if
     /// `tiles` is empty (nothing to launch).
