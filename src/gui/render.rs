@@ -112,9 +112,16 @@ impl RenderWorker {
                 use crate::gpu::cuda::CudaFractal;
                 use crate::fractal::fractal::{compute_reference_orbit, compute_reference_orbit_f128, F128_ZOOM_THRESHOLD};
                 use crate::fractal::fractal_type::FractalType;
+                use crate::gui::color::lut_bytes;
                 use crate::scheduler::{self, controller::ThresholdController, SchedulerConfig};
                 let mut compute: Option<CudaFractal> = None;
                 let mut cached_size = (0u32, 0u32);
+                // Reused across frames for the two GPU-colorize paths below —
+                // same `_into`-buffer-reuse rationale as `compute` itself,
+                // a fresh `Vec<u8>`
+                // every frame would just re-pay the allocation this whole
+                // path exists to avoid.
+                let mut rgba_scratch: Vec<u8> = Vec::new();
                 // Initial value is a starting guess for the new normalized
                 // corner-spread threshold (~[0,1]) — see
                 // scheduler::controller's doc comment; pending re-tuning via
@@ -140,33 +147,52 @@ impl RenderWorker {
                     let im_step  = half * 2.0          / vp.height as f64;
                     let cuda     = compute.as_mut().unwrap();
 
-                    let buf = if req.use_perturbation && req.fractal == FractalType::Mandelbrot {
-                        let orbit = if vp.zoom > F128_ZOOM_THRESHOLD {
-                            compute_reference_orbit_f128(vp.center[0], vp.center[1], req.max_iter)
-                        } else {
-                            compute_reference_orbit(vp.center[0], vp.center[1], req.max_iter)
-                        };
-                        cuda.render_perturbation(
-                            &orbit,
-                            re_start, im_start, re_step, im_step,
-                            req.max_iter,
-                        )
-                    } else if req.use_heterogeneous {
-                        scheduler::render_heterogeneous(
+                    // The heterogeneous scheduler's `self.output` never holds the
+                    // *entire* frame (CPU-computed tiles never touch the GPU at
+                    // all), so it can't feed `colorize_into` — global histogram
+                    // equalization needs every pixel, and the merged buffer only
+                    // ever exists host-side. Both other paths render the whole
+                    // frame on the GPU, so they colorize there too: skips the
+                    // escape-value D2H copy entirely and moves the histogram/
+                    // CDF/LUT work `colorize` below would otherwise run on the
+                    // CPU onto the GPU (see `CudaFractal::colorize_into`).
+                    let image = if req.use_heterogeneous {
+                        let buf = scheduler::render_heterogeneous(
                             vp, req.fractal, req.julia_c, req.max_iter,
                             cuda, &mut het_controller, &scheduler_cfg,
-                        ).buf
+                        ).buf;
+                        let pixels = colorize(&buf, req.max_iter, req.scheme);
+                        ColorImage::new([sz.0 as usize, sz.1 as usize], pixels)
                     } else {
-                        cuda.render(
-                            re_start, im_start, re_step, im_step,
-                            req.julia_c[0], req.julia_c[1],
-                            req.max_iter,
-                            req.fractal.as_u32(),
-                        )
-                    };
+                        let n = (sz.0 * sz.1) as usize * 4;
+                        if rgba_scratch.len() < n { rgba_scratch.resize(n, 0); }
+                        let rgba = &mut rgba_scratch[..n];
+                        let scheme_id = req.scheme.palette_index() as u8;
+                        let lut = lut_bytes(req.scheme);
 
-                    let pixels = colorize(&buf, req.max_iter, req.scheme);
-                    let image  = ColorImage::new([sz.0 as usize, sz.1 as usize], pixels);
+                        if req.use_perturbation && req.fractal == FractalType::Mandelbrot {
+                            let orbit = if vp.zoom > F128_ZOOM_THRESHOLD {
+                                compute_reference_orbit_f128(vp.center[0], vp.center[1], req.max_iter)
+                            } else {
+                                compute_reference_orbit(vp.center[0], vp.center[1], req.max_iter)
+                            };
+                            cuda.render_perturbation_and_colorize(
+                                &orbit,
+                                re_start, im_start, re_step, im_step,
+                                req.max_iter,
+                                scheme_id, lut, rgba,
+                            );
+                        } else {
+                            cuda.render_and_colorize(
+                                re_start, im_start, re_step, im_step,
+                                req.julia_c[0], req.julia_c[1],
+                                req.max_iter,
+                                req.fractal.as_u32(),
+                                scheme_id, lut, rgba,
+                            );
+                        }
+                        ColorImage::from_rgba_unmultiplied([sz.0 as usize, sz.1 as usize], rgba)
+                    };
                     // CUDA path is CPU-cache-free and single-pass for now (progressive
                     // refinement is CPU-only in this iteration — see CURSOR_OPTIMIZATIONS.md 3c).
                     if img_tx.send(RenderResult { image, quality: Quality::Final }).is_err() { break; }

@@ -12,6 +12,24 @@ static PALETTES: LazyLock<[[Color32; LUT_SIZE]; N_SCHEMES]> = LazyLock::new(|| {
     })
 });
 
+/// Flat RGBA8 bytes (`LUT_SIZE * 4` per scheme) of [`PALETTES`] — the same
+/// values `colorize` looks up on the CPU, laid out for `CudaFractal::colorize_into`
+/// to upload once and index identically on the GPU. Built lazily from
+/// `PALETTES` itself rather than duplicating the sampling, so the two never
+/// drift: whatever `colorize` would draw for a given scheme is exactly what
+/// `colorize_into` draws for it too.
+#[cfg(feature = "cuda")]
+static PALETTE_BYTES: LazyLock<[Vec<u8>; N_SCHEMES]> = LazyLock::new(|| {
+    std::array::from_fn(|i| PALETTES[i].iter().flat_map(|c| c.to_array()).collect())
+});
+
+/// GPU-side LUT bytes for `scheme` — see [`PALETTE_BYTES`]. Pair with
+/// `scheme.palette_index() as u8` as `CudaFractal::colorize_into`'s cache key.
+#[cfg(feature = "cuda")]
+pub fn lut_bytes(scheme: ColorScheme) -> &'static [u8] {
+    &PALETTE_BYTES[scheme.palette_index()]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum ColorScheme {
     #[default]
@@ -40,7 +58,7 @@ impl ColorScheme {
         }
     }
 
-    const fn palette_index(self) -> usize {
+    pub const fn palette_index(self) -> usize {
         match self {
             Self::Inferno   => 0,
             Self::Ocean     => 1,

@@ -508,3 +508,177 @@ void fractal_kernel_tiled_f32(
 
     buf[y * full_width + x] = v;
 }
+
+// ── Compact tiled kernels — PCIe-frugal variant of the two kernels above ────
+//
+// `fractal_kernel_tiled`/`_f32` scatter each tile straight into its
+// row-major position in a *full-frame* buffer, so reading the result back
+// (`CudaFractal::readback[_into]`) has to copy the whole frame even when
+// the heterogeneous scheduler routed most of it to the CPU — measured as
+// ~82% of a CUDA frame's total cost and the reason the scheduler can lose
+// to plain GPU rendering (see `dispatch_tiled`'s doc comment,
+// `results/summary.md` §3). A row-banded readback window doesn't fix it
+// either — `SchedulerConfig::windowed_readback`'s doc comment records that
+// GPU-classified cells at the frame's own top/bottom edges pin the band to
+// the full height in practice.
+//
+// These variants write each tile *contiguously*, back-to-back in dispatch
+// order, into a compact buffer sized only for the pixels actually
+// dispatched — `tile_descs` carries a 5th `uint32` per tile (the
+// destination's cumulative pixel offset, a host-side prefix sum over
+// `tw*th`) instead of relying on the tile's absolute frame position. The
+// caller (`CudaFractal::dispatch_tiled_compact`) then does exactly one
+// contiguous `dtoh_sync_copy_into` sized to the dispatched pixel count —
+// never the full frame — and scatters each tile from that host-side
+// compact buffer into the frame, the same way the scheduler already
+// scatters CPU tiles. tile_descs layout: [x0, y0, w, h, offset] (5 ×
+// uint32 per entry).
+extern "C" __global__ __launch_bounds__(256, 2)
+void fractal_kernel_tiled_compact(
+    float* __restrict__          buf,
+    const uint32_t* __restrict__ tile_descs,
+    double   re_start,
+    double   im_start,
+    double   re_step,
+    double   im_step,
+    double   julia_cr,
+    double   julia_ci,
+    uint32_t max_iter,
+    uint32_t fractal
+) {
+    uint32_t tile_idx = blockIdx.z;
+    uint32_t tx0    = tile_descs[tile_idx * 5u + 0u];
+    uint32_t ty0    = tile_descs[tile_idx * 5u + 1u];
+    uint32_t tw     = tile_descs[tile_idx * 5u + 2u];
+    uint32_t th     = tile_descs[tile_idx * 5u + 3u];
+    uint32_t offset = tile_descs[tile_idx * 5u + 4u];
+
+    uint32_t lx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t ly = blockIdx.y * blockDim.y + threadIdx.y;
+    if (lx >= tw || ly >= th) return;
+
+    double re = re_start + (double)(tx0 + lx) * re_step;
+    double im = im_start + (double)(ty0 + ly) * im_step;
+
+    float v;
+    switch (fractal) {
+        case 0: v = mandelbrot(re, im, max_iter); break;
+        case 1: v = julia(re, im, julia_cr, julia_ci, max_iter); break;
+        case 2: v = newton(re, im, max_iter); break;
+        default: v = nova(re, im, max_iter); break;
+    }
+
+    buf[offset + ly * tw + lx] = v;
+}
+
+// f32 counterpart of `fractal_kernel_tiled_compact` (Mandelbrot/Julia only) —
+// same relationship to `fractal_kernel_tiled_f32` that the f64 compact
+// kernel above has to `fractal_kernel_tiled`.
+extern "C" __global__ __launch_bounds__(256, 2)
+void fractal_kernel_tiled_f32_compact(
+    float* __restrict__          buf,
+    const uint32_t* __restrict__ tile_descs,
+    float    re_start,
+    float    im_start,
+    float    re_step,
+    float    im_step,
+    float    julia_cr,
+    float    julia_ci,
+    uint32_t max_iter,
+    uint32_t fractal
+) {
+    uint32_t tile_idx = blockIdx.z;
+    uint32_t tx0    = tile_descs[tile_idx * 5u + 0u];
+    uint32_t ty0    = tile_descs[tile_idx * 5u + 1u];
+    uint32_t tw     = tile_descs[tile_idx * 5u + 2u];
+    uint32_t th     = tile_descs[tile_idx * 5u + 3u];
+    uint32_t offset = tile_descs[tile_idx * 5u + 4u];
+
+    uint32_t lx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t ly = blockIdx.y * blockDim.y + threadIdx.y;
+    if (lx >= tw || ly >= th) return;
+
+    float re = re_start + (float)(tx0 + lx) * re_step;
+    float im = im_start + (float)(ty0 + ly) * im_step;
+
+    float v = (fractal == 0)
+        ? mandelbrot_f32(re, im, max_iter)
+        : julia_f32(re, im, julia_cr, julia_ci, max_iter);
+
+    buf[offset + ly * tw + lx] = v;
+}
+
+// ── GPU colorization (histogram equalization + palette LUT) ─────────────────
+//
+// Mirrors `gui/color.rs::colorize()`'s algorithm exactly (bin-by-floor
+// histogram over escaped pixels, cumulative-sum equalization, linear-
+// interpolated LUT lookup) so a full-frame escape-time buffer that is
+// already entirely GPU-resident (`CudaFractal::render`/`render_perturbation`)
+// never has to make a round trip to the CPU just to be turned into pixels —
+// see `CudaFractal::colorize_into`. Only valid when the *whole* frame's
+// escape values live in `buf`; the heterogeneous scheduler's CPU tiles are
+// never written here, so this pair of kernels is not used on that path (its
+// PCIe cost is a separate, already-identified problem — see
+// `CudaFractal::dispatch_tiled_compact`).
+//
+// Two passes because histogram equalization is a genuinely global
+// operation — every pixel's color depends on the distribution of every
+// other pixel's escape value, so the CDF must be complete before any pixel
+// can be colorized. `hist_kernel` builds per-bin escape counts with a plain
+// `atomicAdd` (bin count is `max_iter+1`, nowhere near large enough to make
+// contention a real cost against a frame-sized launch); the CDF itself is
+// then a `bins`-sized sequential prefix sum, cheap enough on the host that
+// it isn't worth a scan kernel (`bins` is orders of magnitude smaller than
+// `width*height`, so the two small histogram/CDF transfers this needs cost
+// far less than one more full-frame trip would).
+extern "C" __global__
+void hist_kernel(
+    const float* __restrict__ buf,
+    uint32_t* __restrict__    hist,
+    uint32_t                  n,
+    uint32_t                  max_iter
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = buf[i];
+    if (v < (float)max_iter) {
+        uint32_t bin = (uint32_t)floorf(v);
+        if (bin > max_iter) bin = max_iter;
+        atomicAdd(&hist[bin], 1u);
+    }
+}
+
+// `lut`/`out` are flat RGBA8 byte arrays (4 bytes/entry) rather than a
+// vector type — keeps the Rust side a plain `CudaSlice<u8>` with no
+// alignment/layout assumptions about `uchar4` to get right on both ends.
+extern "C" __global__
+void colorize_kernel(
+    const float* __restrict__          buf,
+    const float* __restrict__          cdf,
+    const unsigned char* __restrict__  lut,
+    unsigned char* __restrict__        out,
+    uint32_t                           n,
+    uint32_t                           max_iter,
+    uint32_t                           lut_size
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uint32_t o = i * 4u;
+    float v = buf[i];
+    if (v >= (float)max_iter) {
+        out[o + 0] = 0; out[o + 1] = 0; out[o + 2] = 0; out[o + 3] = 255;
+        return;
+    }
+    float    frac = v - floorf(v);
+    uint32_t lo   = (uint32_t)floorf(v);
+    uint32_t hi   = lo + 1u;
+    if (hi > max_iter) hi = max_iter;
+    float t = cdf[lo] + frac * (cdf[hi] - cdf[lo]);
+    uint32_t idx = (uint32_t)(t * (float)(lut_size - 1u));
+    if (idx >= lut_size) idx = lut_size - 1u;
+    uint32_t li = idx * 4u;
+    out[o + 0] = lut[li + 0];
+    out[o + 1] = lut[li + 1];
+    out[o + 2] = lut[li + 2];
+    out[o + 3] = lut[li + 3];
+}

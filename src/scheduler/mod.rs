@@ -220,14 +220,30 @@ pub fn render_heterogeneous_into(
     let use_gpu_f32 = cfg.gpu_tiles_f32
         && matches!(fractal, FractalType::Mandelbrot | FractalType::Julia)
         && zoom < F32_PRECISION_THRESHOLD;
-    let dispatch = |cuda: &mut CudaFractal, batch: &[[u32; 4]]| {
+    // Tags each tile with its cumulative pixel offset into the GPU's compact
+    // output buffer (`CudaFractal::dispatch_tiled_compact`) — computed once
+    // here so the same offsets used to place a tile on the GPU are reused,
+    // unchanged, to scatter it back out of the compact readback below. This
+    // is what lets the readback copy only the pixels the GPU actually
+    // computed this frame instead of the whole frame regardless of how much
+    // of it CPU claimed — see that method's doc comment for why a row-banded
+    // window (the previously-tried fix here) doesn't achieve the same thing.
+    fn with_offsets(tiles: &[[u32; 4]], mut offset: u32) -> (Vec<[u32; 5]>, u32) {
+        let mut tagged = Vec::with_capacity(tiles.len());
+        for &[x0, y0, tw, th] in tiles {
+            tagged.push([x0, y0, tw, th, offset]);
+            offset += tw * th;
+        }
+        (tagged, offset)
+    }
+    let dispatch_compact = |cuda: &mut CudaFractal, batch: &[[u32; 5]]| {
         if use_gpu_f32 {
-            cuda.dispatch_tiled_f32(
+            cuda.dispatch_tiled_f32_compact(
                 batch, pg.re_start, pg.im_start, pg.re_step, pg.im_step,
                 julia_c[0], julia_c[1], max_iter, fractal.as_u32(),
             );
         } else {
-            cuda.dispatch_tiled(
+            cuda.dispatch_tiled_compact(
                 batch, pg.re_start, pg.im_start, pg.re_step, pg.im_step,
                 julia_c[0], julia_c[1], max_iter, fractal.as_u32(),
             );
@@ -315,28 +331,53 @@ pub fn render_heterogeneous_into(
         // claimed from `steal_queue` if it's a big enough leftover to justify
         // a second launch. ---
         let gpu_t0 = std::time::Instant::now();
-        dispatch(cuda, &gpu_committed);
+        let (committed_tagged, mut gpu_offset) = with_offsets(&gpu_committed, 0);
+        dispatch_compact(cuda, &committed_tagged);
+        let mut all_gpu_tiles = committed_tagged;
 
         let leftover_len = steal_queue.lock().unwrap().len();
         let mut gpu_steal_dispatched = false;
         if leftover_len as u32 >= cfg.min_steal_tiles {
             let leftover: Vec<[u32; 4]> = std::mem::take(&mut *steal_queue.lock().unwrap()).into_iter().collect();
             if !leftover.is_empty() {
-                dispatch(cuda, &leftover);
+                let (leftover_tagged, new_offset) = with_offsets(&leftover, gpu_offset);
+                dispatch_compact(cuda, &leftover_tagged);
+                gpu_offset = new_offset;
+                all_gpu_tiles.extend_from_slice(&leftover_tagged);
                 gpu_steal_dispatched = true;
             }
         }
 
-        let gpu_did_anything = !gpu_committed.is_empty() || gpu_steal_dispatched;
         // If GPU had nothing to do at all this frame (every tile ended up
-        // CPU-side), don't read back — `self.output` would be stale from a
-        // previous frame/viewport, and every pixel gets overwritten by the
-        // CPU merge below regardless.
-        // DMA straight into the caller's frame buffer. When that buffer is a
-        // `PinnedBuf` the driver can write into it directly instead of staging
-        // through its own bounce buffer — on a readback-bound frame (~82% of a
-        // CUDA frame, §2) that is the cheapest win available.
-        if gpu_did_anything { cuda.readback_into(out); } else { out.fill(0.0); }
+        // CPU-side), don't read back — there's nothing on the GPU to fetch,
+        // and every pixel gets filled by the CPU merge below regardless.
+        // Otherwise, copy back exactly `gpu_offset` pixels — the compact
+        // buffer holds precisely what was dispatched this frame, tile by
+        // tile in the order `all_gpu_tiles` records, so one contiguous
+        // transfer sized to that (never the full frame) followed by a
+        // per-tile scatter reproduces the same full-resolution image the old
+        // full-frame `readback_into` did, at the cost of only the pixels the
+        // GPU actually computed. This is the fix for the ~82%-of-frame fixed
+        // readback cost documented on `CudaFractal::dispatch_tiled`/
+        // `dispatch_tiled_compact` — a row-banded window (tried and measured
+        // before this) couldn't get under that cost because the classifier's
+        // GPU-tagged edge cells pin such a window to the full frame height
+        // regardless of how much of the frame CPU actually claimed; scatter
+        // avoids that because each tile is placed independently of the
+        // others, so it doesn't matter that they're scattered across the
+        // full frame extent.
+        if !all_gpu_tiles.is_empty() {
+            let compact = cuda.readback_compact(gpu_offset);
+            for &[x0, y0, tw, th, offset] in &all_gpu_tiles {
+                for row in 0..th {
+                    let dst = ((y0 + row) * w + x0) as usize;
+                    let src = (offset + row * tw) as usize;
+                    out[dst..dst + tw as usize].copy_from_slice(&compact[src..src + tw as usize]);
+                }
+            }
+        } else {
+            out.fill(0.0);
+        }
         let gpu_ms = gpu_t0.elapsed().as_secs_f32() * 1000.0;
 
         (gpu_ms, gpu_steal_dispatched)
