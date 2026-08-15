@@ -105,7 +105,7 @@ impl RenderWorker {
             #[cfg(feature = "cuda")]
             {
                 use crate::gpu::cuda::CudaFractal;
-                use crate::fractal::perturburation_theory::{compute_reference_orbit, compute_reference_orbit_f128, F128_ZOOM_THRESHOLD};
+                use crate::fractal::perturbation::perturburation_theory::{compute_reference_orbit, compute_reference_orbit_f128, F128_ZOOM_THRESHOLD};
                 use crate::fractal::fractal_type::FractalType;
                 use crate::gui::color::lut_bytes;
                 use crate::scheduler::{self, controller::ThresholdController, SchedulerConfig};
@@ -177,13 +177,13 @@ impl RenderWorker {
             #[cfg(not(feature = "cuda"))]
             {
                 use crate::fractal::fractal::{render as cpu_render, render_neighbor_capped};
-                use crate::fractal::mariani_silver::render_mariani_silver;
-                use crate::fractal::pan::shift_and_fill;
-                use crate::fractal::perturburation_theory::{render_perturbation, render_perturbation_sa, render_perturbation_multiref};
+                use crate::fractal::render::mariani_silver::render_mariani_silver;
+                use crate::fractal::render::pan::shift_and_fill;
+                use crate::fractal::perturbation::perturburation_theory::{render_perturbation, render_perturbation_sa, render_perturbation_multiref};
                 #[cfg(feature = "simd")]
                 use crate::fractal::fractal::F32_PRECISION_THRESHOLD;
                 #[cfg(feature = "simd")]
-                use crate::fractal::simd::{render_simd, render_simd_f32, render_simd_f32_ilp};
+                use crate::fractal::render::simd::{render_simd, render_simd_f32, render_simd_f32_ilp};
                 #[cfg(feature = "simd")]
                 use crate::fractal::fractal_type::FractalType;
 

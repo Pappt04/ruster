@@ -1,7 +1,7 @@
 use crate::fractal::fractal::{pixel_grid, IterBuf};
 use crate::fractal::fractal_type::FractalType;
-use crate::fractal::julia::{julia, julia_x4, julia_x8};
-use crate::fractal::mandelbrot::{mandelbrot, mandelbrot_x4, mandelbrot_x8, mandelbrot_x8x2};
+use crate::fractal::kernels::julia::{julia, julia_x4, julia_x8};
+use crate::fractal::kernels::mandelbrot::{mandelbrot, mandelbrot_x4, mandelbrot_x8, mandelbrot_x8x2};
 use crate::gui::viewport::Viewport;
 use rayon::prelude::*;
 

@@ -1,5 +1,5 @@
 use crate::fractal::fractal::{render, pixel_grid, IterBuf, ESCAPE_RADIUS_SQ, ESCAPE_RADIUS_SQ_F32, smooth_iter, smooth_iter_f32};
-use crate::fractal::bulb_precheck::{bulb_precheck_x4, bulb_precheck_x8, in_cardioid_or_period2, in_period3_bulb};
+use crate::fractal::kernels::bulb_precheck::{bulb_precheck_x4, bulb_precheck_x8, in_cardioid_or_period2, in_period3_bulb};
 use crate::fractal::fractal_type::FractalType;
 use crate::gui::viewport::Viewport;
 use rayon::prelude::*;

@@ -1,13 +1,8 @@
 #include <math.h>
 #include <stdint.h>
 
-// Must match src/fractal/fractal.rs's ESCAPE_RADIUS_SQ exactly (bailout
-// radius 2, radius² = 4) — anything else breaks the CPU/GPU bit-for-bit
-// agreement the heterogeneous scheduler depends on, and costs every
-// escaping pixel a few wasted iterations.
 #define ESCAPE_SQ 4.0
 
-// Precomputed 1/ln(2) — avoids repeated log(2.0) calls in smooth_iter.
 __device__ static const double INV_LN2 = 1.4426950408889634;
 
 __device__ double smooth_iter(uint32_t i, double zn_sq) {
@@ -16,10 +11,6 @@ __device__ double smooth_iter(uint32_t i, double zn_sq) {
     return (double)i + 1.0 - nu;
 }
 
-// Center (nucleus) and squared radius of the two largest period-3 bulbs
-// attached to the main cardioid. Must match src/fractal/fractal.rs's
-// PERIOD3_CENTER_RE/IM/PERIOD3_RADIUS_SQ bit-for-bit (same decimal literals)
-// so both backends classify exactly the same points as "interior".
 #define PERIOD3_CENTER_RE (-0.1225611668766536)
 #define PERIOD3_CENTER_IM (0.7448617666197442)
 #define PERIOD3_RADIUS_SQ (0.07371484375 * 0.07371484375)
@@ -32,9 +23,6 @@ __device__ __forceinline__ bool in_period3_bulb(double cr, double ci) {
         || (dr * dr + di_neg * di_neg < PERIOD3_RADIUS_SQ);
 }
 
-// f32 counterpart, for `mandelbrot_f32`. Ampere GeForce runs fp64 at 1/64 the
-// fp32 rate, so calling the double version above from an otherwise-f32 kernel
-// cost HALF that kernel's total runtime — see the note at its call site.
 __device__ __forceinline__ bool in_period3_bulb_f32(float cr, float ci) {
     float dr     = cr - (float)PERIOD3_CENTER_RE;
     float di_pos = ci - (float)PERIOD3_CENTER_IM;
@@ -43,15 +31,6 @@ __device__ __forceinline__ bool in_period3_bulb_f32(float cr, float ci) {
         || (dr * dr + di_neg * di_neg < (float)PERIOD3_RADIUS_SQ);
 }
 
-// Mirrors src/fractal/fractal.rs's `mandelbrot()` exactly, including the
-// "z0=c" fast path (skips the trivial z0=0 -> z1=c step and manually unrolls
-// z1 -> z2). This isn't just a performance match: the period-detection
-// reference orbit (zr_b/zi_b) only starts accumulating once the main loop
-// begins, so starting that loop at a different iteration index than the CPU
-// changes *which* orbit point convergence gets checked against — a pixel
-// exactly on the edge of a periodic cycle can come out "converged" on one
-// backend and "escapes 400 iterations later" on the other. Keeping the loop
-// structure identical keeps the two backends in bit-for-bit agreement.
 __device__ float mandelbrot(double cr, double ci, uint32_t max_iter) {
     double q = (cr - 0.25) * (cr - 0.25) + ci * ci;
     if (q * (q + cr - 0.25) < 0.25 * ci * ci) return (float)max_iter;
@@ -60,7 +39,6 @@ __device__ float mandelbrot(double cr, double ci, uint32_t max_iter) {
 
     double zr = cr, zi = ci;
     if (max_iter <= 1) return (float)max_iter;
-    // iter 1: z = c² + c
     double zr2 = zr * zr;
     double zi2 = zi * zi;
     zi = 2.0 * zr * zi + ci;
@@ -113,18 +91,6 @@ __device__ float julia(double zr0, double zi0, double cr, double ci, uint32_t ma
     return (float)max_iter;
 }
 
-// ── f32 fast path (Mandelbrot / Julia only) ──────────────────────────────────
-//
-// RTX-class consumer GPUs run fp64 at a small fraction of their fp32 rate
-// (Ampere GeForce: 1/64), so the double-precision kernel above — needed for
-// bit-exact agreement with the CPU's f64 path at deep zoom, and reused by the
-// heterogeneous scheduler's tiled dispatch — is dramatically slower than it
-// needs to be at shallow zoom, where f32 has plenty of precision. This mirrors
-// `mandelbrot_x8`/`julia_x8` in fractal.rs (the CPU's own f32 SIMD fast path):
-// same bulb pre-check, same "no period-detection in f32" trade-off, same
-// escape radius. `CudaFractal::render()` picks this kernel only for
-// Mandelbrot/Julia below `F32_PRECISION_THRESHOLD`, exactly mirroring
-// `cpu_render_fastest`'s dispatch — Newton/Nova stay on the f64 kernel above.
 #define ESCAPE_SQ_F32 4.0f
 
 __device__ float smooth_iter_f32(uint32_t i, float zn_sq, uint32_t max_iter) {
@@ -139,29 +105,10 @@ __device__ float mandelbrot_f32(float cr, float ci, uint32_t max_iter) {
     float q = (cr - 0.25f) * (cr - 0.25f) + ci * ci;
     if (q * (q + cr - 0.25f) < 0.25f * ci * ci) return (float)max_iter;
     if ((cr + 1.0f) * (cr + 1.0f) + ci * ci < 0.0625f) return (float)max_iter;
-    // This check used to call the fp64 `in_period3_bulb`, with a comment
-    // claiming that was cheap "because it runs once per pixel, not per
-    // iteration". True on a CPU, false on this GPU: Ampere GeForce runs fp64 at
-    // 1/64 the fp32 rate, so those 8 fp64 ops (PTX census) cost about as much
-    // issue bandwidth as the entire 1000-iteration f32 loop below.
-    //
-    // Ablation (examples/ptx_variants.rs, 1920x1080, zoom 1, kernel only):
-    //     with the fp64 check ................... 0.911 ms
-    //     with this f32 check ................... 0.452 ms   (-50.4%)
-    // Absolute times drift with the laptop GPU's clock state; the ratio is
-    // measured within one process and reproduces exactly, so trust the ratio.
-    //
-    // Verified bit-identical, not just "close": zero differing pixels out of
-    // 2,073,600 on all seven viewports ptx_variants.rs checks, including three
-    // centred ON the period-3 boundary arc at zooms 1e2/1e4/1e6 (1e6 being
-    // F32_PRECISION_THRESHOLD, the deepest zoom this kernel is ever used at).
-    // `cr`/`ci` arrive already rounded to f32, so widening them for the
-    // comparison adds no information the predicate can act on.
     if (in_period3_bulb_f32(cr, ci)) return (float)max_iter;
 
     float zr = cr, zi = ci;
     if (max_iter <= 1) return (float)max_iter;
-    // iter 1: z = c² + c (same fast-start as the f64 kernel).
     float zr2 = zr * zr;
     float zi2 = zi * zi;
     zi = 2.0f * zr * zi + ci;
@@ -228,15 +175,6 @@ __device__ float nova(double cr, double ci, uint32_t max_iter) {
     return (float)max_iter;
 }
 
-// ── Morton (Z-order) curve helpers ───────────────────────────────────────────
-//
-// Interleave the lower 16 bits of x and y into a 32-bit Morton code so that
-// spatially adjacent pixels have adjacent Morton indices — improving L2/L1
-// cache locality when adjacent warp threads write nearby output addresses.
-//
-// Bit pattern: y15 x15 y14 x14 … y1 x1 y0 x0
-
-// Spread: insert a zero bit after each of the 16 input bits.
 __device__ __forceinline__ uint32_t spread_bits(uint32_t x) {
     x &= 0x0000FFFFu;
     x = (x | (x << 8u)) & 0x00FF00FFu;
@@ -246,7 +184,6 @@ __device__ __forceinline__ uint32_t spread_bits(uint32_t x) {
     return x;
 }
 
-// Compact: inverse of spread_bits (extract every other bit).
 __device__ __forceinline__ uint32_t compact_bits(uint32_t x) {
     x &= 0x55555555u;
     x = (x | (x >> 1u)) & 0x33333333u;
@@ -265,11 +202,6 @@ __device__ __forceinline__ void morton_decode(uint32_t code, uint32_t *x, uint32
     *y = compact_bits(code >> 1u);
 }
 
-// ── Perturbation-theory kernel ────────────────────────────────────────────────
-//
-// orbit_re / orbit_im hold orbit_len+1 entries of the reference orbit Z_0..Z_{orbit_len}.
-// Each thread iterates ε_{n+1} = 2·Z_n·ε_n + ε_n² + δ and checks escape on
-// z_{n+1} = Z_{n+1} + ε_{n+1}.  Glitched pixels fall back to the scalar kernel.
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_perturb_kernel(
     float* __restrict__         buf,
@@ -331,12 +263,6 @@ void fractal_perturb_kernel(
     }
 }
 
-// ── Main fractal kernel — Z-order (Morton) dispatch ───────────────────────────
-//
-// Launched with a 1D grid of 256-thread blocks (16×16).  Each block handles
-// 256 consecutive Morton codes so that threads in a warp read from nearby input
-// coordinates and write to nearby output addresses, improving L2 hit rate.
-// The output buffer remains in row-major order — only the traversal order changes.
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_kernel(
     float* __restrict__ buf,
@@ -351,7 +277,6 @@ void fractal_kernel(
     uint32_t width,
     uint32_t height
 ) {
-    // Map the flat 1D thread index to a pixel via Morton decode.
     uint32_t morton_idx = (uint32_t)blockIdx.x * 256u
                         + (uint32_t)threadIdx.y * 16u
                         + (uint32_t)threadIdx.x;
@@ -371,16 +296,9 @@ void fractal_kernel(
         default: v = nova(re, im, max_iter); break;
     }
 
-    // Write in row-major order — CPU reads linearly.
     buf[y * width + x] = v;
 }
 
-// ── f32 fast-path kernel (Mandelbrot / Julia, shallow zoom only) ─────────────
-//
-// Same Morton dispatch as `fractal_kernel`, but the whole per-pixel coordinate
-// + iteration loop runs in f32. `CudaFractal::render()` only ever launches
-// this for fractal ids 0/1 below `F32_PRECISION_THRESHOLD`; Newton/Nova and
-// deep-zoom Mandelbrot/Julia stay on `fractal_kernel` above.
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_kernel_f32(
     float* __restrict__ buf,
@@ -413,12 +331,6 @@ void fractal_kernel_f32(
     buf[y * width + x] = v;
 }
 
-// ── Tiled kernel — for the heterogeneous scheduler (Stage 3) ─────────────────
-//
-// Each thread block handles one sub-region (tile) of the full image.
-// blockIdx.z selects the tile from the descriptor array.
-// tile_descs layout: [x0, y0, w, h] per tile (4 × uint32 per entry).
-// Launch with grid_dim = (ceil(max_tile_w/16), ceil(max_tile_h/16), num_tiles).
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_kernel_tiled(
     float* __restrict__          buf,
@@ -460,18 +372,6 @@ void fractal_kernel_tiled(
     buf[y * full_width + x] = v;
 }
 
-// ── f32 tiled kernel (Mandelbrot / Julia only) — heterogeneous scheduler ────
-//
-// Same tile-descriptor dispatch as `fractal_kernel_tiled`, but using the f32
-// math from `mandelbrot_f32`/`julia_f32` (see the f32 fast-path section
-// above). `fractal_kernel_tiled` always ran f64 — fine for Newton/Nova (no
-// f32 path exists for them anywhere in this codebase) but, for Mandelbrot/
-// Julia, left the scheduler's GPU tiles paying the same fp64 tax on this
-// GPU tier that `CudaFractal::render()`'s plain (non-tiled) path already
-// avoids via `fractal_kernel_f32`. `CudaFractal::dispatch_tiled_f32` only
-// ever launches this for fractal ids 0/1 below `F32_PRECISION_THRESHOLD`,
-// gated by `SchedulerConfig::gpu_tiles_f32` (default off, same
-// bit-exactness-vs-speed tradeoff as `simd_cpu_tiles` on the CPU side).
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_kernel_tiled_f32(
     float* __restrict__          buf,
@@ -509,30 +409,6 @@ void fractal_kernel_tiled_f32(
     buf[y * full_width + x] = v;
 }
 
-// ── Compact tiled kernels — PCIe-frugal variant of the two kernels above ────
-//
-// `fractal_kernel_tiled`/`_f32` scatter each tile straight into its
-// row-major position in a *full-frame* buffer, so reading the result back
-// (`CudaFractal::readback[_into]`) has to copy the whole frame even when
-// the heterogeneous scheduler routed most of it to the CPU — measured as
-// ~82% of a CUDA frame's total cost and the reason the scheduler can lose
-// to plain GPU rendering (see `dispatch_tiled`'s doc comment,
-// `results/summary.md` §3). A row-banded readback window doesn't fix it
-// either — `SchedulerConfig::windowed_readback`'s doc comment records that
-// GPU-classified cells at the frame's own top/bottom edges pin the band to
-// the full height in practice.
-//
-// These variants write each tile *contiguously*, back-to-back in dispatch
-// order, into a compact buffer sized only for the pixels actually
-// dispatched — `tile_descs` carries a 5th `uint32` per tile (the
-// destination's cumulative pixel offset, a host-side prefix sum over
-// `tw*th`) instead of relying on the tile's absolute frame position. The
-// caller (`CudaFractal::dispatch_tiled_compact`) then does exactly one
-// contiguous `dtoh_sync_copy_into` sized to the dispatched pixel count —
-// never the full frame — and scatters each tile from that host-side
-// compact buffer into the frame, the same way the scheduler already
-// scatters CPU tiles. tile_descs layout: [x0, y0, w, h, offset] (5 ×
-// uint32 per entry).
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_kernel_tiled_compact(
     float* __restrict__          buf,
@@ -571,9 +447,6 @@ void fractal_kernel_tiled_compact(
     buf[offset + ly * tw + lx] = v;
 }
 
-// f32 counterpart of `fractal_kernel_tiled_compact` (Mandelbrot/Julia only) —
-// same relationship to `fractal_kernel_tiled_f32` that the f64 compact
-// kernel above has to `fractal_kernel_tiled`.
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_kernel_tiled_f32_compact(
     float* __restrict__          buf,
@@ -608,29 +481,6 @@ void fractal_kernel_tiled_f32_compact(
     buf[offset + ly * tw + lx] = v;
 }
 
-// ── GPU colorization (histogram equalization + palette LUT) ─────────────────
-//
-// Mirrors `gui/color.rs::colorize()`'s algorithm exactly (bin-by-floor
-// histogram over escaped pixels, cumulative-sum equalization, linear-
-// interpolated LUT lookup) so a full-frame escape-time buffer that is
-// already entirely GPU-resident (`CudaFractal::render`/`render_perturbation`)
-// never has to make a round trip to the CPU just to be turned into pixels —
-// see `CudaFractal::colorize_into`. Only valid when the *whole* frame's
-// escape values live in `buf`; the heterogeneous scheduler's CPU tiles are
-// never written here, so this pair of kernels is not used on that path (its
-// PCIe cost is a separate, already-identified problem — see
-// `CudaFractal::dispatch_tiled_compact`).
-//
-// Two passes because histogram equalization is a genuinely global
-// operation — every pixel's color depends on the distribution of every
-// other pixel's escape value, so the CDF must be complete before any pixel
-// can be colorized. `hist_kernel` builds per-bin escape counts with a plain
-// `atomicAdd` (bin count is `max_iter+1`, nowhere near large enough to make
-// contention a real cost against a frame-sized launch); the CDF itself is
-// then a `bins`-sized sequential prefix sum, cheap enough on the host that
-// it isn't worth a scan kernel (`bins` is orders of magnitude smaller than
-// `width*height`, so the two small histogram/CDF transfers this needs cost
-// far less than one more full-frame trip would).
 extern "C" __global__
 void hist_kernel(
     const float* __restrict__ buf,
@@ -648,9 +498,6 @@ void hist_kernel(
     }
 }
 
-// `lut`/`out` are flat RGBA8 byte arrays (4 bytes/entry) rather than a
-// vector type — keeps the Rust side a plain `CudaSlice<u8>` with no
-// alignment/layout assumptions about `uchar4` to get right on both ends.
 extern "C" __global__
 void colorize_kernel(
     const float* __restrict__          buf,

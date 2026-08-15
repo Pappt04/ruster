@@ -1,6 +1,6 @@
 use crate::fractal::fractal::{compute, pixel_grid, IterBuf, PixelGrid};
 use crate::fractal::fractal_type::FractalType;
-use crate::fractal::mandelbrot::mandelbrot_dem;
+use crate::fractal::kernels::mandelbrot::mandelbrot_dem;
 use crate::gui::viewport::Viewport;
 
 const MS_MIN: usize = 2;

@@ -1,6 +1,6 @@
 use crate::fractal::fractal::{render, pixel_grid, IterBuf, ESCAPE_RADIUS_SQ, smooth_iter};
-use crate::fractal::mandelbrot::mandelbrot;
-use crate::fractal::double_double::DoubleDouble;
+use crate::fractal::kernels::mandelbrot::mandelbrot;
+use crate::fractal::perturbation::double_double::DoubleDouble;
 use crate::fractal::fractal_type::FractalType;
 use crate::gui::viewport::Viewport;
 use rayon::prelude::*;

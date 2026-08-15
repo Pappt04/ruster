@@ -110,10 +110,8 @@ impl FractalCompute {
         }
     }
 
-    /// Full-res dimensions this instance was constructed with.
     pub fn width(&self) -> u32 { self.width }
 
-    /// Full-res dimensions this instance was constructed with.
     pub fn height(&self) -> u32 { self.height }
 
     pub fn render(&self, device: &wgpu::Device, queue: &wgpu::Queue, uniforms: Uniforms) -> Vec<f32> {
@@ -162,14 +160,6 @@ impl FractalCompute {
         self.dispatch_and_readback(device, queue, &self.perturb_pipeline, &bg)
     }
 
-    /// Launches `main_tiled` over `tiles` — dispatch only, no readback (mirrors
-    /// `CudaFractal::dispatch_tiled`, split from readback for the same reason:
-    /// a caller doing work-stealing may need to dispatch more than once per
-    /// frame before reading anything back). No-op if `tiles` is empty.
-    ///
-    /// `uniforms.width`/`uniforms.height` must be the FULL frame dimensions
-    /// (used for the output buffer's row stride), not any single tile's —
-    /// same convention as the CUDA tiled kernel.
     pub fn dispatch_tiled(
         &self,
         device: &wgpu::Device,
@@ -201,9 +191,6 @@ impl FractalCompute {
             ],
         });
 
-        // Grid must be large enough to cover the widest/tallest tile; bounds
-        // checks inside the shader discard threads beyond the actual tile
-        // extent — same approach as `fractal_kernel_tiled`'s CUDA grid sizing.
         let max_tw = tiles.iter().map(|t| t[2]).max().unwrap_or(1);
         let max_th = tiles.iter().map(|t| t[3]).max().unwrap_or(1);
 
@@ -219,8 +206,6 @@ impl FractalCompute {
         queue.submit(std::iter::once(enc.finish()));
     }
 
-    /// Copies the persistent full-frame output buffer back to the host. Call
-    /// once per frame, after all of that frame's `dispatch_tiled` calls.
     pub fn readback(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         enc.copy_buffer_to_buffer(
@@ -275,7 +260,6 @@ impl FractalCompute {
     }
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
 
 fn bgl_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {

@@ -1,8 +1,8 @@
 use crate::fractal::fractal_type::FractalType;
-use crate::fractal::mandelbrot::mandelbrot;
-use crate::fractal::julia::julia;
-use crate::fractal::newton::newton;
-use crate::fractal::nova::nova;
+use crate::fractal::kernels::mandelbrot::mandelbrot;
+use crate::fractal::kernels::julia::julia;
+use crate::fractal::kernels::newton::newton;
+use crate::fractal::kernels::nova::nova;
 use crate::gui::viewport::Viewport;
 use rayon::prelude::*;
 

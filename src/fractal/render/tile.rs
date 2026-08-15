@@ -1,7 +1,7 @@
 use crate::fractal::fractal::{compute, PixelGrid, F32_PRECISION_THRESHOLD};
 use crate::fractal::fractal_type::FractalType;
-use crate::fractal::julia::{julia, julia_x8};
-use crate::fractal::mandelbrot::{mandelbrot, mandelbrot_x8};
+use crate::fractal::kernels::julia::{julia, julia_x8};
+use crate::fractal::kernels::mandelbrot::{mandelbrot, mandelbrot_x8};
 
 pub fn render_tile_exact(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32, tile: [u32; 4]) -> Vec<f32> {
     let [_, _, tw, th] = tile;

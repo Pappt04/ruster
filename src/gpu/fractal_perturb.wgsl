@@ -1,16 +1,3 @@
-// Perturbation-theory Mandelbrot shader.
-//
-// The CPU pre-computes a reference orbit Z_0..Z_N at the viewport center and
-// uploads it as two storage buffers (orbit_re, orbit_im).  Each thread only
-// iterates the small perturbation ε around that orbit, so most pixels finish
-// in far fewer steps at high zoom.
-//
-// Recurrence:  ε_{n+1} = 2·Z_n·ε_n + ε_n² + δ   (δ = pixel_c − ref_c)
-// Full value:  z_{n+1} = Z_{n+1} + ε_{n+1}
-//
-// Glitch recovery: when |ε|² > 1e-6·|Z|² the linear approximation breaks
-// down; we fall back to the scalar Mandelbrot kernel for that pixel.
-
 struct Uniforms {
     re_start  : f32,
     im_start  : f32,
@@ -29,9 +16,8 @@ struct Uniforms {
 @group(0) @binding(2) var<storage, read>       orbit_re : array<f32>;
 @group(0) @binding(3) var<storage, read>       orbit_im : array<f32>;
 
-// Must match src/fractal/fractal.rs's ESCAPE_RADIUS_SQ (bailout radius 2).
 const ESCAPE_SQ  : f32 = 4.0;
-const GLITCH_SQ  : f32 = 1e-6;      // |ε|²/|Z|² threshold
+const GLITCH_SQ  : f32 = 1e-6;      
 
 fn smooth_iter(i: u32, zn_sq: f32) -> f32 {
     let log_zn = log(zn_sq) * 0.5;
@@ -39,7 +25,6 @@ fn smooth_iter(i: u32, zn_sq: f32) -> f32 {
     return f32(i) + 1.0 - nu;
 }
 
-// Plain scalar fallback used for glitched / early-escaped pixels.
 fn mandelbrot_scalar(cr: f32, ci: f32) -> f32 {
     let q = (cr - 0.25) * (cr - 0.25) + ci * ci;
     if q * (q + cr - 0.25) < 0.25 * ci * ci { return f32(uni.max_iter); }
@@ -69,13 +54,11 @@ fn mandelbrot_perturb(re: f32, im: f32) -> f32 {
         let zr = orbit_re[n];
         let zi = orbit_im[n];
 
-        // ε_{n+1} = 2·Z_n·ε_n + ε_n² + δ
         let new_er = 2.0 * zr * er - 2.0 * zi * ei + er * er - ei * ei + dc_re;
         let new_ei = 2.0 * zr * ei + 2.0 * zi * er + 2.0 * er * ei     + dc_im;
         er = new_er;
         ei = new_ei;
 
-        // z_{n+1} = Z_{n+1} + ε_{n+1}
         let zr1   = orbit_re[n + 1u];
         let zi1   = orbit_im[n + 1u];
         let az    = zr1 + er;
@@ -86,14 +69,12 @@ fn mandelbrot_perturb(re: f32, im: f32) -> f32 {
             return smooth_iter(n + 1u, zn_sq);
         }
 
-        // Glitch: ε grew too large relative to Z — fall back to scalar.
         let ref_sq = zr1 * zr1 + zi1 * zi1;
         if er * er + ei * ei > ref_sq * GLITCH_SQ {
             return mandelbrot_scalar(re, im);
         }
     }
 
-    // Reference orbit escaped before max_iter — fall back to scalar.
     if uni.orbit_len < uni.max_iter {
         return mandelbrot_scalar(re, im);
     }

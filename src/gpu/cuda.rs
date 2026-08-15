@@ -2,7 +2,7 @@ use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DeviceSlice, LaunchAsy
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
 use crate::fractal::fractal::F32_PRECISION_THRESHOLD;
-use crate::fractal::perturburation_theory::RefOrbit;
+use crate::fractal::perturbation::perturburation_theory::RefOrbit;
 
 pub struct PinnedBuf {
     buf: Vec<f32>,
