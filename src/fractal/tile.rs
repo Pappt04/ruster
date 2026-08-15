@@ -67,7 +67,6 @@ pub fn render_tile_exact_simd_into(
             lx += 8;
         }
 
-        // scalar tail (0-7 remaining columns)
         let im_f64 = pg.im_start + y as f64 * pg.im_step;
         while lx < tw {
             let x = x0 + lx;
@@ -82,12 +81,6 @@ pub fn render_tile_exact_simd_into(
     }
 }
 
-/// Dispatches a CPU tile render to the SIMD fast path
-/// (`render_tile_exact_simd`, Mandelbrot/Julia below `F32_PRECISION_THRESHOLD`,
-/// when `use_simd` is set) or the exact scalar path (`render_tile_exact`)
-/// otherwise. `use_simd` is `SchedulerConfig::simd_cpu_tiles` gated at the
-/// call site — see `render_tile_exact_simd`'s doc comment for why this isn't
-/// unconditional.
 pub fn render_cpu_tile(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32, tile: [u32; 4], use_simd: bool, zoom: f64) -> Vec<f32> {
     let [_, _, tw, th] = tile;
     let mut out = vec![0.0f32; (tw * th) as usize];
@@ -95,11 +88,7 @@ pub fn render_cpu_tile(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], 
     out
 }
 
-/// `render_cpu_tile` writing into a caller-owned `out` instead of allocating.
-/// This is what the heterogeneous scheduler calls; see `render_tile_exact_into`.
-///
-/// # Panics
-/// If `out.len() != tw * th`.
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_cpu_tile_into(
     pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32,

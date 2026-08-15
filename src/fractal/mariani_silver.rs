@@ -3,11 +3,8 @@ use crate::fractal::fractal_type::FractalType;
 use crate::fractal::mandelbrot::mandelbrot_dem;
 use crate::gui::viewport::Viewport;
 
-/// Minimum side length at which we stop subdividing and compute all pixels directly.
 const MS_MIN: usize = 2;
 
-/// Mariani-Silver rectangle subdivision: compute only border pixels and fill
-/// uniform interiors without evaluating every point individually.
 pub fn render_mariani_silver(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
     let w = vp.width as usize;
     let h = vp.height as usize;
@@ -33,7 +30,6 @@ fn ms_fill(
     let w = x1 - x0;
     let h = y1 - y0;
 
-    // Base case: too small to subdivide further — compute every pixel.
     if w <= MS_MIN || h <= MS_MIN {
         for y in y0..y1 {
             let im = im_start + y as f64 * im_step;
@@ -47,8 +43,6 @@ fn ms_fill(
         return;
     }
 
-    // Compute uncomputed border pixels.
-    // Top row
     {
         let im = im_start + y0 as f64 * im_step;
         for x in x0..x1 {
@@ -58,7 +52,6 @@ fn ms_fill(
             }
         }
     }
-    // Bottom row
     {
         let im = im_start + (y1 - 1) as f64 * im_step;
         for x in x0..x1 {
@@ -68,7 +61,6 @@ fn ms_fill(
             }
         }
     }
-    // Left column (interior rows only)
     {
         let re = re_start + x0 as f64 * re_step;
         for y in (y0 + 1)..(y1 - 1) {
@@ -78,7 +70,6 @@ fn ms_fill(
             }
         }
     }
-    // Right column (interior rows only)
     {
         let re = re_start + (x1 - 1) as f64 * re_step;
         for y in (y0 + 1)..(y1 - 1) {
@@ -89,7 +80,6 @@ fn ms_fill(
         }
     }
 
-    // Check whether all border pixels share the same value.
     let border_val = buf[y0 * stride + x0];
     let uniform = 'check: {
         for x in x0..x1 {
@@ -104,14 +94,12 @@ fn ms_fill(
     };
 
     if uniform {
-        // Flood-fill the interior.
         for y in (y0 + 1)..(y1 - 1) {
             for x in (x0 + 1)..(x1 - 1) {
                 buf[y * stride + x] = border_val;
             }
         }
     } else {
-        // Subdivide along the longer axis (non-overlapping halves).
         if w >= h {
             let mid = x0 + w / 2;
             ms_fill(buf, stride, fractal, julia_c, max_iter, re_start, im_start, re_step, im_step, x0, y0, mid, y1);
@@ -154,7 +142,6 @@ fn ms_fill_dem(
         return;
     }
 
-    // DEM corner cull, tried before computing the full border. Corner coords:
     let cs = [(x0, y0), (x1 - 1, y0), (x0, y1 - 1), (x1 - 1, y1 - 1)];
     let diag = ((w as f64 * pg.re_step).powi(2) + (h as f64 * pg.im_step).powi(2)).sqrt();
     let mut vals = [0.0f32; 4];
@@ -167,7 +154,6 @@ fn ms_fill_dem(
             break;
         }
     }
-    // Secondary guard: corner smooth values must agree closely, or interpolation bands.
     if culled {
         let vmin = vals.iter().cloned().fold(f32::INFINITY, f32::min);
         let vmax = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -188,10 +174,6 @@ fn ms_fill_dem(
         return;
     }
 
-    // Fall back to the exact MS logic for this rect, recursing through the DEM
-    // variant: compute border, uniform-fill or subdivide.
-    // (Reuses ms_fill for border+uniform by delegating one level when small.)
-    // Compute border pixels.
     for x in x0..x1 {
         for &y in &[y0, y1 - 1] {
             let idx = y * stride + x;

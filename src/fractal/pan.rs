@@ -20,7 +20,6 @@ pub fn shift_and_fill(
     let pg = pixel_grid(vp);
 
     if dy != 0 {
-        // Vertical pan: shift whole rows (each row is a contiguous w-element chunk).
         if dy > 0 {
             let dy = dy as usize;
             buf.copy_within(0..(h - dy) * w, dy * w);
@@ -41,7 +40,6 @@ pub fn shift_and_fill(
                 }
             });
     } else if dx != 0 {
-        // Horizontal pan: shift within each row.
         let (shift_dst, shift_src_len, fill_x0, fill_x1) = if dx > 0 {
             (dx as usize, w - dx as usize, 0usize, dx as usize)
         } else {

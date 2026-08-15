@@ -17,8 +17,6 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-// Single-binary headless mode for `perf stat` / `perf record`.
-// Renders 1920×1080 Mandelbrot 6 times (1 warm-up, 5 timed) and prints timing.
 fn headless_bench() {
     use novafractal::fractal::{render, FractalType};
     use novafractal::gui::viewport::Viewport;
@@ -29,7 +27,7 @@ fn headless_bench() {
     const RUNS: usize = 5;
 
     let vp = Viewport { center: [-0.5, 0.0], zoom: 1.0, width: W, height: H };
-    let _ = render(&vp, FractalType::Mandelbrot, [0.0, 0.0], MAX_ITER); // warm-up
+    let _ = render(&vp, FractalType::Mandelbrot, [0.0, 0.0], MAX_ITER); 
 
     let mut times = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {

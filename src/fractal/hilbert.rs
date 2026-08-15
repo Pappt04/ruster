@@ -1,17 +1,11 @@
-//! Hilbert-curve pixel ordering for cache-friendly tile traversal (2b in
-//! CURSOR_OPTIMIZATIONS.md). Standard bit-rotation algorithm.
-
 use crate::fractal::fractal::{compute, pixel_grid, IterBuf};
 use crate::fractal::fractal_type::FractalType;
 use crate::gui::viewport::Viewport;
 use rayon::prelude::*;
 
-/// Side length of one traversal tile: 2^6 = 64.
 pub const TILE: usize = 64;
 const ORDER: u32 = 6;
 
-/// Converts a Hilbert-curve distance `d` (0..4^order) to (x,y) within a
-/// 2^order × 2^order square.
 pub fn d2xy(d: usize) -> (u32, u32) {
     let mut rx: u32;
     let mut ry: u32;
@@ -38,16 +32,10 @@ pub fn d2xy(d: usize) -> (u32, u32) {
     (x, y)
 }
 
-/// Precomputed Hilbert traversal order for one TILE×TILE tile (4096 (x,y) pairs).
 pub fn tile_order() -> Vec<(u32, u32)> {
     (0..TILE * TILE).map(d2xy).collect()
 }
 
-/// Row-parallel render that traverses pixels within each 64×64 tile in Hilbert-curve
-/// order for better L1/L2 cache locality (2b in CURSOR_OPTIMIZATIONS.md). Bit-
-/// identical output to `render()` — only the write order differs. Parallelism grain
-/// is a disjoint band of up to `TILE` rows (via `par_chunks_mut`, the same idiom
-/// `render()` already uses), avoiding `unsafe` for finer per-tile dispatch.
 pub fn render_tiled(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
     let w = vp.width as usize;
     let h = vp.height as usize;

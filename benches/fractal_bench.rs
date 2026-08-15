@@ -435,6 +435,9 @@ fn bench_hybrid_cpu_wgpu(c: &mut Criterion) {
 // `bench_hybrid_cpu_wgpu` above is the OLD static top/bottom-half split, kept
 // for comparison; this is the adaptive replacement for the wgpu backend,
 // mirroring `bench_heterogeneous`'s CUDA version below.
+// `scheduler` itself is only compiled with the `cuda` feature (see src/lib.rs),
+// even though this particular benchmark drives the wgpu backend.
+#[cfg(feature = "cuda")]
 fn bench_heterogeneous_wgpu(c: &mut Criterion) {
     use novafractal::scheduler::{render_heterogeneous_wgpu, controller::ThresholdController, SchedulerConfig};
 
@@ -475,6 +478,10 @@ fn bench_heterogeneous_wgpu(c: &mut Criterion) {
     }
     group.finish();
 }
+
+// Stub when cuda feature is off — criterion_group! needs a consistent list.
+#[cfg(not(feature = "cuda"))]
+fn bench_heterogeneous_wgpu(c: &mut Criterion) { let _ = c; }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CUDA benchmarks  (only compiled and run with --features cuda)

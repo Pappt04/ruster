@@ -16,7 +16,7 @@ fn two_sum(a: f64, b: f64) -> DoubleDouble {
 #[inline]
 fn two_prod(a: f64, b: f64) -> DoubleDouble {
     let p = a * b;
-    DoubleDouble(p, a.mul_add(b, -p)) // FMA computes the rounding error exactly
+    DoubleDouble(p, a.mul_add(b, -p)) 
 }
 
 impl std::ops::Add for DoubleDouble {
@@ -50,7 +50,6 @@ impl std::ops::Mul<DoubleDouble> for f64 {
 impl PartialEq for DoubleDouble { fn eq(&self, o: &DoubleDouble) -> bool { self.0 == o.0 && self.1 == o.1 } }
 impl PartialOrd for DoubleDouble {
     fn partial_cmp(&self, o: &DoubleDouble) -> Option<std::cmp::Ordering> {
-        // hi parts determine order; lo breaks ties within the same ulp.
         match self.0.partial_cmp(&o.0) {
             Some(std::cmp::Ordering::Equal) => self.1.partial_cmp(&o.1),
             other => other,

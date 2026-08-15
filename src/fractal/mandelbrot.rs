@@ -123,11 +123,9 @@ pub(crate) fn mandelbrot_x8x2(
     let mut escape_zn1   = [0.0f32; 8];
 
     for i in 2..max_iter {
-        // batch 0
         let zr2_0   = zr0 * zr0;
         let zi2_0   = zi0 * zi0;
         let zn_sq_0 = zr2_0 + zi2_0;
-        // batch 1 (interleaved so the CPU can pipeline both chains)
         let zr2_1   = zr1 * zr1;
         let zi2_1   = zi1 * zi1;
         let zn_sq_1 = zr2_1 + zi2_1;
@@ -202,7 +200,6 @@ pub(crate) fn mandelbrot_x4(cr: wide::f64x4, ci: wide::f64x4, max_iter: u32) -> 
         return [max_iter as f32; 4];
     }
 
-    // Exclude already-classified in-set lanes from the SIMD loop.
     let mut active = f64x4::from([
         f64::from_bits(if in_set[0] { 0 } else { u64::MAX }),
         f64::from_bits(if in_set[1] { 0 } else { u64::MAX }),
@@ -259,7 +256,6 @@ pub fn mandelbrot_dem(cr: f64, ci: f64, max_iter: u32) -> (f32, f64) {
             let d = if dz_mag > 0.0 { z_mag * z_mag.ln() / dz_mag } else { 0.0 };
             return (smooth_iter(i, zn_sq, max_iter), d);
         }
-        // dz ← 2·z·dz + 1 (must use pre-update z)
         let new_dzr = 2.0 * (zr * dzr - zi * dzi) + 1.0;
         let new_dzi = 2.0 * (zr * dzi + zi * dzr);
         dzr = new_dzr;
@@ -279,7 +275,6 @@ pub(crate) fn mandelbrot(cr: f64, ci: f64, max_iter: u32) -> f32 {
     let mut zr = cr;
     let mut zi = ci;
     if max_iter <= 1 { return max_iter as f32; }
-    // iter 1: z = c² + c
     let zr2 = zr * zr;
     let zi2 = zi * zi;
     let new_zi = (2.0 * zr).mul_add(zi, ci);
@@ -337,13 +332,12 @@ pub fn mandelbrot_ide(cr: f64, ci: f64, max_iter: u32) -> f32 {
         if zn_sq > ESCAPE_RADIUS_SQ {
             return smooth_iter(i, zn_sq, max_iter);
         }
-        // der ← 2·z·der (pre-update z)
         let new_der_r = 2.0 * (zr * der_r - zi * der_i);
         let new_der_i = 2.0 * (zr * der_i + zi * der_r);
         der_r = new_der_r;
         der_i = new_der_i;
         if der_r * der_r + der_i * der_i < IDE_DER_SQ {
-            return max_iter as f32; // attracting cycle → interior
+            return max_iter as f32; 
         }
         zi = 2.0 * zr * zi + ci;
         zr = zr2 - zi2 + cr;

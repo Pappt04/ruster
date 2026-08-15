@@ -39,7 +39,6 @@ pub fn render_simd(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_i
             x += 4;
         }
 
-        // scalar tail (0–3 remaining pixels)
         for x in x..w {
             let re = pg.re_start + x as f64 * pg.re_step;
             row[x] = match fractal {
@@ -53,9 +52,6 @@ pub fn render_simd(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_i
     buf
 }
 
-/// 8-wide f32 SIMD path — 2× more pixels per instruction than f64x4.
-/// Coordinate values are computed in f64 then narrowed to f32 per lane so
-/// the initial pixel mapping stays accurate before the cast.
 pub fn render_simd_f32(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
     use wide::f32x8;
 
@@ -94,7 +90,6 @@ pub fn render_simd_f32(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], m
             x += 8;
         }
 
-        // scalar tail (0–7 remaining pixels)
         let im_f64 = pg.im_start + y as f64 * pg.im_step;
         for x in x..w {
             let re = pg.re_start + x as f64 * pg.re_step;
@@ -109,11 +104,6 @@ pub fn render_simd_f32(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], m
     buf
 }
 
-/// Like `render_simd_f32` but processes 16 pixels/iteration via two interleaved
-/// `f32x8` chains (`mandelbrot_x8x2`) to increase instruction-level parallelism.
-/// Mandelbrot only (falls back to the 8-wide kernel for Julia and for the 8-15
-/// pixel remainder, then scalar for the final <8 tail). Bit-identical output to
-/// `render_simd_f32` — see CURSOR_OPTIMIZATIONS.md 2a.
 pub fn render_simd_f32_ilp(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
     use wide::f32x8;
 
@@ -143,7 +133,6 @@ pub fn render_simd_f32_ilp(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2
             }
         }
 
-        // 8-15 remaining pixels: fall back to the single-batch 8-wide kernel
         while x + 8 <= w {
             let re = f32x8::from(std::array::from_fn::<f32, 8, _>(|k| {
                 (pg.re_start + (x + k) as f64 * pg.re_step) as f32
@@ -161,7 +150,6 @@ pub fn render_simd_f32_ilp(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2
             x += 8;
         }
 
-        // scalar tail (0-7 remaining pixels)
         let im_f64 = pg.im_start + y as f64 * pg.im_step;
         for x in x..w {
             let re = pg.re_start + x as f64 * pg.re_step;

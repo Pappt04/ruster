@@ -1,36 +1,29 @@
 use crate::gpu::unifroms::{PerturbUniforms, Uniforms};
 
-// Maximum orbit entries pre-allocated on the GPU.
-// Handles max_iter up to 8192 (orbit has max_iter+1 entries).
 const MAX_ORBIT: u64 = 8193;
 
 pub struct FractalCompute {
-    // ── standard pipeline ────────────────────────────────────────────────────
     pipeline:         wgpu::ComputePipeline,
     bgl:              wgpu::BindGroupLayout,
     uniform_buf:      wgpu::Buffer,
     output_buf:       wgpu::Buffer,
     readback_buf:     wgpu::Buffer,
-    // ── tiled pipeline (heterogeneous scheduler) ─────────────────────────────
     tiled_pipeline:   wgpu::ComputePipeline,
     tiled_bgl:        wgpu::BindGroupLayout,
-    // ── perturbation pipeline ─────────────────────────────────────────────────
     perturb_pipeline: wgpu::ComputePipeline,
     perturb_bgl:      wgpu::BindGroupLayout,
     perturb_uni_buf:  wgpu::Buffer,
     orbit_re_buf:     wgpu::Buffer,
     orbit_im_buf:     wgpu::Buffer,
-    // ── shared ───────────────────────────────────────────────────────────────
     width:  u32,
     height: u32,
 }
 
 impl FractalCompute {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
-        // ── standard pipeline ────────────────────────────────────────────────
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("fractal"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../fractal/fractal.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("fractal.wgsl").into()),
         });
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -43,9 +36,6 @@ impl FractalCompute {
 
         let pipeline = build_pipeline(device, &bgl, &shader, "main", "fractal");
 
-        // Tiled bind group layout adds one read-only storage binding (tile
-        // descriptors) over the standard layout's uniform + output buffers —
-        // reuses the same shader module (`main_tiled` alongside `main`).
         let tiled_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -74,11 +64,10 @@ impl FractalCompute {
             mapped_at_creation: false,
         });
 
-        // ── perturbation pipeline ────────────────────────────────────────────
         let perturb_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("fractal_perturb"),
             source: wgpu::ShaderSource::Wgsl(
-                include_str!("../fractal/fractal_perturb.wgsl").into(),
+                include_str!("fractal_perturb.wgsl").into(),
             ),
         });
 
@@ -95,7 +84,7 @@ impl FractalCompute {
         let perturb_pipeline =
             build_pipeline(device, &perturb_bgl, &perturb_shader, "main", "fractal_perturb");
 
-        let orbit_bytes = MAX_ORBIT * 4; // f32 per entry
+        let orbit_bytes = MAX_ORBIT * 4; 
         let perturb_uni_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("perturb_uniforms"),
             size: std::mem::size_of::<PerturbUniforms>() as u64,

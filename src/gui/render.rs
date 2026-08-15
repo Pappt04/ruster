@@ -1,15 +1,17 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use egui::ColorImage;
 use crate::{
-    fractal::{fractal_type::FractalType, IterBuf},
+    fractal::fractal_type::FractalType,
     gui::color::{colorize, ColorScheme},
     gui::viewport::Viewport,
 };
+#[cfg(not(feature = "cuda"))]
+use crate::fractal::IterBuf;
 
-/// Slack added to a row-neighbor's escape count when computing the per-pixel
-/// iteration cap for `render_neighbor_capped`. See CURSOR_OPTIMIZATIONS.md 1d.
+#[cfg(not(feature = "cuda"))]
 const NEIGHBOR_CAP_SLACK: u32 = 16;
 
+#[cfg(not(feature = "cuda"))]
 #[derive(Clone, PartialEq)]
 struct CacheKey {
     vp: Viewport,
@@ -23,6 +25,7 @@ struct CacheKey {
     use_multiref: bool,
 }
 
+#[cfg(not(feature = "cuda"))]
 impl CacheKey {
     fn from(req: &RenderRequest) -> Self {
         Self {
@@ -38,11 +41,6 @@ impl CacheKey {
         }
     }
 
-    /// True if every field except `vp` matches — i.e. the cached buffer was
-    /// produced with the same fractal/params and none of the modes that are
-    /// incompatible with incremental pan (MS/perturbation/SA/neighbor-cap all
-    /// invalidate the "buffer values are independent of the rest of the frame"
-    /// assumption incremental pan relies on). Used to gate `shift_and_fill`.
     fn pan_eligible_match(&self, other: &CacheKey) -> bool {
         self.fractal == other.fractal
             && self.julia_c_bits == other.julia_c_bits
@@ -54,11 +52,13 @@ impl CacheKey {
     }
 }
 
+#[cfg(not(feature = "cuda"))]
 struct FrameCache {
     key: Option<CacheKey>,
     buf: IterBuf,
 }
 
+#[cfg(not(feature = "cuda"))]
 impl FrameCache {
     fn new() -> Self {
         Self { key: None, buf: vec![] }
@@ -76,14 +76,9 @@ pub struct RenderRequest {
     pub use_sa: bool,
     pub use_neighbor_cap: bool,
     pub use_multiref: bool,
-    /// CUDA builds only: route tiles between CPU/GPU via the adaptive
-    /// prepass-guided scheduler instead of a single full-frame GPU dispatch.
     pub use_heterogeneous: bool,
 }
 
-/// Whether a `RenderResult` is a fast, lower-resolution preview (worker still busy,
-/// a `Final` result will follow) or the completed full-resolution frame. See 3c in
-/// CURSOR_OPTIMIZATIONS.md.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Quality {
     Preview,
@@ -116,16 +111,7 @@ impl RenderWorker {
                 use crate::scheduler::{self, controller::ThresholdController, SchedulerConfig};
                 let mut compute: Option<CudaFractal> = None;
                 let mut cached_size = (0u32, 0u32);
-                // Reused across frames for the two GPU-colorize paths below —
-                // same `_into`-buffer-reuse rationale as `compute` itself,
-                // a fresh `Vec<u8>`
-                // every frame would just re-pay the allocation this whole
-                // path exists to avoid.
                 let mut rgba_scratch: Vec<u8> = Vec::new();
-                // Initial value is a starting guess for the new normalized
-                // corner-spread threshold (~[0,1]) — see
-                // scheduler::controller's doc comment; pending re-tuning via
-                // `bench_runner --scheduler-sweep`.
                 let mut het_controller = ThresholdController::new(0.02);
                 let scheduler_cfg = SchedulerConfig::default();
 
@@ -147,15 +133,6 @@ impl RenderWorker {
                     let im_step  = half * 2.0          / vp.height as f64;
                     let cuda     = compute.as_mut().unwrap();
 
-                    // The heterogeneous scheduler's `self.output` never holds the
-                    // *entire* frame (CPU-computed tiles never touch the GPU at
-                    // all), so it can't feed `colorize_into` — global histogram
-                    // equalization needs every pixel, and the merged buffer only
-                    // ever exists host-side. Both other paths render the whole
-                    // frame on the GPU, so they colorize there too: skips the
-                    // escape-value D2H copy entirely and moves the histogram/
-                    // CDF/LUT work `colorize` below would otherwise run on the
-                    // CPU onto the GPU (see `CudaFractal::colorize_into`).
                     let image = if req.use_heterogeneous {
                         let buf = scheduler::render_heterogeneous(
                             vp, req.fractal, req.julia_c, req.max_iter,
@@ -193,8 +170,6 @@ impl RenderWorker {
                         }
                         ColorImage::from_rgba_unmultiplied([sz.0 as usize, sz.1 as usize], rgba)
                     };
-                    // CUDA path is CPU-cache-free and single-pass for now (progressive
-                    // refinement is CPU-only in this iteration — see CURSOR_OPTIMIZATIONS.md 3c).
                     if img_tx.send(RenderResult { image, quality: Quality::Final }).is_err() { break; }
                 }
             }
@@ -214,8 +189,6 @@ impl RenderWorker {
 
                 let mut cache = FrameCache::new();
 
-                // Dispatches to the right kernel for an arbitrary target viewport
-                // (may be a half-res preview viewport, not necessarily req.vp).
                 let compute_buf = |req: &RenderRequest, target_vp: &Viewport| -> IterBuf {
                     if req.use_perturbation && req.use_sa {
                         render_perturbation_sa(target_vp, req.fractal, req.julia_c, req.max_iter)
@@ -233,8 +206,6 @@ impl RenderWorker {
                             match req.fractal {
                                 FractalType::Mandelbrot => {
                                     if target_vp.zoom < F32_PRECISION_THRESHOLD {
-                                        // render_simd_f32_ilp is bit-identical to
-                                        // render_simd_f32, only faster (2a ILP).
                                         render_simd_f32_ilp(target_vp, req.fractal, req.julia_c, req.max_iter)
                                     } else {
                                         render_simd(target_vp, req.fractal, req.julia_c, req.max_iter)
@@ -264,18 +235,12 @@ impl RenderWorker {
                     let key = CacheKey::from(&req);
 
                     if cache.key.as_ref() == Some(&key) {
-                        // Cache hit: recolor only, skip straight to a single Final
-                        // result — no preview phase needed, this is already fast.
                         let pixels = colorize(&cache.buf, req.max_iter, req.scheme);
                         let image = ColorImage::new([w as usize, h as usize], pixels);
                         if img_tx.send(RenderResult { image, quality: Quality::Final }).is_err() { break; }
                         continue;
                     }
 
-                    // Incremental pan: same fractal/params, axis-aligned pixel-only
-                    // center shift, none of MS/perturbation/SA/neighbor-cap active.
-                    // shift_and_fill mutates cache.buf in place — cheap enough to
-                    // skip the preview phase and go straight to Final.
                     if let Some(prev_key) = cache.key.as_ref() {
                         if prev_key.pan_eligible_match(&key) {
                             if let Some((dx, dy)) = prev_key.vp.delta_pixels(&req.vp) {
@@ -297,7 +262,6 @@ impl RenderWorker {
                         }
                     }
 
-                    // Cache miss: quick half-res preview first, then full-res final.
                     if w >= 2 && h >= 2 {
                         let preview_vp = req.vp.with_size((w / 2).max(1), (h / 2).max(1));
                         let preview_buf = compute_buf(&req, &preview_vp);
@@ -330,9 +294,6 @@ impl RenderWorker {
         self.busy = true;
     }
 
-    /// Returns the next available result. `busy` only clears on `Quality::Final` —
-    /// a `Preview` result keeps the worker marked busy so the caller keeps polling
-    /// for the final frame that follows.
     pub fn poll(&mut self) -> Option<RenderResult> {
         match self.rx.try_recv() {
             Ok(result) => {

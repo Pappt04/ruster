@@ -8,7 +8,7 @@ fn compile_cuda() {
     use std::path::PathBuf;
     use std::process::Command;
 
-    let cu  = "src/fractal/fractal.cu";
+    let cu  = "src/gpu/fractal.cu";
     let ptx = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("fractal.ptx");
 
     let status = Command::new("nvcc")
