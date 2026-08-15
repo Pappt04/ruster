@@ -1,8 +1,22 @@
+//! Mariani-Silver boundary tracing: recursively subdivides the frame into
+//! rectangles, and whenever a rectangle's border pixels all share one
+//! iteration count, fills its interior with that value instead of
+//! computing it. This exploits the fact that connected level sets of the
+//! escape-time function are large relative to a pixel — a rectangle whose
+//! entire perimeter belongs to the same level set is, in the overwhelming
+//! majority of cases, entirely inside it. It can occasionally miss a thin
+//! filament that threads through a rectangle's interior without touching
+//! its border, trading a rare, small rendering artifact for skipping the
+//! computation of large uniform regions (deep set interior, or far
+//! exterior where escape time barely changes).
+
 use crate::fractal::fractal::{compute, pixel_grid, IterBuf, PixelGrid};
 use crate::fractal::fractal_type::FractalType;
 use crate::fractal::kernels::mandelbrot::mandelbrot_dem;
 use crate::gui::viewport::Viewport;
 
+/// Rectangles at or below this size are always computed pixel-by-pixel;
+/// subdividing further would cost more in recursion overhead than it saves.
 const MS_MIN: usize = 2;
 
 pub fn render_mariani_silver(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
@@ -15,6 +29,11 @@ pub fn render_mariani_silver(vp: &Viewport, fractal: FractalType, julia_c: [f64;
     buf
 }
 
+/// Fills the rectangle `[x0, x1) x [y0, y1)` of `buf`, recursing per the
+/// module-level algorithm description. `buf` is pre-seeded with `NAN` so a
+/// pixel already computed by a sibling call sharing this border (adjacent
+/// rectangles share an edge) is not recomputed — every write checks
+/// `is_nan()` first.
 fn ms_fill(
     buf: &mut [f32],
     stride: usize,
@@ -80,6 +99,8 @@ fn ms_fill(
         }
     }
 
+    // Border fully computed above; if every border pixel agrees, assume the
+    // interior does too and skip computing it.
     let border_val = buf[y0 * stride + x0];
     let uniform = 'check: {
         for x in x0..x1 {
@@ -100,6 +121,8 @@ fn ms_fill(
             }
         }
     } else {
+        // Split along the longer axis so recursion approaches a square
+        // aspect ratio rather than degenerating into thin slivers.
         if w >= h {
             let mid = x0 + w / 2;
             ms_fill(buf, stride, fractal, julia_c, max_iter, re_start, im_start, re_step, im_step, x0, y0, mid, y1);
@@ -112,6 +135,15 @@ fn ms_fill(
     }
 }
 
+/// Mariani-Silver variant for Mandelbrot that additionally culls rectangles
+/// using the exterior distance estimate ([`mandelbrot_dem`]): a rectangle
+/// whose four corners are all provably at least `k` diagonal-lengths away
+/// from the set boundary cannot contain any boundary detail, so its
+/// interior is filled by bilinear interpolation between the corner values
+/// instead of either full computation or the exact-uniform-border test.
+/// `k` trades accuracy for speed — smaller `k` culls more aggressively at
+/// the risk of visibly flattening fine detail. Non-Mandelbrot fractals have
+/// no distance estimator here and fall back to [`render_mariani_silver`].
 pub fn render_mariani_silver_dem(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32, k: f64) -> IterBuf {
     if fractal != FractalType::Mandelbrot {
         return render_mariani_silver(vp, fractal, julia_c, max_iter);
@@ -142,6 +174,11 @@ fn ms_fill_dem(
         return;
     }
 
+    // A corner escaping within max_iter with distance estimate d means the
+    // boundary is at least ~d away; requiring d >= k * diagonal for all
+    // four corners bounds how much boundary detail this rectangle could
+    // possibly contain. A corner that never escaped has no valid distance
+    // estimate (v >= max_iter), so it always disqualifies the cull.
     let cs = [(x0, y0), (x1 - 1, y0), (x0, y1 - 1), (x1 - 1, y1 - 1)];
     let diag = ((w as f64 * pg.re_step).powi(2) + (h as f64 * pg.im_step).powi(2)).sqrt();
     let mut vals = [0.0f32; 4];
@@ -155,6 +192,10 @@ fn ms_fill_dem(
         }
     }
     if culled {
+        // Extra sanity check: even with all corners individually "safe",
+        // a large spread in their smooth iteration counts suggests the
+        // interior is not as flat as the distance estimate implied, so
+        // bilinear interpolation would misrepresent it.
         let vmin = vals.iter().cloned().fold(f32::INFINITY, f32::min);
         let vmax = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         if vmax - vmin > 2.0 { culled = false; }

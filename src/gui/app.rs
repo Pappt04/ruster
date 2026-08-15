@@ -1,3 +1,8 @@
+//! The egui application: owns UI state, the settings panel, mouse/keyboard
+//! input handling, and the top-level `eframe::App::update` loop that ties
+//! together requesting renders from [`RenderWorker`] and displaying the
+//! result texture.
+
 use egui::{Color32, Rect, TextureHandle, TextureOptions, Vec2};
 use crate::{
     fractal::fractal_type::FractalType,
@@ -8,6 +13,12 @@ use crate::{
     },
 };
 
+/// All application state: current fractal/view/color settings, the
+/// background render worker and its output texture, dirty flags deciding
+/// whether the next frame needs a full render or just a recolor, and which
+/// of the mutually-exclusive render strategies (Mariani-Silver,
+/// perturbation, neighbor-capping, heterogeneous scheduling — see
+/// [`Self::settings_panel`] for how they interact) are enabled.
 pub struct FractalApp {
     // — state
     fractal: FractalType,
@@ -59,6 +70,13 @@ impl Default for FractalApp {
 }
 
 impl FractalApp {
+    /// Sends the current state to the render worker as a new
+    /// [`RenderRequest`]. When `auto_iter` is on, `max_iter` is derived
+    /// from zoom logarithmically before sending, rather than left at a
+    /// fixed value — deeper zoom needs more iterations to resolve fine
+    /// boundary detail, but scaling it linearly with zoom would grow the
+    /// iteration budget far faster than the extra detail actually
+    /// warrants.
     fn request_render(&mut self) {
         if self.auto_iter && self.needs_render {
             // More iterations as you zoom in (logarithmic scale)
@@ -236,8 +254,10 @@ impl FractalApp {
                     if self.use_perturbation {
                         ui.indent("sa_indent", |ui| {
                             if ui.checkbox(&mut self.use_series_approx, "Series approx (SA)").changed() {
-                                // Multi-ref + SA is not implemented in v1 (see
-                                // CURSOR_OPTIMIZATIONS.md 4a) — mutually exclusive.
+                                // Series approximation and multi-reference glitch
+                                // correction are separate strategies for the same
+                                // problem (skipping/repairing perturbation iterations)
+                                // and are not combined, so enabling one disables the other.
                                 if self.use_series_approx { self.use_multiref = false; }
                                 self.needs_render = true;
                             }
@@ -254,8 +274,9 @@ impl FractalApp {
                     self.use_multiref = false;
                 }
 
-                // Neighbor iteration upper bound — scalar row path only, mutually
-                // exclusive with MS/perturbation (see CURSOR_OPTIMIZATIONS.md 1d).
+                // Neighbor iteration cap only applies to the plain scalar row
+                // renderer, so it is mutually exclusive with Mariani-Silver and
+                // perturbation rendering, which use their own row/tile strategies.
                 if ui.checkbox(&mut self.use_neighbor_cap, "Neighbor iteration cap").changed() {
                     if self.use_neighbor_cap {
                         self.use_mariani_silver = false;

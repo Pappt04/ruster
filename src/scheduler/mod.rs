@@ -1,3 +1,11 @@
+//! Heterogeneous CPU+GPU tile scheduler: partitions a frame with
+//! [`classifier::partition_frame`], dispatches GPU-classified tiles to the
+//! GPU while a rayon worker pool concurrently pulls CPU-classified tiles
+//! from a shared queue, and — since a static up-front split cannot know
+//! either device's real-time load — reserves a fraction of the GPU's
+//! tiles as CPU-stealable work that idle CPU workers can claim once they
+//! run out of their own queue, so a temporarily slow GPU doesn't leave CPU
+//! cores idle waiting on it.
 
 pub mod classifier;
 pub mod controller;
@@ -13,6 +21,16 @@ use crate::gpu::wgpu::uniforms::Uniforms;
 use crate::gui::viewport::Viewport;
 use controller::ThresholdController;
 
+/// Tunables for one heterogeneous render pass. `max_tile_size`/
+/// `min_tile_size` bound the classifier's recursive subdivision;
+/// `steal_reserve_frac` is the fraction of GPU-classified tiles held back
+/// as CPU-stealable work rather than committed to the GPU immediately;
+/// `min_steal_tiles` is the minimum number of reserve tiles still
+/// unclaimed by CPU workers by the time the GPU's first dispatch
+/// completes before it is worth a second GPU dispatch to finish them off —
+/// if CPU workers are keeping up and have already stolen most of the
+/// reserve, the remainder is too small to be worth a second GPU launch's
+/// overhead and is simply left for the CPU workers to keep draining.
 pub struct SchedulerConfig {
     pub max_tile_size: u32,
     pub min_tile_size: u32,
@@ -35,6 +53,9 @@ impl Default for SchedulerConfig {
     }
 }
 
+/// Per-frame telemetry from a heterogeneous render, fed back into
+/// [`controller::ThresholdController::update`] and surfaced for
+/// diagnostics/benchmarking.
 #[derive(Debug, Clone, Copy)]
 pub struct HeterogeneousStats {
     pub gpu_ms: f32,
@@ -53,6 +74,7 @@ pub struct HeterogeneousResult {
     pub cpu_stolen_tile_count: u32,
 }
 
+/// Allocating form of [`render_heterogeneous_into`] (CUDA backend).
 pub fn render_heterogeneous(
     vp: &Viewport,
     fractal: FractalType,
@@ -74,6 +96,22 @@ pub fn render_heterogeneous(
     }
 }
 
+/// Renders one frame by splitting it between the CUDA backend and a rayon
+/// CPU worker pool, writing directly into a caller-owned buffer.
+///
+/// Sequence: classify the frame into GPU/CPU tiles
+/// ([`classifier::partition_frame`]); hold back `steal_reserve_frac` of
+/// the GPU tiles as a stealable reserve; launch `n_workers` rayon tasks
+/// that drain the CPU queue and then the steal queue, each accumulating
+/// results into a private scratch buffer (no shared mutable pixel buffer
+/// during rendering — only the small task queues are contended); on the
+/// scheduling thread, dispatch the committed GPU tiles, then check
+/// whether the steal queue still has enough tiles left
+/// (`min_steal_tiles`) to justify one more GPU dispatch for the remainder
+/// before reading the GPU result back; finally, drain each worker's
+/// scratch buffer into `out` at its tiles' true frame positions. The CPU
+/// workers run fully concurrently with the GPU dispatch and readback,
+/// bounded by rayon's `scope`.
 #[allow(clippy::too_many_arguments)]
 pub fn render_heterogeneous_into(
     vp: &Viewport,
@@ -101,6 +139,9 @@ pub fn render_heterogeneous_into(
         cfg.max_tile_size, cfg.min_tile_size, controller.threshold,
     );
 
+    // Split the GPU-classified tiles: the trailing reserve_count tiles go
+    // into the steal queue instead of the immediate GPU dispatch, so idle
+    // CPU workers have GPU-suitable work to fall back on.
     let reserve_frac = cfg.steal_reserve_frac.clamp(0.0, 1.0);
     let reserve_count = ((gpu_tiles.len() as f32) * reserve_frac).round() as usize;
     let split_at = gpu_tiles.len() - reserve_count.min(gpu_tiles.len());
@@ -142,10 +183,18 @@ pub fn render_heterogeneous_into(
             let cpu_queue = &cpu_queue;
             let steal_queue = &steal_queue;
             s.spawn(move |_| {
+                // Each worker renders into its own scratch Vec (append-only,
+                // tracked by (tile, offset) in index) rather than writing
+                // into the shared out buffer directly, so no per-pixel or
+                // per-tile locking is needed during rendering — the
+                // scheduling thread copies each worker's results into
+                // place once, after this loop exits.
                 let mut scratch: Vec<f32> = Vec::new();
                 let mut index: Vec<([u32; 4], usize)> = Vec::new();
                 let mut stolen = 0u32;
                 loop {
+                    // Prefer this worker's own CPU queue; only reach into
+                    // the GPU's steal queue once it's empty.
                     let claim = {
                         let mut cq = cpu_queue.lock().unwrap();
                         if let Some(t) = cq.pop_front() {
@@ -179,6 +228,11 @@ pub fn render_heterogeneous_into(
         let gpu_t0 = std::time::Instant::now();
         dispatch(cuda, &gpu_committed);
 
+        // By the time the committed dispatch returns, CPU workers have
+        // been racing to steal from steal_queue in the background; a
+        // large remainder here means they were still busy with their own
+        // queue and didn't get to it, so it is worth a second GPU pass
+        // rather than waiting on the CPU to eventually drain it.
         let leftover_len = steal_queue.lock().unwrap().len();
         let mut gpu_steal_dispatched = false;
         if leftover_len as u32 >= cfg.min_steal_tiles {
@@ -225,6 +279,13 @@ pub fn render_heterogeneous_into(
     }
 }
 
+/// wgpu-backed counterpart of [`render_heterogeneous_into`]: identical
+/// classify/reserve/steal/dispatch structure, substituting
+/// [`FractalCompute`]'s dispatch and readback for [`CudaFractal`]'s. Kept
+/// as a separate function rather than generic over backend since the two
+/// GPU APIs' dispatch signatures do not share a common trait in this
+/// codebase, and this render loop is not performance-sensitive to the
+/// small amount of duplication.
 pub fn render_heterogeneous_wgpu(
     vp: &Viewport,
     fractal: FractalType,

@@ -1,3 +1,11 @@
+// wgpu compute shader for perturbation-theory rendering. The reference
+// orbit (orbit_re/orbit_im) and its center (ref_re/ref_im) are uploaded by
+// the host each frame; see the perturbation recurrence documented in
+// src/fractal/perturbation/perturbation_theory.rs. WGSL has no f64, so the
+// orbit and every delta computed against it here are f32, unlike the CUDA
+// perturbation kernel which keeps the orbit and deltas in f64.
+
+// Layout must match gpu::wgpu::uniforms::PerturbUniforms field-for-field.
 struct Uniforms {
     re_start  : f32,
     im_start  : f32,
@@ -25,6 +33,8 @@ fn smooth_iter(i: u32, zn_sq: f32) -> f32 {
     return f32(i) + 1.0 - nu;
 }
 
+// Full-precision (for this shader, f32) fallback used by
+// mandelbrot_perturb below on a glitch or reference-orbit exhaustion.
 fn mandelbrot_scalar(cr: f32, ci: f32) -> f32 {
     let q = (cr - 0.25) * (cr - 0.25) + ci * ci;
     if q * (q + cr - 0.25) < 0.25 * ci * ci { return f32(uni.max_iter); }
@@ -43,6 +53,12 @@ fn mandelbrot_scalar(cr: f32, ci: f32) -> f32 {
     return f32(uni.max_iter);
 }
 
+// Perturbation delta recurrence delta_{n+1} = 2*Z_n*delta_n + delta_n^2 +
+// delta_c against the uploaded reference orbit, falling back to
+// mandelbrot_scalar on a glitch (|delta|^2 exceeding GLITCH_SQ times
+// |Z_n|^2) or once the reference orbit runs out before max_iter. No
+// rebasing or multi-reference correction, matching
+// perturb_mandelbrot()/perturb_mandelbrot_flagged() on the CPU side.
 fn mandelbrot_perturb(re: f32, im: f32) -> f32 {
     let dc_re = re - uni.ref_re;
     let dc_im = im - uni.ref_im;

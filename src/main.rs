@@ -1,6 +1,10 @@
 use novafractal::gui::app::FractalApp;
 
 fn main() -> eframe::Result<()> {
+    // A minimal headless path lets timing be captured without a display
+    // (e.g. in CI or over SSH) rather than requiring the interactive
+    // window; the real benchmark suite (bench_runner, criterion) is more
+    // thorough, this is a quick sanity check only.
     if std::env::args().any(|a| a == "--headless" || a == "--bench") {
         headless_bench();
         return Ok(());
@@ -17,6 +21,10 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// Renders a fixed 1920x1080 Mandelbrot frame 5 times on the CPU scalar
+/// backend and reports median/min/max timing and throughput. The first
+/// (untimed) call warms up the rayon thread pool and page-faults the
+/// output buffer so it doesn't skew the first timed run.
 fn headless_bench() {
     use novafractal::fractal::{render, FractalType};
     use novafractal::gui::viewport::Viewport;

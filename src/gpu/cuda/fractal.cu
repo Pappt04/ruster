@@ -1,3 +1,11 @@
+// CUDA device kernels for escape-time and perturbation-theory fractal
+// rendering. These implement the same recurrences as the Rust kernels in
+// src/fractal/kernels/ and src/fractal/perturbation/ (see those files for
+// the underlying math); the two must stay in algebraic step, since a
+// mismatch here is invisible except as a small, hard-to-spot difference
+// between CPU- and GPU-rendered images. build.rs compiles this file to PTX
+// via nvrtc and embeds it into the Rust binary.
+
 #include <math.h>
 #include <stdint.h>
 
@@ -5,12 +13,18 @@
 
 __device__ static const double INV_LN2 = 1.4426950408889634;
 
+// Continuous iteration count from discrete escape count and |z|^2 at
+// escape; see smooth_iter in src/fractal/fractal.rs for the derivation.
 __device__ double smooth_iter(uint32_t i, double zn_sq) {
     double log_zn = log(zn_sq) * 0.5;
     double nu     = log(log_zn * INV_LN2) * INV_LN2;
     return (double)i + 1.0 - nu;
 }
 
+// Period-3 bulb membership test (see bulb_precheck.rs); the main
+// cardioid/period-2 bulb tests are inlined directly into mandelbrot()
+// below instead of factored out, since CUDA has no equivalent call-site
+// cost concern to weigh against duplicating three lines of arithmetic.
 #define PERIOD3_CENTER_RE (-0.1225611668766536)
 #define PERIOD3_CENTER_IM (0.7448617666197442)
 #define PERIOD3_RADIUS_SQ (0.07371484375 * 0.07371484375)
@@ -31,6 +45,9 @@ __device__ __forceinline__ bool in_period3_bulb_f32(float cr, float ci) {
         || (dr * dr + di_neg * di_neg < (float)PERIOD3_RADIUS_SQ);
 }
 
+// f64 Mandelbrot escape-time iteration: cardioid/period-2/period-3
+// prechecks, then Brent-style periodicity detection during iteration.
+// Mirrors mandelbrot() in src/fractal/kernels/mandelbrot.rs.
 __device__ float mandelbrot(double cr, double ci, uint32_t max_iter) {
     double q = (cr - 0.25) * (cr - 0.25) + ci * ci;
     if (q * (q + cr - 0.25) < 0.25 * ci * ci) return (float)max_iter;
@@ -67,6 +84,8 @@ __device__ float mandelbrot(double cr, double ci, uint32_t max_iter) {
     return (float)max_iter;
 }
 
+// f64 Julia escape-time iteration with the same periodicity detection as
+// mandelbrot() above. Mirrors julia() in src/fractal/kernels/julia.rs.
 __device__ float julia(double zr0, double zi0, double cr, double ci, uint32_t max_iter) {
     double zr = zr0, zi = zi0;
     double zr_b = zr0, zi_b = zi0;
@@ -91,6 +110,10 @@ __device__ float julia(double zr0, double zi0, double cr, double ci, uint32_t ma
     return (float)max_iter;
 }
 
+// f32 kernels used below F32_PRECISION_THRESHOLD (see fractal.rs). Like
+// the SIMD CPU kernels, these skip periodicity detection — not worth the
+// extra branching at this granularity — relying only on the bulb
+// prechecks and the escape-radius bailout.
 #define ESCAPE_SQ_F32 4.0f
 
 __device__ float smooth_iter_f32(uint32_t i, float zn_sq, uint32_t max_iter) {
@@ -137,6 +160,8 @@ __device__ float julia_f32(float zr0, float zi0, float cr, float ci, uint32_t ma
     return (float)max_iter;
 }
 
+// Newton's method for f(z) = z^3 - 1, seeded at z0 = c. Mirrors newton()
+// in src/fractal/kernels/newton.rs.
 __device__ float newton(double cr, double ci, uint32_t max_iter) {
     double zr = cr, zi = ci;
     for (uint32_t i = 0; i < max_iter; i++) {
@@ -156,6 +181,9 @@ __device__ float newton(double cr, double ci, uint32_t max_iter) {
     return (float)max_iter;
 }
 
+// Nova fractal: same Newton update as newton() above, with c added back
+// in each step and z fixed-started at 1+0i. Mirrors nova() in
+// src/fractal/kernels/nova.rs.
 __device__ float nova(double cr, double ci, uint32_t max_iter) {
     double zr = 1.0, zi = 0.0;
     for (uint32_t i = 0; i < max_iter; i++) {
@@ -175,6 +203,13 @@ __device__ float nova(double cr, double ci, uint32_t max_iter) {
     return (float)max_iter;
 }
 
+// Morton (Z-order) encode/decode via bit interleaving: spread_bits
+// inserts a zero bit between each bit of a 16-bit input, so
+// morton_encode's OR of spread_bits(x) with spread_bits(y) shifted left
+// one interleaves x and y's bits into a single Z-order index. Used by
+// fractal_kernel[_f32] below to map a linear thread index to a spatially
+// local (x, y) pixel — see the module-level comment in gpu/cuda/mod.rs for
+// why Morton order is used instead of row-major.
 __device__ __forceinline__ uint32_t spread_bits(uint32_t x) {
     x &= 0x0000FFFFu;
     x = (x | (x << 8u)) & 0x00FF00FFu;
@@ -202,6 +237,17 @@ __device__ __forceinline__ void morton_decode(uint32_t code, uint32_t *x, uint32
     *y = compact_bits(code >> 1u);
 }
 
+// GPU perturbation rendering against a reference orbit uploaded by the
+// host (orbit_re/orbit_im — see RefOrbit and the perturbation recurrence
+// documented in src/fractal/perturbation/perturbation_theory.rs). The
+// reference orbit's center is not passed explicitly: since the orbit was
+// always computed for the pixel grid's own center, ref_re/ref_im are
+// reconstructed here from re_start/im_start/re_step/im_step directly,
+// exactly the coordinate the middle pixel of a width x height grid maps
+// to. Falls back to full-precision mandelbrot() per pixel on a glitch or
+// on reference-orbit exhaustion, the same policy as
+// perturb_mandelbrot()/perturb_mandelbrot_flagged() on the CPU side (no
+// rebasing or multi-reference correction on the GPU path).
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_perturb_kernel(
     float* __restrict__         buf,
@@ -263,6 +309,11 @@ void fractal_perturb_kernel(
     }
 }
 
+// Full-frame f64 render, one thread per pixel, dispatched in Morton order:
+// morton_idx is the thread's flat position within its 256-thread (16x16)
+// block's slice of the Z-order curve over the padded dim x dim frame (see
+// morton_cfg in gpu/cuda/mod.rs), decoded back to (x, y) and bounds-checked
+// against the true frame size.
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_kernel(
     float* __restrict__ buf,
@@ -299,6 +350,8 @@ void fractal_kernel(
     buf[y * width + x] = v;
 }
 
+// f32 counterpart of fractal_kernel; Newton/Nova have no f32 kernel, so
+// this only handles Mandelbrot (fractal == 0) and Julia.
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_kernel_f32(
     float* __restrict__ buf,
@@ -331,6 +384,14 @@ void fractal_kernel_f32(
     buf[y * width + x] = v;
 }
 
+// Renders a batch of independently-sized/positioned tiles in one launch:
+// blockIdx.z selects the tile, tile_descs[tile_idx] gives its
+// [x0, y0, w, h] in frame coordinates, and threads outside that tile's
+// own w x h are discarded (the launch grid is sized to the largest tile
+// in the batch, so smaller tiles waste some threads rather than needing
+// a separate launch each). Writes land row-major into the full-frame
+// buf at the tile's true screen position. Used by the heterogeneous
+// scheduler's GPU worker for row-major (non-Morton) tile dispatch.
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_kernel_tiled(
     float* __restrict__          buf,
@@ -372,6 +433,7 @@ void fractal_kernel_tiled(
     buf[y * full_width + x] = v;
 }
 
+// f32 counterpart of fractal_kernel_tiled.
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_kernel_tiled_f32(
     float* __restrict__          buf,
@@ -409,6 +471,11 @@ void fractal_kernel_tiled_f32(
     buf[y * full_width + x] = v;
 }
 
+// Like fractal_kernel_tiled, but each tile descriptor carries a fifth
+// field (offset) giving its position in a densely-packed output buffer
+// instead of the tile's own screen offset in a full-frame buffer — used
+// when the dispatched tiles are a scattered, non-contiguous subset of the
+// frame rather than a full tiling of it.
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_kernel_tiled_compact(
     float* __restrict__          buf,
@@ -447,6 +514,7 @@ void fractal_kernel_tiled_compact(
     buf[offset + ly * tw + lx] = v;
 }
 
+// f32 counterpart of fractal_kernel_tiled_compact.
 extern "C" __global__ __launch_bounds__(256, 2)
 void fractal_kernel_tiled_f32_compact(
     float* __restrict__          buf,
@@ -481,6 +549,11 @@ void fractal_kernel_tiled_f32_compact(
     buf[offset + ly * tw + lx] = v;
 }
 
+// Accumulates a per-integer-iteration-count histogram of buf via atomic
+// increments, one bin per possible escape iteration (0..=max_iter).
+// In-set pixels (v >= max_iter) are excluded, matching the CPU
+// colorize pipeline's treatment of interior points as a fixed color
+// rather than part of the equalized range.
 extern "C" __global__
 void hist_kernel(
     const float* __restrict__ buf,
@@ -498,6 +571,13 @@ void hist_kernel(
     }
 }
 
+// Maps each pixel's (fractional) iteration count through the CDF built
+// from hist_kernel's histogram, then through the palette LUT: cdf[lo] and
+// cdf[hi] (the two integer bins the fractional value falls between) are
+// linearly interpolated by the fractional part, giving a smooth,
+// histogram-equalized t in [0, 1], which then indexes the LUT. In-set
+// pixels (v >= max_iter) bypass this and are always opaque black,
+// matching the CPU colorize pipeline in src/gui/color.rs.
 extern "C" __global__
 void colorize_kernel(
     const float* __restrict__          buf,

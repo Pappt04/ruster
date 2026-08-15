@@ -4,6 +4,20 @@ use crate::fractal::fractal_type::FractalType;
 use crate::gui::viewport::Viewport;
 use rayon::prelude::*;
 
+/// 8-lane f32 SIMD Mandelbrot: iterates 8 pixels' worth of `c` values
+/// together in lockstep, one AVX-width vector register per variable.
+///
+/// SIMD escape-time iteration cannot branch per lane the way the scalar
+/// kernel does, so instead of stopping a lane's iteration the moment it
+/// escapes, an `active` mask (all-ones/all-zeros per lane, stored as the
+/// bit pattern of a float so it composes with bitwise AND/XOR on the
+/// vector type) marks which lanes are still being updated. A lane that
+/// just crossed the escape radius records its iteration count and `|z|^2`
+/// into `escape_iter`/`escape_zn` and is cleared from `active`; the whole
+/// vector keeps iterating — including already-escaped lanes, whose values
+/// are simply discarded — until every lane has escaped or `max_iter` is
+/// reached. [`bulb_precheck_x8`] is applied first so lanes already known to
+/// be interior points skip the loop entirely.
 pub fn mandelbrot_x8(cr: wide::f32x8, ci: wide::f32x8, max_iter: u32) -> [f32; 8] {
     use wide::{f32x8, CmpGt};
 
@@ -74,6 +88,16 @@ pub fn mandelbrot_x8(cr: wide::f32x8, ci: wide::f32x8, max_iter: u32) -> [f32; 8
     out
 }
 
+/// Two independent [`mandelbrot_x8`] lanes interleaved in the same loop
+/// body (16 pixels total, two 8-wide vectors).
+///
+/// A single f32x8 chain has a serial dependency through `zr`/`zi` from one
+/// iteration to the next, so the CPU's floating-point pipeline can stall
+/// waiting for one multiply-add to retire before issuing the next. Running
+/// two independent chains side by side gives the out-of-order scheduler a
+/// second, unrelated instruction stream to fill those stalls with —
+/// instruction-level parallelism (ILP) traded for the register pressure of
+/// tracking two sets of state. Otherwise identical to [`mandelbrot_x8`].
 pub(crate) fn mandelbrot_x8x2(
     cr0: wide::f32x8, ci0: wide::f32x8,
     cr1: wide::f32x8, ci1: wide::f32x8,
@@ -173,6 +197,9 @@ pub(crate) fn mandelbrot_x8x2(
     };
     (finish(&escape_iter0, &escape_zn0), finish(&escape_iter1, &escape_zn1))
 }
+/// 4-lane f64 counterpart of [`mandelbrot_x8`], used past
+/// [`crate::fractal::fractal::F32_PRECISION_THRESHOLD`] where f32 no
+/// longer resolves distinct pixel coordinates.
 pub(crate) fn mandelbrot_x4(cr: wide::f64x4, ci: wide::f64x4, max_iter: u32) -> [f32; 4] {
     use wide::{f64x4, CmpGt};
 
@@ -242,6 +269,16 @@ pub(crate) fn mandelbrot_x4(cr: wide::f64x4, ci: wide::f64x4, max_iter: u32) -> 
     }
     out
 }
+/// Escape-time iteration with the exterior distance estimate (DEM) added
+/// alongside the usual smooth iteration count.
+///
+/// Alongside `z_{n+1} = z_n^2 + c`, tracks the orbit's derivative with
+/// respect to `c` via `dz_{n+1} = 2 z_n dz_n + 1` (the chain rule applied
+/// to the iteration itself, `dz_0 = 0`). At escape, the estimated distance
+/// from `c` to the set boundary is `d ~= |z| * ln|z| / |dz|` — the standard
+/// exterior distance estimator, used for boundary/stalk rendering at
+/// resolutions where escape-time banding would otherwise show thin
+/// filaments as aliased single pixels.
 pub fn mandelbrot_dem(cr: f64, ci: f64, max_iter: u32) -> (f32, f64) {
     let mut zr = 0.0f64;
     let mut zi = 0.0f64;
@@ -266,6 +303,18 @@ pub fn mandelbrot_dem(cr: f64, ci: f64, max_iter: u32) -> (f32, f64) {
     }
     (max_iter as f32, 0.0)
 }
+/// Scalar f64 Mandelbrot escape-time iteration — the reference
+/// implementation the SIMD, CUDA, and WGSL kernels are all algebraically
+/// derived from.
+///
+/// Combines two optimizations beyond bare `z_{n+1} = z_n^2 + c` iteration:
+/// [`in_cardioid_or_period2`]/[`in_period3_bulb`] reject the largest known
+/// interior components up front, and Brent-style periodicity detection
+/// (`zr_b`/`zi_b`, doubling `check`) catches orbits that settle into a
+/// smaller periodic cycle not covered by those closed-form tests, so they
+/// too return at `max_iter` instead of iterating the full budget. The
+/// first two iterations are unrolled unconditionally because the
+/// periodicity reference point is not established until iteration 2.
 #[inline]
 pub(crate) fn mandelbrot(cr: f64, ci: f64, max_iter: u32) -> f32 {
     if in_cardioid_or_period2(cr, ci) || in_period3_bulb(cr, ci) {
@@ -313,8 +362,23 @@ pub(crate) fn mandelbrot(cr: f64, ci: f64, max_iter: u32) -> f32 {
     max_iter as f32
 }
 
+/// Threshold below which `|d z_n / d z_0|^2` is treated as having collapsed
+/// to zero — see [`mandelbrot_ide`].
 const IDE_DER_SQ: f64 = 1e-24;
 
+/// Interior-biased Mandelbrot kernel: like [`mandelbrot`], but replaces
+/// Brent periodicity detection with tracking of the orbit derivative
+/// `d z_n / d z_0` (via the chain rule `d z_{n+1}/d z_0 = 2 z_n * d z_n/d z_0`,
+/// `d z_0/d z_0 = 1`).
+///
+/// An orbit attracted to a stable periodic cycle has this derivative decay
+/// geometrically toward zero, so once `|d z_n/d z_0|^2` drops below
+/// [`IDE_DER_SQ`] the point is classified interior and iteration stops.
+/// This needs no reference-point bookkeeping, so per-iteration cost is
+/// lower than the periodicity check in [`mandelbrot`] — but it only
+/// detects *attracting* cycles reliably deep into the interior, so
+/// [`render_ide_biased`] only reaches for it after a neighboring pixel has
+/// already been confirmed interior, where that trade-off is favorable.
 pub fn mandelbrot_ide(cr: f64, ci: f64, max_iter: u32) -> f32 {
     if in_cardioid_or_period2(cr, ci) || in_period3_bulb(cr, ci) {
         return max_iter as f32;
@@ -345,6 +409,14 @@ pub fn mandelbrot_ide(cr: f64, ci: f64, max_iter: u32) -> f32 {
     max_iter as f32
 }
 
+/// Mandelbrot render that switches to the cheaper [`mandelbrot_ide`] kernel
+/// whenever the previous pixel in the row was classified interior,
+/// otherwise using the standard [`mandelbrot`] kernel. Interior regions are
+/// spatially contiguous, so once one pixel is confirmed interior its
+/// row-neighbor is likely interior too, making the derivative-collapse
+/// test's weaker guarantees an acceptable trade for its lower per-iteration
+/// cost. Non-Mandelbrot fractal types fall back to the general
+/// [`crate::fractal::fractal::render`].
 pub fn render_ide_biased(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
     if fractal != FractalType::Mandelbrot {
         return render(vp, fractal, julia_c, max_iter);

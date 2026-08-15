@@ -1,5 +1,18 @@
 use crate::fractal::fractal::{ESCAPE_RADIUS_SQ, ESCAPE_RADIUS_SQ_F32, smooth_iter, smooth_iter_f32};
 
+/// Escape-time iteration for the Julia set of `f(z) = z^2 + c`, with `c`
+/// fixed for the whole image and the pixel coordinate `(zr0, zi0)` as the
+/// starting `z_0` — the mirror image of Mandelbrot iteration, where `c`
+/// varies per pixel and `z_0` is fixed at the origin.
+///
+/// Includes Brent-style cycle detection: every time `period` reaches
+/// `check`, the current `z` is saved as a reference point (`zr_b`, `zi_b`)
+/// and the threshold doubles (capped at 512). If `z` returns arbitrarily
+/// close to that reference before the next checkpoint, the orbit has
+/// entered a periodic cycle and can never escape, so iteration stops early
+/// instead of running to `max_iter`. This is the same technique used by
+/// the scalar Mandelbrot kernel; see
+/// [`crate::fractal::kernels::mandelbrot::mandelbrot`].
 #[inline]
 pub fn julia(zr0: f64, zi0: f64, cr: f64, ci: f64, max_iter: u32) -> f32 {
     let (mut zr, mut zi) = (zr0, zi0);
@@ -34,6 +47,13 @@ pub fn julia(zr0: f64, zi0: f64, cr: f64, ci: f64, max_iter: u32) -> f32 {
     max_iter as f32
 }
 
+/// 8-lane f32 SIMD form of [`julia`]. Lanes escape at different iteration
+/// counts, so each lane is masked out of the active set as soon as it
+/// escapes (`active` tracks which lanes are still iterating) while the
+/// remaining lanes continue; see
+/// [`crate::fractal::kernels::mandelbrot::mandelbrot_x8`] for the full
+/// explanation of the masking scheme, which this mirrors exactly minus
+/// periodicity checking (not worth the branch at 8-wide).
 pub(crate) fn julia_x8(zr0: wide::f32x8, zi0: wide::f32x8, cr: wide::f32x8, ci: wide::f32x8, max_iter: u32) -> [f32; 8] {
     use wide::{f32x8, CmpGt};
 
@@ -80,6 +100,8 @@ pub(crate) fn julia_x8(zr0: wide::f32x8, zi0: wide::f32x8, cr: wide::f32x8, ci: 
     }
     out
 }
+/// 4-lane f64 counterpart of [`julia_x8`], used past
+/// [`crate::fractal::fractal::F32_PRECISION_THRESHOLD`].
 pub(crate) fn julia_x4(zr0: wide::f64x4, zi0: wide::f64x4, cr: wide::f64x4, ci: wide::f64x4, max_iter: u32) -> [f32; 4] {
     use wide::{f64x4, CmpGt};
 

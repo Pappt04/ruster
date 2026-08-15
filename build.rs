@@ -3,6 +3,11 @@ fn main() {
     compile_cuda();
 }
 
+/// Compiles `fractal.cu` to PTX via `nvcc` at build time and exposes its
+/// path to the crate through the `FRACTAL_PTX` environment variable (read
+/// back with `env!("FRACTAL_PTX")` in `gpu::cuda::CudaFractal::from_device`),
+/// so the CUDA kernels ship embedded in the compiled binary rather than
+/// needing `fractal.cu` present or nvrtc-compiled at runtime.
 #[cfg(feature = "cuda")]
 fn compile_cuda() {
     use std::path::PathBuf;
@@ -14,7 +19,7 @@ fn compile_cuda() {
     let status = Command::new("nvcc")
         .args([
             "--ptx",
-            "--gpu-architecture=sm_86", // Ampere (RTX 30xx)
+            "--gpu-architecture=sm_86", // Ampere (RTX 30xx) — matches the target RTX 3050
             "-O3",
             "--ftz=false",       // keep denormals (needed for smooth coloring accuracy)
             "--prec-div=true",   // full precision division

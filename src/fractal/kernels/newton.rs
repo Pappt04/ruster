@@ -1,3 +1,21 @@
+/// Newton fractal for `f(z) = z^3 - 1`, seeded at the pixel's own complex
+/// coordinate `z_0 = c`.
+///
+/// Applies the complex Newton-Raphson update
+/// `z_{n+1} = z_n - f(z_n) / f'(z_n)` with `f'(z) = 3z^2`, computed by
+/// expanding `f(z)/f'(z)` into real/imaginary components and dividing by
+/// `|f'(z)|^2` (multiplying by the conjugate of the derivative). Every
+/// starting point converges to one of the three cube roots of unity except
+/// on a measure-zero set of boundaries between their basins of attraction —
+/// it is this boundary that produces the fractal structure. The returned
+/// value is the iteration count at convergence (not which root was
+/// reached), so coloring shows convergence speed rather than basin
+/// identity.
+///
+/// `denom < 1e-20` guards against `f'(z) == 0`, the critical point where
+/// Newton's method is undefined; `dr*dr + di*di < 1e-12` is the
+/// step-size convergence threshold — iteration stops once successive `z`
+/// values stop moving in a way that matters at f32 output precision.
 #[inline]
 pub fn newton(cr: f64, ci: f64, max_iter: u32) -> f32 {
     let (mut zr, mut zi) = (cr, ci);

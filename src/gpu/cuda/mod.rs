@@ -1,15 +1,38 @@
+//! CUDA backend targeting the discrete NVIDIA GPU directly (as opposed to
+//! the portable wgpu backend). Kernels are precompiled to PTX by `build.rs`
+//! from `fractal.cu` and loaded once via `nvrtc`; this module owns the
+//! device buffers and launch configuration around them.
+//!
+//! Frame pixels are dispatched in Morton (Z-order) rather than row-major
+//! order (see [`CudaFractal::morton_cfg`]) so that threads within a warp,
+//! and blocks scheduled close together in time, cover a spatially compact
+//! region of the image — escape-time cost is spatially correlated, so this
+//! keeps warps more uniform in their iteration counts than a row-major
+//! sweep would, reducing the amount of time fast-finishing threads in a
+//! warp sit idle waiting for the slowest one.
+
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DeviceSlice, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
 use crate::fractal::fractal::F32_PRECISION_THRESHOLD;
 use crate::fractal::perturbation::perturbation_theory::RefOrbit;
 
+/// Host-side pixel buffer registered as CUDA page-locked ("pinned")
+/// memory, so [`CudaFractal::readback_into`] can DMA directly into it
+/// instead of the driver first staging through an internal pinned buffer.
+/// Falls back to ordinary (unpinned) memory if `cuMemHostRegister` fails —
+/// still correct, just without the DMA speedup.
 pub struct PinnedBuf {
     buf: Vec<f32>,
     pinned: bool,
 }
 
 impl PinnedBuf {
+    /// Allocates `len` f32s and attempts to pin them via
+    /// `cuMemHostRegister`. Registration can fail (e.g. no CUDA context,
+    /// address not page-aligned in a way the driver accepts) without that
+    /// being a fatal error for the caller — [`PinnedBuf::is_pinned`]
+    /// reports whether it succeeded.
     pub fn new(len: usize) -> Self {
         let mut buf = vec![0.0f32; len];
         let rc = unsafe {
@@ -47,6 +70,13 @@ impl Drop for PinnedBuf {
     }
 }
 
+/// Owns one CUDA device context, its loaded kernel functions, and the
+/// GPU-resident buffers reused across frames. `output` is the full-frame,
+/// row-major buffer used by whole-frame and Morton-order rendering;
+/// `compact_output` is a separate densely-packed buffer for
+/// [`CudaFractal::dispatch_tiled_compact`], whose tiles are typically a
+/// small subset of the frame gathered from scattered scheduler work
+/// rather than covering it fully.
 pub struct CudaFractal {
     dev:            Arc<CudaDevice>,
     output:         CudaSlice<f32>,
@@ -69,11 +99,20 @@ pub struct CudaFractal {
 }
 
 impl CudaFractal {
+    /// Opens CUDA device 0 (the discrete GPU on this machine's topology;
+    /// see [`crate::gpu::cuda`] module docs) and loads all kernels onto it.
     pub fn new(width: u32, height: u32) -> Self {
         let dev = CudaDevice::new(0).expect("no CUDA device");
         Self::from_device(dev, width, height)
     }
 
+    /// Loads `fractal.cu`'s compiled PTX (embedded at build time via the
+    /// `FRACTAL_PTX` env var `build.rs` sets) onto an already-open device
+    /// and allocates the frame-sized output buffers. PTX loading is
+    /// skipped if a module named `"fractal"` is already loaded on this
+    /// device, so constructing multiple `CudaFractal`s sharing a device
+    /// (e.g. one per scheduler worker) doesn't reload and relink the
+    /// kernels each time.
     pub fn from_device(dev: Arc<CudaDevice>, width: u32, height: u32) -> Self {
         if !dev.has_func("fractal", "fractal_kernel") {
             let ptx = Ptx::from_src(include_str!(env!("FRACTAL_PTX")));
@@ -114,6 +153,7 @@ impl CudaFractal {
         }
     }
 
+    /// Renders a full frame in Morton order and reads it back synchronously.
     pub fn render(
         &mut self,
         re_start : f64,
@@ -129,6 +169,14 @@ impl CudaFractal {
         self.dev.dtoh_sync_copy(&self.output).unwrap()
     }
 
+    /// Chooses between the f32 and f64 CUDA kernels the same way the CPU
+    /// backend does: Mandelbrot/Julia (`fractal` discriminants 0/1) below
+    /// [`F32_PRECISION_THRESHOLD`] use [`CudaFractal::dispatch_render_f32`];
+    /// everything else — deeper zoom, or Newton/Nova which have no f32
+    /// kernel at all — uses the f64 path. Zoom is recovered from `im_step`
+    /// rather than passed explicitly, since it is the same quantity
+    /// [`crate::fractal::fractal::pixel_grid`] derives it from on the CPU
+    /// side.
     fn dispatch_render(
         &mut self,
         re_start : f64,
@@ -186,6 +234,9 @@ impl CudaFractal {
         }.unwrap();
     }
 
+    /// Renders and immediately colorizes on the GPU, avoiding a
+    /// device-to-host round trip of the raw iteration buffer between the
+    /// two stages — only the final RGBA bytes cross the PCIe bus.
     #[allow(clippy::too_many_arguments)]
     pub fn render_and_colorize(
         &mut self,
@@ -205,6 +256,8 @@ impl CudaFractal {
         self.colorize_into(max_iter, scheme_id, lut, out);
     }
 
+    /// Renders a full frame in perturbation mode against `orbit` and reads
+    /// it back synchronously; see [`CudaFractal::dispatch_render_perturbation`].
     pub fn render_perturbation(
         &mut self,
         orbit    : &RefOrbit,
@@ -218,6 +271,15 @@ impl CudaFractal {
         self.dev.dtoh_sync_copy(&self.output).unwrap()
     }
 
+    /// Uploads `orbit`'s `zr`/`zi` arrays fresh for every call — the
+    /// reference orbit changes whenever the view center or zoom changes,
+    /// so there is no cross-frame reuse to cache here, unlike the LUT
+    /// caching in [`CudaFractal::colorize_into`]. Dispatches over a plain
+    /// row-major 16x16-block grid rather than Morton order: the
+    /// perturbation kernel's per-pixel cost already varies far less than
+    /// escape-time iteration count does (most of its work is the fixed
+    /// reference-orbit walk), so Morton ordering's warp-uniformity benefit
+    /// does not apply here.
     fn dispatch_render_perturbation(
         &mut self,
         orbit    : &RefOrbit,
@@ -264,6 +326,13 @@ impl CudaFractal {
         self.colorize_into(max_iter, scheme_id, lut, out);
     }
 
+    /// Renders a coarse `prepass_w x prepass_h` grid at 8x the pixel
+    /// stride of the full frame (`re_step * 8.0`, `im_step * 8.0`) — a
+    /// cheap, low-resolution pass over the same view used to estimate
+    /// per-region iteration cost before committing to a full-resolution
+    /// render. The prepass buffer is only reallocated when a larger one is
+    /// requested than currently held, so repeated prepasses at the same or
+    /// smaller size reuse the existing GPU allocation.
     pub fn render_prepass(
         &mut self,
         re_start  : f64,
@@ -304,6 +373,12 @@ impl CudaFractal {
         out
     }
 
+    /// Uploads a batch of `[x0, y0, w, h]` tile descriptors and builds a
+    /// launch grid sized to the largest tile, with one grid Z-layer per
+    /// tile — shared by [`CudaFractal::dispatch_tiled`] and
+    /// [`CudaFractal::dispatch_tiled_f32`]. Tiles write into `self.output`
+    /// at their own frame-relative offset, so results land directly in the
+    /// full-frame buffer without a separate compositing step.
     fn upload_tiles(&self, tiles: &[[u32; 4]]) -> Option<(CudaSlice<u32>, LaunchConfig)> {
         if tiles.is_empty() {
             return None;
@@ -325,6 +400,10 @@ impl CudaFractal {
         Some((tile_descs_dev, cfg))
     }
 
+    /// f64 tiled dispatch: writes tiles into `self.output` without reading
+    /// back. Used by [`CudaFractal::render_tiled`] and by callers that
+    /// batch several `dispatch_tiled*` calls before a single
+    /// [`CudaFractal::readback`].
     pub fn dispatch_tiled(
         &mut self,
         tiles    : &[[u32; 4]],
@@ -352,6 +431,9 @@ impl CudaFractal {
         }.unwrap();
     }
 
+    /// f32 counterpart of [`CudaFractal::dispatch_tiled`], for callers that
+    /// have already determined the current zoom is below
+    /// [`F32_PRECISION_THRESHOLD`] for every tile in the batch.
     pub fn dispatch_tiled_f32(
         &mut self,
         tiles    : &[[u32; 4]],
@@ -379,10 +461,18 @@ impl CudaFractal {
         }.unwrap();
     }
 
+    /// Allocating readback of the full-frame output buffer.
     pub fn readback(&self) -> Vec<f32> {
         self.dev.dtoh_sync_copy(&self.output).unwrap()
     }
 
+    /// Copies the device output buffer into a caller-owned host buffer —
+    /// pair `dst` with a [`PinnedBuf`] so this DMAs directly rather than
+    /// staging through the driver's internal pinned memory. This
+    /// device-to-host transfer is the dominant cost of a CUDA frame, so
+    /// avoiding both the allocation in [`CudaFractal::readback`] and the
+    /// staging copy here is the single largest win available in this
+    /// backend's render loop.
     pub fn readback_into(&self, dst: &mut [f32]) {
         assert_eq!(
             dst.len(), (self.width * self.height) as usize,
@@ -391,6 +481,12 @@ impl CudaFractal {
         self.dev.dtoh_sync_copy_into(&self.output, dst).unwrap();
     }
 
+    /// Like [`CudaFractal::upload_tiles`], but for tile descriptors with a
+    /// fifth field — a destination offset into the *compact* output
+    /// buffer, since these tiles are not laid out at their own screen
+    /// position within a full-frame buffer but packed contiguously
+    /// (typically a scattered subset of the frame the scheduler batched
+    /// for the GPU).
     fn upload_tiles_compact(&self, tiles: &[[u32; 5]]) -> Option<(CudaSlice<u32>, LaunchConfig)> {
         if tiles.is_empty() {
             return None;
@@ -412,6 +508,9 @@ impl CudaFractal {
         Some((tile_descs_dev, cfg))
     }
 
+    /// f64 compact-tile dispatch: writes into `self.compact_output` at
+    /// each tile's own destination offset rather than `self.output`. Read
+    /// back with [`CudaFractal::readback_compact`].
     pub fn dispatch_tiled_compact(
         &mut self,
         tiles    : &[[u32; 5]],
@@ -438,6 +537,7 @@ impl CudaFractal {
         }.unwrap();
     }
 
+    /// f32 counterpart of [`CudaFractal::dispatch_tiled_compact`].
     pub fn dispatch_tiled_f32_compact(
         &mut self,
         tiles    : &[[u32; 5]],
@@ -464,6 +564,10 @@ impl CudaFractal {
         }.unwrap();
     }
 
+    /// Reads back the first `total_pixels` of `compact_output` into a
+    /// reused host-side scratch buffer (grown, never shrunk, across
+    /// calls), returning a borrow rather than an owned `Vec` to avoid a
+    /// per-call heap allocation on what is typically a per-batch hot path.
     pub fn readback_compact(&mut self, total_pixels: u32) -> &[f32] {
         let n = total_pixels as usize;
         assert!(n <= (self.width * self.height) as usize, "batch exceeds frame size");
@@ -475,6 +579,8 @@ impl CudaFractal {
         &self.compact_host_scratch[..n]
     }
 
+    /// Convenience wrapper: [`CudaFractal::dispatch_tiled`] followed by
+    /// [`CudaFractal::readback`] for one-shot (non-batched) callers.
     pub fn render_tiled(
         &mut self,
         tiles    : &[[u32; 4]],
@@ -491,6 +597,15 @@ impl CudaFractal {
         self.readback()
     }
 
+    /// GPU-side mirror of [`crate::gui::color::colorize`]'s
+    /// histogram-equalization pipeline: a per-value histogram over the
+    /// current `output` buffer, reduced on the host into a cumulative
+    /// distribution function (`bins` small enough — at most `max_iter + 1`
+    /// — that this reduction is not worth a second kernel), then a second
+    /// kernel maps each pixel's CDF-equalized position through the palette
+    /// LUT. The LUT upload is skipped and the cached device copy reused
+    /// whenever `scheme_id` matches the previous call, since the same
+    /// palette is typically used across many consecutive frames.
     pub fn colorize_into(&mut self, max_iter: u32, scheme_id: u8, lut: &[u8], out: &mut [u8]) {
         let n = (self.width * self.height) as usize;
         assert_eq!(out.len(), n * 4, "colorize destination must be width*height RGBA8 bytes");
@@ -532,6 +647,8 @@ impl CudaFractal {
         self.dev.dtoh_sync_copy_into(&self.color_output, out).unwrap();
     }
 
+    /// Standard 1D launch grid for the histogram/colorize kernels, which
+    /// operate on a flat pixel array with no 2D spatial meaning.
     fn linear_cfg(n: u32) -> LaunchConfig {
         LaunchConfig {
             block_dim: (256, 1, 1),
@@ -544,6 +661,15 @@ impl CudaFractal {
 
     pub fn height(&self) -> u32 { self.height }
 
+    /// Launch grid for Morton-order dispatch (see the module-level
+    /// documentation): the frame is conceptually padded up to a `dim x
+    /// dim` square, `dim` the next power of two at or above
+    /// `max(w, h)`, since a Z-order curve's bit-interleaving only maps
+    /// cleanly onto power-of-two square regions. `blocks` covers that
+    /// padded area in flat 256-thread (16x16) chunks via a 1D grid — the
+    /// kernel itself decodes each thread's linear index back into `(x, y)`
+    /// through the Morton bit-interleaving and discards threads that land
+    /// outside the true `w x h` frame.
     fn morton_cfg(&self, w: u32, h: u32) -> LaunchConfig {
         let dim    = w.max(h).max(1).next_power_of_two();
         let total  = dim as u64 * dim as u64;

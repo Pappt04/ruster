@@ -5,6 +5,10 @@ use crate::fractal::kernels::mandelbrot::{mandelbrot, mandelbrot_x4, mandelbrot_
 use crate::gui::viewport::Viewport;
 use rayon::prelude::*;
 
+/// Full-frame render using 4-lane f64 SIMD kernels, with a scalar tail for
+/// the last `w % 4` pixels of each row. Used for Mandelbrot/Julia at zoom
+/// levels past [`crate::fractal::fractal::F32_PRECISION_THRESHOLD`], where
+/// f32 no longer distinguishes adjacent pixels.
 pub fn render_simd(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
     use wide::f64x4;
 
@@ -52,6 +56,10 @@ pub fn render_simd(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_i
     buf
 }
 
+/// Full-frame render using 8-lane f32 SIMD kernels (twice the lane count of
+/// [`render_simd`], since f32 packs twice as many values per vector
+/// register), with an f64 scalar tail for the remainder of each row. The
+/// default fast path below [`crate::fractal::fractal::F32_PRECISION_THRESHOLD`].
 pub fn render_simd_f32(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
     use wide::f32x8;
 
@@ -104,6 +112,11 @@ pub fn render_simd_f32(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], m
     buf
 }
 
+/// Like [`render_simd_f32`], but for Mandelbrot processes 16 pixels per
+/// step using the dual-chain [`mandelbrot_x8x2`] kernel to give the CPU's
+/// out-of-order scheduler independent work to overlap (see that kernel's
+/// documentation for why). Julia has no such dual-chain kernel and falls
+/// straight through to the single-chain 8-wide loop.
 pub fn render_simd_f32_ilp(vp: &Viewport, fractal: FractalType, julia_c: [f64; 2], max_iter: u32) -> IterBuf {
     use wide::f32x8;
 

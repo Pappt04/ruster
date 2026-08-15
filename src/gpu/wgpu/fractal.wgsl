@@ -1,3 +1,11 @@
+// wgpu compute shader for direct escape-time rendering. WGSL has no f64
+// type, so every kernel here is f32 only — this is always the fast-path
+// precision, with no f64 fallback for deep zoom the way the CPU and CUDA
+// backends have. Mirrors the f32 kernels in src/fractal/kernels/ (see
+// those for the underlying math); periodicity detection is skipped, as in
+// the CPU SIMD and CUDA f32 kernels.
+
+// Layout must match gpu::wgpu::uniforms::Uniforms field-for-field.
 struct Uniforms {
     re_start : f32,
     im_start : f32,
@@ -6,7 +14,7 @@ struct Uniforms {
     julia_cr : f32,
     julia_ci : f32,
     max_iter : u32,
-    fractal  : u32,   
+    fractal  : u32,
     width    : u32,
     height   : u32,
 }
@@ -88,6 +96,9 @@ fn nova(cr: f32, ci: f32, max_iter: u32) -> f32 {
     return f32(max_iter);
 }
 
+// Full-frame entry point: one invocation per pixel in row-major order
+// (unlike the CUDA backend, which dispatches Morton-ordered — wgpu has no
+// equivalent scheduling concern being addressed here).
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = gid.x;
@@ -110,6 +121,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @group(0) @binding(2) var<storage, read> tile_descs : array<u32>;
 
+// Tiled entry point: workgroup Z selects the tile (tile_descs[tile_idx] =
+// [x0, y0, w, h]), local (x, y) within it bounds-checked against the
+// tile's own size before writing at its true frame position — see
+// FractalCompute::dispatch_tiled in fractal_compute.rs.
 @compute @workgroup_size(16, 16, 1)
 fn main_tiled(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tile_idx = gid.z;

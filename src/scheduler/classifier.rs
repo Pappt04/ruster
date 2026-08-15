@@ -1,13 +1,30 @@
+//! Corner-sampling classifier: recursively subdivides the frame into
+//! tiles and, without computing a single interior pixel, estimates
+//! whether each tile is "uniform" (its four corners have similar escape
+//! counts, so the whole tile is likely deep in the set or far outside it)
+//! or "divergent" (corners disagree, so the set boundary likely passes
+//! through it). Uniform tiles are cheap and their per-pixel cost is
+//! predictable, which suits the GPU's lockstep SIMT execution — divergent
+//! escape counts within a GPU warp otherwise force every thread in the
+//! warp to run for as long as its slowest member. Divergent tiles are
+//! routed to the CPU instead, where each core runs its own pixels
+//! independently and pays no such penalty. This upfront partition is what
+//! [`crate::scheduler::render_heterogeneous`] dispatches from.
 
 use crate::fractal::fractal_type::FractalType;
 use crate::fractal::{pixel, PixelGrid};
 
+/// Which backend a tile was routed to. Currently only used as a return
+/// discriminant conceptually — [`partition_frame`] returns separate GPU/CPU
+/// vectors directly rather than tagged tiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TileKind {
     Gpu,
     Cpu,
 }
 
+/// Shared read-only parameters threaded through the recursive partition
+/// calls, to avoid an ever-growing argument list.
 struct PartitionCtx<'a> {
     pg: &'a PixelGrid,
     fractal: FractalType,
@@ -17,6 +34,11 @@ struct PartitionCtx<'a> {
     threshold: f32,
 }
 
+/// Normalized spread of the four corner samples: `(max - min) / max_iter`,
+/// so the result is comparable across different `max_iter` settings. A
+/// tile is treated as "uniform enough for the GPU" when this stays below
+/// [`PartitionCtx::threshold`], which
+/// [`crate::scheduler::controller::ThresholdController`] tunes at runtime.
 fn corner_spread(corners: [f32; 4], max_iter: u32) -> f32 {
     let mut max_val = f32::MIN;
     let mut min_val = f32::MAX;
@@ -27,6 +49,9 @@ fn corner_spread(corners: [f32; 4], max_iter: u32) -> f32 {
     (max_val - min_val) / (max_iter.max(1) as f32)
 }
 
+/// Evaluates the escape-time kernel at just the four corners of a tile —
+/// the only per-pixel computation this classifier performs, keeping
+/// partitioning cost negligible relative to actually rendering the frame.
 fn sample_corners(ctx: &PartitionCtx, x0: u32, y0: u32, tw: u32, th: u32) -> [f32; 4] {
     let re0 = ctx.pg.re_start + x0 as f64 * ctx.pg.re_step;
     let re1 = ctx.pg.re_start + (x0 + tw - 1) as f64 * ctx.pg.re_step;
@@ -40,6 +65,11 @@ fn sample_corners(ctx: &PartitionCtx, x0: u32, y0: u32, tw: u32, th: u32) -> [f3
     ]
 }
 
+/// Splits the frame into `max_tile`-sized cells (the largest unit a tile
+/// can be), classifies each independently in parallel via
+/// [`partition_tile`], and merges the resulting GPU/CPU tile lists. Cells
+/// are independent of each other, so this parallelizes trivially over
+/// rayon with no shared mutable state during classification.
 pub fn partition_frame(
     pg: &PixelGrid,
     fractal: FractalType,
@@ -91,6 +121,17 @@ pub fn partition_frame(
     (gpu_tiles, cpu_tiles)
 }
 
+/// Recursively bisects one cell along its longer axis (mirroring
+/// [`crate::fractal::render::mariani_silver`]'s split rule) until either
+/// its corner spread drops below threshold — classified GPU, since the
+/// tile is now small and uniform enough to be predictable — or it hits
+/// [`PartitionCtx::min_tile`] and is handed to the CPU regardless, since
+/// tiles that small are not worth subdividing further no matter how
+/// divergent they are.
+///
+/// Splitting reuses two of the four corner samples from the parent tile
+/// (the pair on the shared edge) and only evaluates the two *new* corners
+/// created by the split, rather than resampling all four for each half.
 fn partition_tile(
     ctx: &PartitionCtx,
     x0: u32, y0: u32, tw: u32, th: u32,

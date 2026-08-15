@@ -1,3 +1,10 @@
+//! The camera: complex-plane center, zoom, and output pixel dimensions.
+//! [`crate::fractal::fractal::pixel_grid`] derives its per-frame pixel
+//! stepping from a `Viewport`, and this module's `pixel_to_complex` is the
+//! same affine mapping expressed as a one-off query rather than a
+//! precomputed grid — used for UI interactions (zoom-to-cursor, pan) where
+//! only one or two points need converting, not every pixel.
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Viewport {
     pub center: [f64; 2],
@@ -13,6 +20,8 @@ impl Default for Viewport {
 }
 
 impl Viewport {
+    /// Same affine mapping as [`crate::fractal::fractal::pixel_grid`],
+    /// evaluated at one point rather than expanded into a per-frame grid.
     pub fn pixel_to_complex(&self, px: f64, py: f64) -> [f64; 2] {
         let half = 2.0 / self.zoom;
         let re = self.center[0] + (px / self.width as f64 - 0.5) * half * self.aspect_ratio() * 2.0;
@@ -20,6 +29,11 @@ impl Viewport {
         [re, im]
     }
 
+    /// Zooms by `factor` while keeping the complex-plane point under
+    /// pixel `(px, py)` fixed on screen: converts that pixel to its
+    /// complex coordinate before changing zoom, then shifts `center` by
+    /// however far that same pixel now maps to after the zoom, so the
+    /// point the cursor was over does not visibly drift.
     pub fn zoom_at(&mut self, px: f64, py: f64, factor: f64) {
         let [re, im] = self.pixel_to_complex(px, py);
         self.zoom *= factor;
@@ -28,13 +42,18 @@ impl Viewport {
         self.center[1] += im - im2;
     }
 
+    /// Translates the camera by a screen-space drag of `(dpx, dpy)`
+    /// pixels, converted to the equivalent complex-plane offset at the
+    /// current zoom.
     pub fn pan(&mut self, dpx: f64, dpy: f64) {
-        let aspect = self.aspect_ratio(); 
+        let aspect = self.aspect_ratio();
         let half = 2.0 / self.zoom;
         self.center[0] -= dpx / self.width as f64 * half * aspect * 2.0;
         self.center[1] -= dpy / self.height as f64 * half * 2.0;
     }
 
+    /// Restores the default view for `fractal` (its own natural center,
+    /// zoom reset to 1).
     pub fn reset(&mut self, fractal: crate::fractal::fractal_type::FractalType) {
         self.center = fractal.default_center();
         self.zoom = 1.0;

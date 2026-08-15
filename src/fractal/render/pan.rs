@@ -3,6 +3,22 @@ use crate::fractal::fractal_type::FractalType;
 use crate::gui::viewport::Viewport;
 use rayon::prelude::*;
 
+/// Reuses a previous frame's iteration buffer across an axis-aligned pan by
+/// shifting the still-valid pixels in place and only recomputing the
+/// newly-exposed strip.
+///
+/// A pan by `dx`/`dy` pixels moves every existing pixel's screen position
+/// but not its complex-plane value, so `buf.copy_within` slides the
+/// reusable region into its new position (row-by-row for a horizontal
+/// pan, one bulk copy for vertical, since vertical shifts move whole
+/// contiguous rows) and only the vacated `|dx|`- or `|dy|`-pixel-wide
+/// strip along the leading edge is recomputed from scratch. This turns an
+/// O(w*h) full re-render into an O(w*h) copy plus an O(w*|dy|) (or
+/// O(h*|dx|)) recompute, which is cheaper whenever the pan is small
+/// relative to the frame — the common case for interactive dragging.
+/// Diagonal pans are not supported (`dx` and `dy` cannot both be nonzero)
+/// since the shifted and newly-exposed regions would overlap in a way a
+/// single `copy_within` cannot express.
 pub fn shift_and_fill(
     buf: &mut IterBuf,
     w: usize,

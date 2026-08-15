@@ -1,10 +1,28 @@
+//! Coloring pipeline: escape-time value -> histogram-equalized position in
+//! [0, 1] -> palette lookup. Histogram equalization is used instead of a
+//! fixed linear mapping from iteration count to color because escape-time
+//! distributions are extremely non-uniform (most pixels either escape
+//! almost immediately or never escape at all) — equalizing spreads the
+//! visible color gradient across whatever range of iteration counts is
+//! actually present in the current view, rather than concentrating nearly
+//! all pixels into one end of a fixed palette.
+
 use std::sync::LazyLock;
 use egui::Color32;
 use rayon::prelude::*;
 
+/// Palette resolution: sampled once per scheme (see [`PALETTES`]) rather
+/// than evaluating each [`ColorScheme::sample`] closed-form expression per
+/// pixel — this is finer than any per-frame pixel range could visibly
+/// distinguish, while keeping the lookup a cheap array index.
 const LUT_SIZE: usize = 4096*2;
 const N_SCHEMES: usize = 6;
 
+/// Every [`ColorScheme`], pre-sampled into a `LUT_SIZE`-entry LUT at
+/// startup (lazily, on first use). [`colorize`] and, on the GPU side,
+/// `colorize_kernel`/`fractal.wgsl` all index into this same table (or its
+/// byte-serialized form, [`PALETTE_BYTES`]), so every backend renders
+/// identical colors for identical input.
 static PALETTES: LazyLock<[[Color32; LUT_SIZE]; N_SCHEMES]> = LazyLock::new(|| {
     std::array::from_fn(|scheme_idx| {
         let scheme = ColorScheme::ALL[scheme_idx];
@@ -30,6 +48,11 @@ pub fn lut_bytes(scheme: ColorScheme) -> &'static [u8] {
     &PALETTE_BYTES[scheme.palette_index()]
 }
 
+/// A palette, defined as a closed-form `t -> RGB` function
+/// ([`ColorScheme::sample`]) rather than a fixed set of control points —
+/// each variant is its own hand-tuned combination of polynomial and
+/// periodic (`sin`) terms in `t`, chosen for visual character rather than
+/// any shared parametrization across schemes.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum ColorScheme {
     #[default]
@@ -128,14 +151,23 @@ fn rgb(r: f32, g: f32, b: f32) -> Color32 {
     )
 }
 
-/// Maps a smooth iteration buffer to RGBA pixels using histogram equalization.
+/// Maps a smooth iteration buffer to RGBA pixels using histogram
+/// equalization: a per-integer-count histogram of escaped pixels, reduced
+/// to a cumulative distribution function, then each pixel's fractional
+/// iteration count is linearly interpolated between its two neighboring
+/// CDF bins before indexing the palette LUT — the interpolation is what
+/// keeps the final image continuous despite the underlying histogram
+/// being built over discrete integer bins. In-set pixels bypass this
+/// entirely and are always solid black.
 pub fn colorize(buf: &[f32], max_iter: u32, scheme: ColorScheme) -> Vec<Color32> {
     let max_f = max_iter as f32;
     let lut = &PALETTES[scheme.palette_index()];
     let bins = max_iter as usize + 1;
 
     // Build histogram of escaped pixels (exclude in-set)
-    // Use parallel fold+reduce if the buffer is large enough to warrant the overhead
+    // Parallel fold+reduce only pays off once there are enough pixels to
+    // amortize the per-thread histogram allocation and final merge —
+    // below that, sequential is both simpler and faster.
     let hist = if buf.len() >= 200_000 {
         buf.par_iter()
             .fold(

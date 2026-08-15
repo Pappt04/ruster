@@ -1,5 +1,17 @@
+//! Owns the wgpu compute pipelines and GPU-resident buffers for all three
+//! render modes this backend supports: a single full-frame dispatch
+//! (`render`), a batch of independently-sized tiles in one dispatch
+//! (`dispatch_tiled`, used by the heterogeneous scheduler's GPU worker),
+//! and perturbation-theory rendering against an uploaded reference orbit
+//! (`render_perturbation`).
+
 use crate::gpu::wgpu::uniforms::{PerturbUniforms, Uniforms};
 
+/// Maximum reference-orbit length (in f32 samples) the perturbation orbit
+/// buffers are pre-sized for. Fixed rather than resized per frame so
+/// `render_perturbation` never needs to reallocate GPU buffers on the hot
+/// path — [`FractalCompute::render_perturbation`] asserts against it
+/// instead.
 const MAX_ORBIT: u64 = 8193;
 
 pub struct FractalCompute {
@@ -20,6 +32,11 @@ pub struct FractalCompute {
 }
 
 impl FractalCompute {
+    /// Compiles both WGSL shader modules (`fractal.wgsl` for direct and
+    /// tiled rendering, `fractal_perturb.wgsl` for perturbation) and
+    /// allocates every GPU buffer up front at the given frame resolution,
+    /// so per-frame calls only need to write uniform/storage data and
+    /// dispatch — no allocation or pipeline creation in the render path.
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("fractal"),
@@ -114,6 +131,9 @@ impl FractalCompute {
 
     pub fn height(&self) -> u32 { self.height }
 
+    /// Renders one full frame: uploads `uniforms`, binds the output
+    /// buffer, dispatches the direct escape-time pipeline, and reads the
+    /// result back to the host.
     pub fn render(&self, device: &wgpu::Device, queue: &wgpu::Queue, uniforms: Uniforms) -> Vec<f32> {
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
@@ -128,6 +148,11 @@ impl FractalCompute {
         self.dispatch_and_readback(device, queue, &self.pipeline, &bg)
     }
 
+    /// Uploads a precomputed [`crate::fractal::perturbation::perturbation_theory::RefOrbit`]
+    /// (split into separate real/imaginary storage buffers, `orbit_re`/
+    /// `orbit_im`) and the frame's [`PerturbUniforms`], then dispatches
+    /// the perturbation shader, which iterates the same delta recurrence
+    /// as the CPU kernels against the uploaded orbit, per pixel.
     pub fn render_perturbation(
         &self,
         device: &wgpu::Device,
@@ -160,6 +185,15 @@ impl FractalCompute {
         self.dispatch_and_readback(device, queue, &self.perturb_pipeline, &bg)
     }
 
+    /// Renders an arbitrary batch of independently-positioned/sized tiles
+    /// (`[x0, y0, w, h]` each) in a single dispatch, indexed by workgroup
+    /// Z: the compute grid is sized to the *largest* tile's width/height
+    /// so every tile fits, and the shader is responsible for bounds-checking
+    /// against its own tile's actual size, discarding threads outside it.
+    /// Does not read back the result — callers combine this with
+    /// [`FractalCompute::readback`] once all tiles for a frame are queued,
+    /// since the scheduler dispatches CPU and GPU tiles concurrently and
+    /// only needs to synchronize once per frame.
     pub fn dispatch_tiled(
         &self,
         device: &wgpu::Device,
@@ -206,6 +240,11 @@ impl FractalCompute {
         queue.submit(std::iter::once(enc.finish()));
     }
 
+    /// Copies the GPU-side output buffer into the host-mappable readback
+    /// buffer and maps it synchronously (`device.poll(Wait)`), returning
+    /// the pixel data as a plain `Vec`. The counterpart to
+    /// [`FractalCompute::dispatch_tiled`], called once after all tiles for
+    /// a frame have been dispatched.
     pub fn readback(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         enc.copy_buffer_to_buffer(
@@ -225,6 +264,11 @@ impl FractalCompute {
         result
     }
 
+    /// Shared dispatch-then-block-for-readback path used by
+    /// [`FractalCompute::render`] and
+    /// [`FractalCompute::render_perturbation`]: 16x16 pixels per
+    /// workgroup, sized to cover the full frame, followed by the same
+    /// synchronous copy-and-map sequence as [`FractalCompute::readback`].
     fn dispatch_and_readback(
         &self,
         device: &wgpu::Device,
@@ -261,6 +305,8 @@ impl FractalCompute {
 }
 
 
+/// Shorthand for a compute-visible uniform/storage buffer binding —
+/// every bind group layout in this module is built from these.
 fn bgl_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,

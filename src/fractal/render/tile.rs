@@ -1,8 +1,17 @@
+//! Renders a single rectangular tile of an already-computed [`PixelGrid`]
+//! rather than a full frame. This is the unit of work the heterogeneous
+//! scheduler dispatches to CPU workers: tiles are small enough to balance
+//! load across threads and GPU launches, while each tile call still
+//! amortizes its own setup cost over many pixels.
+
 use crate::fractal::fractal::{compute, PixelGrid, F32_PRECISION_THRESHOLD};
 use crate::fractal::fractal_type::FractalType;
 use crate::fractal::kernels::julia::{julia, julia_x8};
 use crate::fractal::kernels::mandelbrot::{mandelbrot, mandelbrot_x8};
 
+/// `tile = [x0, y0, width, height]` in pixel coordinates. Allocates and
+/// returns a fresh buffer; see [`render_tile_exact_into`] for the
+/// caller-owned-buffer form used by the scheduler's hot path.
 pub fn render_tile_exact(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32, tile: [u32; 4]) -> Vec<f32> {
     let [_, _, tw, th] = tile;
     let mut local = vec![0.0f32; (tw * th) as usize];
@@ -10,6 +19,9 @@ pub fn render_tile_exact(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2]
     local
 }
 
+/// Scalar f64 tile render into a caller-owned buffer, one worker-owned
+/// scratch allocation reused across many tiles instead of one `Vec` per
+/// tile call.
 pub fn render_tile_exact_into(
     pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32,
     tile: [u32; 4], out: &mut [f32],
@@ -25,6 +37,7 @@ pub fn render_tile_exact_into(
     }
 }
 
+/// Allocating form of [`render_tile_exact_simd_into`].
 pub fn render_tile_exact_simd(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32, tile: [u32; 4]) -> Vec<f32> {
     let [_, _, tw, th] = tile;
     let mut local = vec![0.0f32; (tw * th) as usize];
@@ -32,6 +45,10 @@ pub fn render_tile_exact_simd(pg: &PixelGrid, fractal: FractalType, julia_c: [f6
     local
 }
 
+/// 8-lane f32 SIMD tile render (Mandelbrot/Julia only) into a caller-owned
+/// buffer, with a scalar f64 tail for the last `tw % 8` pixels of each
+/// row. Rows are written directly into `out`'s tile-local layout rather
+/// than the full-frame stride used by [`render_tile_exact_into`].
 pub fn render_tile_exact_simd_into(
     pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32,
     tile: [u32; 4], out: &mut [f32],
@@ -81,6 +98,7 @@ pub fn render_tile_exact_simd_into(
     }
 }
 
+/// Allocating form of [`render_cpu_tile_into`].
 pub fn render_cpu_tile(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32, tile: [u32; 4], use_simd: bool, zoom: f64) -> Vec<f32> {
     let [_, _, tw, th] = tile;
     let mut out = vec![0.0f32; (tw * th) as usize];
@@ -89,6 +107,12 @@ pub fn render_cpu_tile(pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], 
 }
 
 
+/// Dispatches a tile to the SIMD or scalar CPU renderer based on caller
+/// preference and precision requirements: SIMD is only valid for
+/// Mandelbrot/Julia, and only below [`F32_PRECISION_THRESHOLD`], since past
+/// that zoom f32 coordinates round together and the tile would render
+/// wrong. This is the entry point the scheduler's CPU worker calls per
+/// tile.
 #[allow(clippy::too_many_arguments)]
 pub fn render_cpu_tile_into(
     pg: &PixelGrid, fractal: FractalType, julia_c: [f64; 2], max_iter: u32,

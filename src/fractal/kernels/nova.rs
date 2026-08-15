@@ -1,3 +1,16 @@
+/// Nova fractal for `f(z) = z^3 - 1`: the same Newton-Raphson update as
+/// [`crate::fractal::kernels::newton::newton`], but with the pixel
+/// coordinate `c` added back in at every step and `z` always started at the
+/// fixed point `1 + 0i` (a root of `f`, chosen so the first step is
+/// well-defined).
+///
+/// `z_{n+1} = z_n - f(z_n)/f'(z_n) + c` turns the fractal from a
+/// root-finding *basin* picture (Newton, boundaries in the `z`-plane) into
+/// one parametrized by `c`, structurally analogous to how the Mandelbrot
+/// set parametrizes the Julia family: here `c` perturbs an otherwise
+/// convergent iteration just enough to produce chaotic orbits near the
+/// basin boundaries. Convergence and critical-point thresholds are the
+/// same as in [`crate::fractal::kernels::newton::newton`].
 #[inline]
 pub fn nova(cr: f64, ci: f64, max_iter: u32) -> f32 {
     let (mut zr, mut zi) = (1.0, 0.0);

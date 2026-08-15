@@ -1,3 +1,17 @@
+//! Background render worker: moves rendering off the UI thread onto a
+//! dedicated thread communicating over channels, so a slow frame never
+//! blocks input handling or frame pacing. [`RenderWorker::request`] is
+//! fire-and-forget; the worker always renders against the most recently
+//! sent [`RenderRequest`], discarding any it fell behind on, and
+//! [`RenderWorker::poll`] is a non-blocking check for a finished image.
+//!
+//! The worker body is compiled in two different forms depending on the
+//! `cuda` feature: with CUDA, the GPU is fast enough that every frame is
+//! rendered from scratch; without it, the CPU path adds a frame cache with
+//! exact-match reuse, pan-shift buffer recycling, and a fast half-resolution
+//! preview pass so the UI still gets quick visual feedback while a full
+//! CPU render is in flight.
+
 use std::sync::mpsc::{self, Receiver, Sender};
 use egui::ColorImage;
 use crate::{
@@ -11,6 +25,12 @@ use crate::fractal::IterBuf;
 #[cfg(not(feature = "cuda"))]
 const NEIGHBOR_CAP_SLACK: u32 = 16;
 
+/// Identifies whether two requests would produce the same iteration
+/// buffer, so a repeated request (e.g. only the color scheme changed) can
+/// reuse [`FrameCache::buf`] instead of rerendering it. `vp` is compared
+/// by [`Viewport`]'s `PartialEq` directly for exact-match caching, while
+/// [`CacheKey::pan_eligible_match`] separately checks everything *except*
+/// `vp` to decide whether pan-shift recycling applies instead.
 #[cfg(not(feature = "cuda"))]
 #[derive(Clone, PartialEq)]
 struct CacheKey {
@@ -41,6 +61,16 @@ impl CacheKey {
         }
     }
 
+    /// True if `self` and `other` differ only in `vp` (and only in a way
+    /// [`Viewport::delta_pixels`] could still resolve to a pixel-aligned
+    /// pan) — i.e. every render *setting* matches, so
+    /// [`crate::fractal::render::pan::shift_and_fill`] can reuse the cached
+    /// buffer instead of a full rerender. Perturbation, Mariani-Silver, and
+    /// neighbor-capped rendering are excluded because their output is not
+    /// simply "the same function evaluated at a shifted pixel grid" per
+    /// pixel — they carry state (a reference orbit, a boundary-uniformity
+    /// cache, an adaptive iteration cap) tied to the specific frame that a
+    /// naive shift would invalidate.
     fn pan_eligible_match(&self, other: &CacheKey) -> bool {
         self.fractal == other.fractal
             && self.julia_c_bits == other.julia_c_bits
@@ -65,6 +95,9 @@ impl FrameCache {
     }
 }
 
+/// One frame's worth of render settings, sent from the UI thread to the
+/// worker. The `use_*` flags select among the CPU render strategies
+/// (mutually prioritized in `compute_buf`, see [`RenderWorker::new`]).
 pub struct RenderRequest {
     pub vp: Viewport,
     pub fractal: FractalType,
@@ -79,6 +112,9 @@ pub struct RenderRequest {
     pub use_heterogeneous: bool,
 }
 
+/// Distinguishes the fast half-resolution pass (CPU path only) from the
+/// full-resolution result, so [`RenderWorker::poll`] knows a `Preview`
+/// result does not mean the request is fully served yet.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Quality {
     Preview,
@@ -90,6 +126,10 @@ pub struct RenderResult {
     pub quality: Quality,
 }
 
+/// Owns the channels to/from the background render thread. `busy` tracks
+/// whether a `Final` result is still outstanding for the most recent
+/// request, so the UI can show a render-in-progress indicator without
+/// polling render state directly off the worker thread.
 pub struct RenderWorker {
     tx: Sender<RenderRequest>,
     pub rx: Receiver<RenderResult>,
@@ -116,6 +156,11 @@ impl RenderWorker {
                 let scheduler_cfg = SchedulerConfig::default();
 
                 while let Ok(mut req) = req_rx.recv() {
+                    // Block for the first request, then greedily adopt any
+                    // newer ones already queued behind it — only the most
+                    // recent viewport state is worth rendering, so a burst
+                    // of input events (e.g. a zoom drag) collapses to one
+                    // render instead of one per event.
                     while let Ok(newer) = req_rx.try_recv() { req = newer; }
 
                     let sz = (req.vp.width, req.vp.height);
@@ -124,6 +169,9 @@ impl RenderWorker {
                         cached_size = sz;
                     }
 
+                    // Same affine mapping as pixel_grid/PixelGrid, computed
+                    // directly here since the CUDA call sites need the
+                    // individual f64 components rather than the struct.
                     let vp     = &req.vp;
                     let aspect = vp.width as f64 / vp.height as f64;
                     let half   = 2.0 / vp.zoom;
@@ -147,6 +195,11 @@ impl RenderWorker {
                         let scheme_id = req.scheme.palette_index() as u8;
                         let lut = lut_bytes(req.scheme);
 
+                        // The reference orbit is computed host-side (it is
+                        // a serial recurrence with no per-pixel
+                        // parallelism to offer the GPU) and then uploaded
+                        // for the GPU to perturb against; see
+                        // CudaFractal::render_perturbation_and_colorize.
                         if req.use_perturbation && req.fractal == FractalType::Mandelbrot {
                             let orbit = if vp.zoom > F128_ZOOM_THRESHOLD {
                                 compute_reference_orbit_f128(vp.center[0], vp.center[1], req.max_iter)
@@ -189,6 +242,12 @@ impl RenderWorker {
 
                 let mut cache = FrameCache::new();
 
+                // Dispatches to a render strategy by request flag, most
+                // specific first: perturbation variants (deep zoom) take
+                // priority over Mariani-Silver and neighbor-capping (both
+                // general escape-time speedups), which in turn take
+                // priority over the plain SIMD/scalar fallback selected by
+                // precision threshold and fractal type.
                 let compute_buf = |req: &RenderRequest, target_vp: &Viewport| -> IterBuf {
                     if req.use_perturbation && req.use_series_approx {
                         render_perturbation_sa(target_vp, req.fractal, req.julia_c, req.max_iter)
@@ -234,6 +293,9 @@ impl RenderWorker {
                     let h = req.vp.height;
                     let key = CacheKey::from(&req);
 
+                    // Exact match (e.g. only the color scheme or quality
+                    // toggle changed): recolor the cached iteration buffer
+                    // without recomputing it at all.
                     if cache.key.as_ref() == Some(&key) {
                         let pixels = colorize(&cache.buf, req.max_iter, req.scheme);
                         let image = ColorImage::new([w as usize, h as usize], pixels);
@@ -241,6 +303,9 @@ impl RenderWorker {
                         continue;
                     }
 
+                    // Same settings, camera moved by a pixel-aligned pan:
+                    // shift the reusable region of the cached buffer in
+                    // place and only recompute the newly-exposed strip.
                     if let Some(prev_key) = cache.key.as_ref() {
                         if prev_key.pan_eligible_match(&key) {
                             if let Some((dx, dy)) = prev_key.vp.delta_pixels(&req.vp) {
@@ -262,6 +327,11 @@ impl RenderWorker {
                         }
                     }
 
+                    // Neither cache path applied (new view, changed
+                    // fractal/settings, or a non-axis-aligned/out-of-bounds
+                    // move): render a cheap half-resolution preview first
+                    // so the UI has something to show immediately, then
+                    // proceed to the full-resolution render below.
                     if w >= 2 && h >= 2 {
                         let preview_vp = req.vp.with_size((w / 2).max(1), (h / 2).max(1));
                         let preview_buf = compute_buf(&req, &preview_vp);
@@ -289,11 +359,18 @@ impl RenderWorker {
         Self { tx: req_tx, rx: img_rx, busy: false }
     }
 
+    /// Sends a new render request. Never blocks the caller on the render
+    /// itself — the worker thread picks it up asynchronously, discarding
+    /// any request it was still working on that has since been superseded.
     pub fn request(&mut self, req: RenderRequest) {
         let _ = self.tx.send(req);
         self.busy = true;
     }
 
+    /// Non-blocking check for a finished frame, meant to be called once
+    /// per UI frame. Clears `busy` only once a `Final` result arrives, so
+    /// an intermediate `Preview` result does not prematurely signal that
+    /// rendering has finished.
     pub fn poll(&mut self) -> Option<RenderResult> {
         match self.rx.try_recv() {
             Ok(result) => {

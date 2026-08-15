@@ -1,3 +1,8 @@
+//! Fractal math: pixel-grid setup, per-fractal iteration kernels, the CPU
+//! render backends (scalar, SIMD, tiled, perturbation), and post-render
+//! analysis. GPU backends live under `crate::gpu` and reuse the same
+//! [`fractal_type::FractalType`] discriminant and iteration formulas.
+
 pub mod fractal;
 pub mod fractal_type;
 pub mod analysis;
