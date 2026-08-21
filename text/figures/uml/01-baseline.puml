@@ -1,0 +1,23 @@
+@startuml
+!include _header.iuml
+start
+:pixel coordinate -> c;
+if (cardioid / period-2 / period-3\nclosed-form test?) then (interior)
+  :classify as max_iter;
+  stop
+endif
+while (n < max_iter?) is (yes)
+  :FMA update\nz = z*z + c;
+  if (|z|^2 > 4?) then (yes)
+    :record escape\niteration n;
+    stop
+  elseif (periodic orbit\n(Brent cycle check)?) then (yes)
+    :classify as max_iter\n(periodic);
+    stop
+  else (no)
+    :n = n + 1;
+  endif
+endwhile (n = max_iter)
+:classify as max_iter;
+stop
+@enduml

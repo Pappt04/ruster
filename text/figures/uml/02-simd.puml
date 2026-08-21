@@ -1,0 +1,20 @@
+@startuml
+!include _header.iuml
+start
+:load 8 (or 4) pixels into\none vector register\n(f32x8 / f64x4);
+repeat
+  fork
+    :lane 0 (if active):\nz = z*z + c;
+  fork again
+    :lane 1 (if active):\nz = z*z + c;
+  fork again
+    :... ;
+  fork again
+    :lane N-1 (if active):\nz = z*z + c;
+  end fork
+  :test |z|^2 > 4 per lane;
+  :clear escaped lanes from\nactive mask, record their\nescape iteration and z;
+repeat while (any lane still active\nand n < max_iter?) is (yes)
+:remaining active lanes\nclassified as max_iter;
+stop
+@enduml

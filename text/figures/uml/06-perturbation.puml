@@ -1,0 +1,28 @@
+@startuml
+!include _header.iuml
+start
+:compute reference orbit Z_n\n(once per frame; f64, or\ndouble-double past zoom 1e12);
+:for each pixel,\ndelta_c = c_pixel - c_ref;
+while (n < max_iter and\npixel unresolved?) is (yes)
+  :delta = 2*Z_n*delta + delta^2 + delta_c;
+  if (|delta|^2 too large\nrelative to |Z_n|^2?\n(glitch)) then (yes)
+    if (rebasing?) then (yes)
+      :adopt current z_n as the\nnew delta = 0, keep iterating\nagainst the same reference;
+    else (no)
+      :mark pixel glitched;
+      break
+    endif
+  else (no)
+  endif
+endwhile (resolved or max_iter)
+if (glitched pixels remain?\n(multi-reference)) then (yes)
+  :new reference orbit centered\non first glitched pixel\n(up to 8 references total);
+  :retry glitched pixels\nagainst new reference;
+else (no)
+endif
+if (still glitched after\nall references tried?) then (yes)
+  :fall back to exact scalar\nkernel (Section 3.1);
+else (no)
+endif
+stop
+@enduml

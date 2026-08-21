@@ -1,0 +1,20 @@
+@startuml
+!include _header.iuml
+start
+:queue = { full image rectangle };
+while (queue not empty?) is (yes)
+  :pop rectangle R;
+  if (R's width <= 2\nor height <= 2?) then (yes)
+    :compute R's pixels directly;
+  else (no)
+    :render R's border\n(skip edges already\ncomputed by a neighbour);
+    if (every border pixel\nequal? (or DEM cull:\nall corners far enough\nfrom the boundary)) then (yes)
+      :fill interior with\nborder value (or bilinear\ninterpolation for DEM cull);
+    else (no)
+      :split R along its\nlonger axis into R1, R2;
+      :push R1, R2 onto queue;
+    endif
+  endif
+endwhile (empty)
+stop
+@enduml

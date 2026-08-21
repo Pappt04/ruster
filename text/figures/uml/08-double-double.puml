@@ -1,0 +1,12 @@
+@startuml
+!include _header.iuml
+start
+:real value represented as an\nunevaluated pair (hi, lo) of\nordinary f64 values,\n|lo| <= ulp(hi)/2;
+split
+  :Add(a, b):\nTwoSum(a.hi, b.hi) -> (s, e1);\nfold e1 + a.lo + b.lo into e2;\nrenormalize (s, e2) with TwoSum;
+split again
+  :Mul(a, b):\nTwoProduct(a.hi, b.hi) via FMA\n-> (p, e1);\nadd cross terms a.hi*b.lo,\na.lo*b.hi into e1;\nrenormalize (p, e1) with TwoSum;
+end split
+:result: new (hi, lo) pair;
+stop
+@enduml

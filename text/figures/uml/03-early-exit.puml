@@ -1,0 +1,19 @@
+@startuml
+!include _header.iuml
+start
+:c;
+if (in main cardioid?\n(closed-form test)) then (yes)
+  :interior, assign max_iter;
+  stop
+endif
+if (in period-2 bulb?\n(disk test)) then (yes)
+  :interior, assign max_iter;
+  stop
+endif
+if (in either period-3 bulb?\n(two disk tests)) then (yes)
+  :interior, assign max_iter;
+  stop
+endif
+:no closed-form match ->\nrun full iteration loop\n(Section 3.1);
+stop
+@enduml

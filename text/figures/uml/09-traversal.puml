@@ -1,0 +1,15 @@
+@startuml
+!include _header.iuml
+start
+:new frame requested;
+if (pure axis-aligned pan\nfrom the previous frame?) then (yes)
+  :bulk-copy the reusable region\nof the old buffer into place\n(copy_within);
+  :compute only the newly\nexposed strip along the\nedge the view moved toward;
+else (no / new view)
+  :split frame into\n64x64 tiles;
+  :distribute tile bands across\nCPU worker threads (rayon);
+  :visit pixels within each tile\nin row-major or Hilbert order;
+endif
+:frame buffer complete;
+stop
+@enduml

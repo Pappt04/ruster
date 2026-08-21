@@ -1,0 +1,24 @@
+@startuml
+!include _header.iuml
+start
+:c, z0 = 0, dz0/dc = 0;
+while (n < max_iter\nand not escaped?) is (yes)
+  fork
+    :z = z*z + c;
+  fork again
+    :dz/dc = 2*z*(dz/dc) + 1;
+  end fork
+  :n = n + 1;
+  if (|z|^2 > 4?) then (yes)
+    :escaped;
+  else (no)
+  endif
+endwhile (escaped or max_iter)
+if (escaped?) then (yes)
+  :d = |z| * ln|z| / |dz/dc|;
+  :used as corner cull test in\nDEM-augmented Mariani-Silver\n(Section 3.4);
+else (no)
+  :interior: no distance\nestimate computed;
+endif
+stop
+@enduml

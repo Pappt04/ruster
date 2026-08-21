@@ -1,0 +1,9 @@
+@startuml
+!include _header.iuml
+start
+:compute reference orbit Z_n\nand series coefficients\nA_n, B_n, C_n, D_n together\n(once per frame);
+:find skip = last iteration where\nthird- and fourth-order terms stay\nnegligible for the worst-case\ndelta_c in the viewport;
+:for every pixel, evaluate the\nseries directly at n = skip:\ndelta_skip = A dc + B dc^2\n+ C dc^3 + D dc^4;
+:continue ordinary perturbation\niteration (Section 3.6)\nfrom n = skip onward;
+stop
+@enduml
