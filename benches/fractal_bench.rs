@@ -55,16 +55,27 @@ fn cuda_dev() -> Arc<cudarc::driver::CudaDevice> {
     CUDA_DEV.get_or_init(|| cudarc::driver::CudaDevice::new(0).expect("no CUDA device")).clone()
 }
 
+// `WGPU_ADAPTER=integrated cargo bench --bench fractal_bench` reruns the whole
+// wgpu suite (bench_wgpu_*) against the AMD Vega instead of the RTX 3050 — an
+// env var rather than a second copy of every bench_wgpu_* function, since
+// criterion binaries don't get to define their own CLI flags. Selecting by
+// explicit `DeviceType` rather than `PowerPreference` removes any ambiguity
+// about which adapter actually got measured (results/summary.md §1.1).
 fn gpu() -> Option<&'static GpuState> {
     GPU.get_or_init(|| {
         pollster::block_on(async {
+            let integrated = std::env::var("WGPU_ADAPTER").as_deref() == Ok("integrated");
+            let wanted = if integrated {
+                wgpu::DeviceType::IntegratedGpu
+            } else {
+                wgpu::DeviceType::DiscreteGpu
+            };
             let instance = wgpu::Instance::default();
-            let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            }).await?;
-            let info = format!("{} ({:?})", adapter.get_info().name, adapter.get_info().backend);
+            let adapter = instance
+                .enumerate_adapters(wgpu::Backends::all())
+                .into_iter()
+                .find(|a| a.get_info().device_type == wanted)?;
+            let info = format!("{} ({:?}, {:?})", adapter.get_info().name, adapter.get_info().device_type, adapter.get_info().backend);
             let (device, queue) = adapter.request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("bench"),

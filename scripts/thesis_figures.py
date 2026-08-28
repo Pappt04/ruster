@@ -331,9 +331,11 @@ def fig_gpu_breakdown():
     ax.legend(handles=[Patch(facecolor=MUTED, label="iteration kernel"),
                        Patch(facecolor=MUTED, alpha=0.32, label="host readback")],
               loc="upper left")
-    finish(fig, "1920×1080 Mandelbrot, from examples/gpu_probe.rs (median of 5 process launches). The link is "
-            "PCIe 3.0 ×8 — 7.9 GB/s theoretical, 6.7 measured page-locked, so the copy can only be made smaller, "
-            "never faster. Halving the kernel (the fp64 bulb fix) raised the readback's share from 69% to 82%.", top=1.0)
+    # No finish()/baked caption here on purpose — this figure is embedded in
+    # the thesis with its own \caption in diplomski.tex, and the surrounding
+    # prose already covers the PCIe/readback-share explanation finish()
+    # used to print into the image itself.
+    fig.tight_layout()
     return fig
 
 
@@ -566,35 +568,43 @@ def fig_perturbation():
 # FIGURE 10 — cross-project
 # ═════════════════════════════════════════════════════════════════════════════
 def fig_cross_project():
-    # 1-thread f64 scalar: the only fully controlled cross-project comparison.
+    # 1-thread f64 scalar, naive CPU path: the fully controlled cross-project
+    # comparison. ruster/FractalRendererCpp/XaoS/FractalNow were all measured in
+    # one session — bench_results/comparison_report.md (2026-08-18), Table A.
     ruster_1t = ms(FULL, "cpu_thread_scaling_Mandelbrot_1080p/threads/1")
     if ruster_1t is None:
         return None
-    cpp_1t, cpp_16t = 1096.38, 167.07          # FractalRendererCpp, Google Benchmark
-    frs_1t, frs_16t = 18.07, 2.58              # Fractals-rs (f32 SIMD — see caption)
-    ruster_16t = ms(FULL, "cpu_thread_scaling_Mandelbrot_1080p/threads/16")
+    cpp_1t = 893.02     # FractalRendererCpp, Google Benchmark
+    xaos_1t = 720.30    # XaoS, raw per-pixel kernel, guessing disabled (caveat 12)
+    fnow_1t = 2013.25   # FractalNow, raw per-pixel kernel, quad-interp disabled (caveat 17)
+    frs_1t, frs_16t = 18.07, 2.58   # Fractals-rs (f32 SIMD — different algorithm class, right panel only)
 
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(8.6, 4.2))
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(9.4, 4.2))
 
-    names = ["ruster", "FractalRenderer\nCpp"]
-    vals = [ruster_1t, cpp_1t]
-    bars = a1.bar(names, vals, color=[C_CUDA, C_ALT], edgecolor="white", linewidth=1.6,
-                  width=0.55)
-    # Linear, for the same reason as Figure 8: the 20x gap should LOOK like 20x.
+    names = ["ruster", "FractalRenderer\nCpp", "XaoS", "FractalNow"]
+    vals = [ruster_1t, cpp_1t, xaos_1t, fnow_1t]
+    bars = a1.bar(names, vals, color=[C_CUDA, C_ALT, C_WGPU, C_CPU], edgecolor="white",
+                  linewidth=1.6, width=0.6)
+    # Linear, for the same reason as Figure 8: the 36x gap should LOOK like 36x.
     a1.set_ylabel("frame time (ms)")
-    a1.set_ylim(0, cpp_1t * 1.22)
+    a1.set_ylim(0, fnow_1t * 1.22)
     a1.set_title("Single-thread f64 scalar\n(fully controlled comparison)")
     label_bars(a1, bars, vals, "{:.0f} ms")
-    a1.annotate(f"{cpp_1t / ruster_1t:.0f}× faster", (0, ruster_1t), textcoords="offset points",
-                xytext=(0, 22), ha="center", fontsize=10, fontweight="bold", color=INK)
+    for i, v in enumerate(vals[1:], start=1):
+        a1.annotate(f"{v / ruster_1t:.0f}×", (i, v), textcoords="offset points",
+                    xytext=(0, 6), ha="center", fontsize=8.5, fontweight="bold", color=INK)
 
     ns = [1, 2, 4, 8, 16]
     r = [ms(FULL, f"cpu_thread_scaling_Mandelbrot_1080p/threads/{n}") for n in ns]
-    cpp = [1096.38, 736.27, 392.74, 213.93, 167.07]
+    cpp = [893.02, 458.05, 237.37, 135.22, 113.00]
+    xaos = [720.30, 362.81, 185.16, 103.70, 87.96]
+    fnow = [2013.25, 1019.89, 987.55, 707.70, 437.42]
     frs = [18.07, 9.06, 5.18, 3.15, 2.58]
     for ys, colr, lbl, mk in [(r, C_CUDA, "ruster (f64 scalar)", "o"),
                               (frs, C_HYB, "Fractals-rs (f32 SIMD)", "D"),
-                              (cpp, C_ALT, "FractalRendererCpp (f64)", "s")]:
+                              (cpp, C_ALT, "FractalRendererCpp (f64)", "s"),
+                              (xaos, C_WGPU, "XaoS (f64, raw kernel)", "^"),
+                              (fnow, C_CPU, "FractalNow (f64, raw kernel)", "v")]:
         a2.plot(ns, [ys[0] / y for y in ys], marker=mk, markersize=6.5, linewidth=2.0,
                 color=colr, label=lbl, markeredgecolor="white", markeredgewidth=0.8)
     a2.plot(ns, ns, ls=(0, (5, 3)), color=MUTED, lw=1.3, label="ideal")
@@ -603,14 +613,17 @@ def fig_cross_project():
     a2.set_yticks(ns); a2.set_yticklabels(ns)
     a2.set_xlabel("threads"); a2.set_ylabel("speedup vs own 1 thread")
     a2.set_title("Parallel scaling (normalised)")
-    a2.legend(loc="upper left", fontsize=7.6)
+    a2.legend(loc="upper left", fontsize=7.0)
 
-    finish(fig, "LEFT is the only fully controlled cross-project comparison — same fractal, resolution, iteration "
-            "count, precision, algorithm class and thread count — so it isolates kernel quality: ruster rejects "
-            "cardioid/period-2/period-3 interiors and detects cycles; the C++ kernel does neither. RIGHT normalises "
-            "each project against its own single thread, so it compares scaling shape only, not speed. "
-            "⚠ The two projects' numbers come from different sessions; quote the left panel as 17–20× until all "
-            "three are re-run together (see other-projects/tri-compare).", top=1.0)
+    finish(fig, "LEFT is the fully controlled comparison — same fractal, resolution, iteration count, precision, "
+            "algorithm class and thread count, ruster/FractalRendererCpp/XaoS/FractalNow all measured in one "
+            "session (bench_results/comparison_report.md, 2026-08-18) — so it isolates kernel quality: ruster "
+            "rejects cardioid/period-2/period-3 interiors and detects cycles; none of the other three do. XaoS "
+            "and FractalNow are measured on their raw per-pixel kernel with guessing disabled (caveats 12 and "
+            "17); their real interactive engines spend most of a frame avoiding this work, not doing it. "
+            "Fractals-rs's own full-frame bench is SIMD-only, a different algorithm class, so it is left out of "
+            "LEFT and appears only at RIGHT, which normalises each project against its own single thread and so "
+            "compares scaling shape, not speed.", top=1.0)
     return fig
 
 

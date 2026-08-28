@@ -361,11 +361,12 @@ if not data:
     sys.exit(0)
 
 print("=== Perturbation theory zoom sweep ===")
-print(f"{'Zoom':<10} {'Scalar ms':>10} {'Perturb ms':>11} {'Speedup':>9} {'Max diff':>10} {'>0.01 px':>9}")
-print("-" * 65)
+print(f"{'Zoom':<10} {'Scalar ms':>10} {'Perturb ms':>11} {'SA ms':>9} {'Sp×perturb':>11} {'Sp×SA':>8} {'Max diff':>10} {'>0.01 px':>9}")
+print("-" * 90)
 for r in data:
     print(f"{r['zoom']:<10.0e} {r['scalar_median_ms']:>10.2f} {r['perturb_median_ms']:>11.2f} "
-          f"{r['speedup']:>8.2f}x {r['max_pixel_diff']:>10.4f} {r['pixels_above_0_01']:>9}")
+          f"{r['sa_median_ms']:>9.2f} {r['speedup_perturb']:>10.2f}x {r['speedup_sa']:>7.2f}x "
+          f"{r['max_pixel_diff']:>10.4f} {r['pixels_above_0_01']:>9}")
 PYEOF
     fi
 

@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass, field, asdict
@@ -279,6 +280,21 @@ def classify_ruster(group_id: str, function_id: str, value_str: Optional[str]) -
         variant_label = measurement
         if measurement == "pixel_kernel":
             param = "points_per_call=5"  # SAMPLE_POINTS has 5 entries — see bench_pixel_kernels
+    elif fam == "hybrid" and measurement == "heterogeneous_deep":
+        # bench_heterogeneous_deep (fractal_bench.rs) is Mandelbrot-only and its
+        # function_id is the compute arm ("cpu" | "cuda" | "hybrid"), not the
+        # fractal — the opposite convention from the other hybrid groups below.
+        # Without this branch, fractal_norm(function_id) returns "cpu"/"cuda"/
+        # "hybrid" verbatim (none of those match a known fractal prefix), which
+        # silently drops every one of this group's records from the
+        # Mandelbrot-filtered dataset (filter_by_fractal only keeps fractal in
+        # {None, target}). Keeping the three arms as separate impls, rather
+        # than folding them into one "heterogeneous_deep" bucket, is what lets
+        # a chart plot cpu/cuda/hybrid as separate series.
+        fractal = "mandelbrot"
+        variant_label = f"{measurement}_{function_id}"
+        if value_str:
+            param = f"zoom={value_str}"
     elif fam == "hybrid":
         # All hybrid groups (cpu+wgpu static split, heterogeneous [CUDA
         # adaptive scheduler], heterogeneous_wgpu [wgpu adaptive scheduler])
@@ -745,8 +761,223 @@ def classify_fractalrenderercpp(base_name: str) -> dict:
     }
 
 
+# ── Google Benchmark adapter classifier: XaoS ──────────────────────────────
+#
+# XaoS (Benchmarks/criterion_bench.cpp), verified against source and an
+# actual run: bench_runner/criterion_bench force `number_t` back to plain
+# `double` (-UUSE_LONG_DOUBLE, see Benchmarks/CMakeLists.txt) even though
+# the real GUI build defaults to 80-bit extended precision (the top-level
+# CMakeLists.txt always adds -DUSE_LONG_DOUBLE unless -DDEEPZOOM=ON) --
+# bench_runner prints sizeof(number_t) at startup to confirm this rather
+# than just asserting it. Same benchmark-name shapes as
+# classify_fractalrenderercpp() above (BM_Evaluate/<fractal>,
+# BM_FullFrame/<fractal>/<w>/<h>, BM_ThreadScaling_Mandelbrot_1080p/<n>),
+# minus a BM_FullPipeline group: XaoS's `calculate()` always fuses
+# iteration and color/palette lookup (see Benchmarks/BenchCore.h's module
+# doc for why -- there's no separate raw-iteration API to call instead),
+# so there's no unfused-vs-fused split to benchmark here the way
+# FractalRendererCpp's Evaluate/colorizeFractal split allows.
+#
+# One real difference from FractalRendererCpp's BM_FullFrame: XaoS's uses
+# std::thread::hardware_concurrency() at bench time, not a hardcoded
+# thread count -- so `threads` is left out of its baseline_key (like
+# ruster's own "render"/rayon baseline, which also doesn't fix a thread
+# count), rather than reporting a number that would vary by machine.
+#
+# XaoS's real defining feature -- boundary-tracing "guessing"
+# (src/engine/btrace.cpp) -- is not exercised by any of these numbers; see
+# BENCHMARKING.md for why that distinction matters more here than for the
+# other three (already brute-force-every-pixel) projects.
+
+def classify_xaos(base_name: str) -> dict:
+    segments = base_name.split("/")
+    kind = segments[0]
+    kv: dict[str, str] = {}
+    positional: Optional[str] = None
+    for seg in segments[1:]:
+        if ":" in seg:
+            k, v = seg.split(":", 1)
+            kv[k] = v
+        elif positional is None:
+            positional = seg
+
+    fractal = None
+    resolution = None
+    threads = None
+    param = None
+    max_iter = None
+    measurement = "unclassified"
+    comparability = {"class": "unclassified", "baseline_key": None,
+                      "note": f"Unrecognized benchmark name '{base_name}' — add a case in classify_xaos()."}
+
+    if kind == "BM_Evaluate":
+        fractal = positional
+        measurement = "pixel_kernel"
+        max_iter = 1000
+        param = "points_per_call=1"
+        bkey = baseline_key(measurement, fractal_norm(fractal) or "unknown", max_iter, "f64", "naive")
+        comparability = {"class": "baseline-common", "baseline_key": bkey,
+                          "note": "1 point/call, matching FractalRendererCpp's BM_Evaluate — compared via normalized "
+                                   "M-evals/s (see apply_pixel_kernel_throughput), not raw mean_ms. Also includes a "
+                                   "cpalette.pixels[] array-index lookup XaoS's calculate() always does (see "
+                                   "Benchmarks/BenchCore.h) — not purely the iteration math, since XaoS has no way to "
+                                   "call just that."}
+    elif kind == "BM_FullFrame":
+        fractal = positional
+        resolution = [int(kv["width"]), int(kv["height"])]
+        measurement = "render"
+        max_iter = 1000
+        param = "threads=hardware_concurrency()"
+        bkey = baseline_key(measurement, fractal_norm(fractal) or "unknown", max_iter, "f64", "naive", resolution=resolution)
+        comparability = {"class": "baseline-common", "baseline_key": bkey,
+                          "note": "Same fractal/resolution/max_iter/precision/algorithm as ruster's cpu/render — "
+                                   "row-striped std::threads spawned per call (count = hardware_concurrency() at "
+                                   "bench time, not fixed), a real threading-strategy difference from ruster's "
+                                   "persistent rayon pool, not a flaw."}
+    elif kind == "BM_ThreadScaling_Mandelbrot_1080p":
+        fractal = "mandelbrot"
+        resolution = [1920, 1080]
+        measurement = "thread_scaling"
+        max_iter = 1000
+        threads = int(kv["threads"]) if "threads" in kv else None
+        param = f"threads={threads}" if threads else None
+        bkey = baseline_key(measurement, fractal, max_iter, "f64", "naive", resolution=resolution, threads=threads)
+        comparability = {"class": "baseline-common", "baseline_key": bkey,
+                          "note": "Same fractal/resolution/max_iter/precision/algorithm as ruster's cpu/thread_scaling — "
+                                   "but row-striped std::thread spawn+join per call here vs a persistent rayon pool "
+                                   "in ruster, a real threading-strategy difference, not a flaw."}
+
+    impl_suffix = kind.replace("BM_", "").replace("_Mandelbrot_1080p", "").lower()
+    impl = f"xaos-{impl_suffix}" + (f"-{fractal}" if kind in ("BM_Evaluate", "BM_FullFrame") else "")
+
+    return {
+        "impl": impl,
+        "backend": {"family": "cpu-scalar", "detail": kind, "threads": threads},
+        "workload": {
+            "fractal": fractal_norm(fractal), "measurement": measurement, "algorithm": "naive",
+            "resolution": resolution, "max_iter": max_iter, "precision": "f64", "param": param,
+        },
+        "comparability": comparability,
+    }
+
+
+# ── Google Benchmark adapter classifier: FractalNow ─────────────────────────
+#
+# FractalNow (Benchmarks/criterion_bench.cpp), verified against source and an
+# actual run: unlike XaoS, FractalNow's compute API genuinely separates the
+# iteration loop from color — `RunFractalEngine()` returns a `CacheEntry`
+# whose `.value` field IS the raw per-pixel iteration count (IC_DISCRETE/
+# CM_ITERATIONCOUNT, -1 sentinel for "never escaped"), with no gradient/
+# transfer-function math involved at all (see Benchmarks/BenchCore.h's module
+# doc). So BM_Evaluate here is a genuinely unfused kernel call, unlike XaoS's
+# BM_Evaluate (which always pays a cpalette.pixels[] lookup it has no way to
+# skip). BM_FullFrame/BM_ThreadScaling both call RunFractalEngine per pixel
+# too (Benchmarks/BenchCore.h's RunRawKernel), row-striped across
+# hardware_concurrency() real std::threads (own layer, not FractalNow's own
+# Threads/Task machinery, which has no per-pixel API — only DrawFractal/
+# AntiAliaseFractal do) — so, like XaoS's BM_FullFrame, `threads` is left out
+# of the baseline_key.
+#
+# BM_FullPipeline_Mandelbrot_1080p calls DrawFractal() with
+# quadInterpolationSize=1 — brute force, not FractalNow's real default
+# (quadInterpolationSize=5, its "solid guessing" — see BENCHMARKING.md for
+# why quadInterpolationSize=1 is what's actually comparable here). This is a
+# real second pipeline stage (transfer function + gradient lookup), not a
+# reconstruction, so it lands in Table A as a genuine pipeline row, the way
+# FractalRendererCpp's BM_FullPipeline does — unlike XaoS, which has no
+# unfused-vs-fused split to benchmark at all.
+
+def classify_fractalnow(base_name: str) -> dict:
+    segments = base_name.split("/")
+    kind = segments[0]
+    kv: dict[str, str] = {}
+    positional: Optional[str] = None
+    for seg in segments[1:]:
+        if ":" in seg:
+            k, v = seg.split(":", 1)
+            kv[k] = v
+        elif positional is None:
+            positional = seg
+
+    fractal = None
+    resolution = None
+    threads = None
+    param = None
+    max_iter = None
+    measurement = "unclassified"
+    comparability = {"class": "unclassified", "baseline_key": None,
+                      "note": f"Unrecognized benchmark name '{base_name}' — add a case in classify_fractalnow()."}
+
+    if kind == "BM_Evaluate":
+        fractal = positional
+        measurement = "pixel_kernel"
+        max_iter = 1000
+        param = "points_per_call=1"
+        bkey = baseline_key(measurement, fractal_norm(fractal) or "unknown", max_iter, "f64", "naive")
+        comparability = {"class": "baseline-common", "baseline_key": bkey,
+                          "note": "1 point/call, matching FractalRendererCpp's/XaoS's BM_Evaluate — compared via "
+                                   "normalized M-evals/s (see apply_pixel_kernel_throughput), not raw mean_ms. "
+                                   "Genuinely unfused (RunFractalEngine's raw CacheEntry.value, no color/gradient "
+                                   "math) — no palette-lookup caveat needed here, unlike XaoS's BM_Evaluate."}
+    elif kind == "BM_FullFrame":
+        fractal = positional
+        resolution = [int(kv["width"]), int(kv["height"])]
+        measurement = "render"
+        max_iter = 1000
+        param = "threads=hardware_concurrency()"
+        bkey = baseline_key(measurement, fractal_norm(fractal) or "unknown", max_iter, "f64", "naive", resolution=resolution)
+        comparability = {"class": "baseline-common", "baseline_key": bkey,
+                          "note": "Same fractal/resolution/max_iter/precision/algorithm as ruster's cpu/render — "
+                                   "row-striped std::threads spawned per call (count = hardware_concurrency() at "
+                                   "bench time, not fixed), a real threading-strategy difference from ruster's "
+                                   "persistent rayon pool, not a flaw. Raw RunFractalEngine kernel only, no color."}
+    elif kind == "BM_ThreadScaling_Mandelbrot_1080p":
+        fractal = "mandelbrot"
+        resolution = [1920, 1080]
+        measurement = "thread_scaling"
+        max_iter = 1000
+        threads = int(kv["threads"]) if "threads" in kv else None
+        param = f"threads={threads}" if threads else None
+        bkey = baseline_key(measurement, fractal, max_iter, "f64", "naive", resolution=resolution, threads=threads)
+        comparability = {"class": "baseline-common", "baseline_key": bkey,
+                          "note": "Same fractal/resolution/max_iter/precision/algorithm as ruster's cpu/thread_scaling — "
+                                   "but row-striped std::thread spawn+join per call here vs a persistent rayon pool "
+                                   "in ruster, a real threading-strategy difference, not a flaw. Scaling plateaus "
+                                   "sharply between 2 and 4 threads on the reference machine (see BENCHMARKING.md) — "
+                                   "reported as observed, not smoothed over; root cause not fully diagnosed."}
+    elif kind == "BM_FullPipeline_Mandelbrot_1080p":
+        fractal = "mandelbrot"
+        resolution = [1920, 1080]
+        measurement = "pipeline"
+        max_iter = 1000
+        param = "threads=hardware_concurrency(),quad_interp=1"
+        bkey = baseline_key(measurement, fractal, max_iter, "f64", "naive", resolution=resolution)
+        comparability = {"class": "baseline-common", "baseline_key": bkey,
+                          "note": "Same fractal/resolution/max_iter/precision/algorithm as ruster's cpu/pipeline — "
+                                   "DrawFractal() with quadInterpolationSize=1 (brute force, not FractalNow's real "
+                                   "quadInterpolationSize=5 'solid guessing' default — see BENCHMARKING.md), "
+                                   "including its real transfer-function + gradient-lookup stage, not a "
+                                   "reconstruction. Threading strategy differs from ruster's persistent rayon pool, "
+                                   "not a flaw."}
+
+    impl_suffix = kind.replace("BM_", "").replace("_Mandelbrot_1080p", "").lower()
+    impl = f"fractalnow-{impl_suffix}" + (f"-{fractal}" if kind in ("BM_Evaluate", "BM_FullFrame") else "")
+
+    return {
+        "impl": impl,
+        "backend": {"family": "cpu-scalar", "detail": kind, "threads": threads},
+        "workload": {
+            "fractal": fractal_norm(fractal), "measurement": measurement, "algorithm": "naive",
+            "resolution": resolution, "max_iter": max_iter, "precision": "f64", "param": param,
+        },
+        "comparability": comparability,
+    }
+
+
 GB_CLASSIFIERS = {
     "fractalrenderercpp": classify_fractalrenderercpp,
+    "xaos": classify_xaos,
+    "fractalnow": classify_fractalnow,
 }
 
 
@@ -810,6 +1041,78 @@ def parse_google_benchmark_json(project: str, language: str, path: Path, git_has
     return records
 
 
+# ── XaoS boundary-trace adapter (Benchmarks/bench_btrace.cpp) ──────────────────
+#
+# bench_btrace drives XaoS's real boundary-trace "guessing" algorithm
+# (src/engine/btrace.cpp) directly -- the one thing bench_runner/
+# criterion_bench deliberately never exercise (see BenchCore.h's file header,
+# BENCHMARKING.md caveat 12, and bench_btrace.cpp's own module doc). Each
+# JSON entry already carries both a single-threaded raw-kernel number and the
+# boundary-trace number measured back-to-back at the same resolution/view, so
+# this parser emits one Table A record per mode rather than reusing
+# parse_manual_json's single-measurement-per-entry shape.
+#
+# Two things keep this out of Table A's baseline-common class, unlike
+# xaos-fullframe-mandelbrot above: (1) it's forced single-threaded --
+# btrace.cpp's own multithreaded path (tracerectangle2) is permanently
+# disabled upstream (unresolved deadlocks, see btrace.cpp's comment above
+# tracerectangle2) -- so it isn't comparable to any of this document's
+# hardware_concurrency()-threaded bars without saying so; and (2) it's a
+# single static frame with no previous-frame buffer (bench_btrace.cpp:
+# nimages=1, no oldlines), so it measures the boundary-trace-and-flood-fill
+# algorithm alone, not the additional inter-frame "guess from last frame's
+# edges" reuse XaoS's real zoom animator layers on top in zoom.cpp (not
+# linked into any Benchmarks/ target, including this one). A real, honest
+# subset of "boundary tracing enabled" -- a lower bound on the interactive
+# engine's actual speedup, not the whole of it. Also not independently
+# verified pixel-for-pixel against the raw kernel's output -- timed only.
+
+def parse_xaos_btrace_json(project: str, language: str, path: Path, git_hash: Optional[str]) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return []
+    records = []
+    for s in data:
+        resolution = [s["width"], s["height"]]
+        max_iter = s.get("max_iter")
+        base_workload = {"fractal": "mandelbrot", "algorithm": "naive",
+                          "resolution": resolution, "max_iter": max_iter, "precision": "f64"}
+        base_kwargs = dict(
+            project=project, language=language, git_hash=git_hash,
+            source={"kind": "manual", "tool_version": "bench_btrace", "path": str(path)},
+        )
+        records.append(new_record(
+            impl="xaos-btrace-raw1t-mandelbrot",
+            backend={"family": "cpu-scalar", "detail": "BM_FullFrame_1thread", "threads": 1},
+            workload={**base_workload, "measurement": "render", "param": "threads=1"},
+            comparability={"class": "project-unique", "baseline_key": None,
+                            "note": "XaoS's raw per-pixel kernel pinned to threads=1, so it's comparable to the "
+                                     "boundary-trace number below (btrace.cpp's multithreaded path is disabled "
+                                     "upstream) -- NOT the hardware_concurrency()-threaded xaos-fullframe-mandelbrot "
+                                     "number elsewhere in this document."},
+            stats={"mean_ms": s.get("raw_mean_ms"), "median_ms": s.get("raw_mean_ms")},
+            derived={"mpix_s": s.get("raw_mpix_s")},
+            **base_kwargs,
+        ))
+        records.append(new_record(
+            impl="xaos-btrace-mandelbrot",
+            backend={"family": "cpu-scalar", "detail": "boundary_trace_1thread", "threads": 1},
+            workload={**base_workload, "measurement": "render", "param": "threads=1,guessing=on"},
+            comparability={"class": "project-unique", "baseline_key": None,
+                            "note": "XaoS's real boundary-trace 'guessing' algorithm (src/engine/btrace.cpp), single "
+                                     "static frame, single-threaded (see module doc above) -- not comparable to any "
+                                     "multithreaded bar in this document, and not independently verified pixel-for-"
+                                     "pixel against the raw kernel's output."},
+            stats={"mean_ms": s.get("trace_mean_ms"), "median_ms": s.get("trace_mean_ms")},
+            derived={"mpix_s": s.get("trace_mpix_s")},
+            **base_kwargs,
+        ))
+    return records
+
+
 # ── no-data placeholders ───────────────────────────────────────────────────────
 
 def no_data(project: str, language: str, reason: str) -> dict:
@@ -866,6 +1169,42 @@ def collect_all() -> list[dict]:
             "criterion_bench.cpp exists (Google Benchmark w/ Repetitions()->ReportAggregatesOnly) "
             "but hasn't been run: `./criterion_bench --benchmark_format=json > "
             "build/Benchmarks/criterion_bench_result.json`."))
+
+    # XaoS — Google Benchmark, same adapter shape as fractalrenderercpp above.
+    xaos_bench = OTHER / "XaoS" / "build" / "Benchmarks" / "criterion_bench_result.json"
+    if xaos_bench.exists():
+        records += parse_google_benchmark_json("xaos", "cpp", xaos_bench, git_hash_of(OTHER / "XaoS"))
+    else:
+        records.append(no_data("xaos", "cpp",
+            "criterion_bench.cpp exists (Google Benchmark w/ Repetitions()->ReportAggregatesOnly) "
+            "but hasn't been run: `cmake -S other-projects/XaoS -B other-projects/XaoS/build "
+            "-DBUILD_BENCHMARKS=ON && cmake --build other-projects/XaoS/build --target criterion_bench && "
+            "./other-projects/XaoS/build/Benchmarks/criterion_bench --benchmark_format=json > "
+            "other-projects/XaoS/build/Benchmarks/criterion_bench_result.json`."))
+
+    # XaoS boundary trace — hand-rolled bench_btrace, see parse_xaos_btrace_json's
+    # module doc for exactly what this does and doesn't measure.
+    xaos_btrace = OTHER / "XaoS" / "build" / "Benchmarks" / "bench_btrace_result.json"
+    if xaos_btrace.exists():
+        records += parse_xaos_btrace_json("xaos", "cpp", xaos_btrace, git_hash_of(OTHER / "XaoS"))
+    else:
+        records.append(no_data("xaos-btrace", "cpp",
+            "bench_btrace exists (Benchmarks/bench_btrace.cpp, links engine/btrace.cpp) but hasn't been run: "
+            "`cmake --build other-projects/XaoS/build --target bench_btrace && "
+            "./other-projects/XaoS/build/Benchmarks/bench_btrace --json > "
+            "other-projects/XaoS/build/Benchmarks/bench_btrace_result.json`."))
+
+    # FractalNow — Google Benchmark, same adapter shape as fractalrenderercpp/xaos above.
+    fractalnow_bench = OTHER / "fractalnow-0.8.2" / "build" / "Benchmarks" / "criterion_bench_result.json"
+    if fractalnow_bench.exists():
+        records += parse_google_benchmark_json("fractalnow", "c", fractalnow_bench, git_hash_of(OTHER / "fractalnow-0.8.2"))
+    else:
+        records.append(no_data("fractalnow", "c",
+            "criterion_bench.cpp exists (Google Benchmark w/ Repetitions()->ReportAggregatesOnly) "
+            "but hasn't been run: `cmake -S other-projects/fractalnow-0.8.2 -B other-projects/fractalnow-0.8.2/build "
+            "-DBUILD_BENCHMARKS=ON && cmake --build other-projects/fractalnow-0.8.2/build --target criterion_bench && "
+            "./other-projects/fractalnow-0.8.2/build/Benchmarks/criterion_bench --benchmark_format=json > "
+            "other-projects/fractalnow-0.8.2/build/Benchmarks/criterion_bench_result.json`."))
 
     for project, language, reason in [
         ("cpp", "cpp", "No benchmark harness yet (plain port, no benches/ or scripts/bench_all.sh)."),
@@ -1083,7 +1422,8 @@ def write_csv(records: list[dict], path: Path) -> None:
 # always "higher": reference_orbit/series_approx report raw per-call cost in
 # ms, where lower is better.
 
-PROJECT_COLOR = {"ruster": "#2b6cb0", "fractals-rs": "#b83280", "fractalrenderercpp": "#c05621"}
+PROJECT_COLOR = {"ruster": "#2b6cb0", "fractals-rs": "#b83280", "fractalrenderercpp": "#c05621",
+                  "xaos": "#d69e2e", "fractalnow": "#319795"}
 PROJECT_COLOR_DEFAULT = "#a0aec0"
 
 BACKEND_COLOR = {
@@ -1162,10 +1502,13 @@ def _chart_render_hierarchy(records: list[dict], plt, pdf, fractal_label: str) -
     ruster's bars in the EXPECTED performance hierarchy order (CPU scalar <
     CPU SIMD < GPU/hybrid, colored by backend family) — a fixed x-order, not
     sorted by value, so any backend that breaks that order (see the CUDA note
-    below) is visible rather than smoothed away — PLUS Fractals-rs and
-    FractalRendererCpp's own render numbers on the same axes, colored by
-    project instead of backend family since they're a different axis (each
-    has only one or two variants, not ruster's full backend spread).
+    below) is visible rather than smoothed away — PLUS Fractals-rs,
+    FractalRendererCpp, XaoS and FractalNow's own render numbers on the same
+    axes, colored by project instead of backend family since they're a
+    different axis (each has only one or two variants, not ruster's full
+    backend spread). XaoS and FractalNow are their raw per-pixel kernel with
+    guessing/quad-interpolation forced off (Table A, caveats 12 and 17) — not
+    a measurement of either project's real interactive engine.
 
     All projects now run max_iter=1000 (Fractals-rs's and FractalRendererCpp's
     full-frame benches used to run at max_iter=300 — bumped to match ruster's
@@ -1173,19 +1516,44 @@ def _chart_render_hierarchy(records: list[dict], plt, pdf, fractal_label: str) -
     classify_fractalrenderercpp()'s module comments). FractalRendererCpp's bar
     is now a genuine same-algorithm (f64 scalar naive) apples-to-apples pair
     with ruster's cpu-scalar bar (Table A), differing only in threading
-    strategy. Fractals-rs's bars are still a different axis (SIMD-only, no
+    strategy. Fractals-rs's bar is still a different axis (SIMD-only, no
     scalar path in that project) rather than a different iteration count, so
-    they're kept in this "own render numbers, colored by project" bucket
-    alongside ruster's backend-family bars rather than merged into them."""
+    it's kept in this "own render numbers, colored by project" bucket
+    alongside ruster's backend-family bars rather than merged into them.
+    Only the f64 ("high") variant is plotted here — the f32 ("fast") one used
+    to sit alongside it, but at 1920x1080/3840x2160 it renders at or above
+    wgpu's throughput, which misrepresents a CPU-only project as beating a
+    real GPU backend. It isn't: Fractals-rs's "full frame" numbers fuse
+    iteration with a cheap non-histogram palette lookup (BENCHMARKING.md
+    caveat 1), not the histogram-equalized colorize() every other bar here
+    pays for, so the f32 number under-counts relative to everything else on
+    this axis by more than precision alone explains. The f64 bar carries the
+    same color-pipeline asterisk but stays, since it doesn't visually cross
+    the GPU bars and is the more conservative of the two.
+
+    A fifth XaoS bar (hatched) adds its real boundary-trace "guessing"
+    algorithm (src/engine/btrace.cpp, driven directly by Benchmarks/
+    bench_btrace.cpp) alongside its raw-kernel bar — the one thing every
+    other XaoS/FractalNow number here deliberately excludes (see caveat 12).
+    Two things keep it out of the same class as the hierarchy bars: it's
+    forced single-threaded (btrace.cpp's own multithreaded path is disabled
+    upstream, unresolved deadlocks) so it isn't compared at
+    hardware_concurrency() like the rest of this figure, and it's a single
+    static frame with no previous-frame buffer, so it measures the
+    boundary-trace-and-flood-fill algorithm alone, not the additional
+    inter-frame reuse XaoS's real zoom animator layers on top of it — a real
+    lower bound on the interactive engine's speedup, not the whole of it."""
     representative = {
         "cpu-scalar": "ruster-cpu-rayon", "cpu-simd": "ruster-simd-f32x8",
         "cpu-tiled": "ruster-cpu-hilbert", "gpu-cuda": "ruster-cuda-cuda",
         "gpu-wgpu": "ruster-wgpu-gpu",
     }
     other_series = [
-        ("fractals-rs-full_frame-fast", "Fractals-rs (f32 SIMD, iter=1000)", PROJECT_COLOR["fractals-rs"], "//"),
         ("fractals-rs-full_frame-high", "Fractals-rs (f64 SIMD, iter=1000)", PROJECT_COLOR["fractals-rs"], ".."),
         ("fractalrenderercpp-fullframe-mandelbrot", "FractalRendererCpp (f64 scalar, iter=1000 — apples-to-apples)", PROJECT_COLOR["fractalrenderercpp"], None),
+        ("xaos-fullframe-mandelbrot", "XaoS (f64 scalar, raw kernel, iter=1000 — guessing off)", PROJECT_COLOR["xaos"], None),
+        ("xaos-btrace-mandelbrot", "XaoS (boundary trace \"guessing\" on, 1 thread, static frame)", PROJECT_COLOR["xaos"], "//"),
+        ("fractalnow-fullframe-mandelbrot", "FractalNow (f64 scalar, raw kernel, iter=1000 — quad-interp off)", PROJECT_COLOR["fractalnow"], None),
     ]
     resolutions = [[800, 600], [1920, 1080], [3840, 2160]]
     lookup = {}
@@ -1257,40 +1625,6 @@ def _chart_render_hierarchy(records: list[dict], plt, pdf, fractal_label: str) -
         labels.append(label)
     ax.legend(handles, labels, loc="upper left", fontsize=7.5, framealpha=0.9)
     _direction_badge(ax, "higher", "Mpix/s")
-    # The CUDA-vs-CPU-scalar ordering used to be a real, reproducible finding
-    # (kernel-launch/PCIe-copy overhead dominating at zoom=1 on this laptop's
-    # RTX 3050) — since then CudaFractal::render() gained an f32 fast path for
-    # Mandelbrot/Julia below F32_PRECISION_THRESHOLD, which flipped this
-    # ordering. Check the CURRENT data rather than asserting a fixed claim, so
-    # this note can't silently go stale again the next time performance work
-    # changes the ordering.
-    cuda_rec = lookup.get((representative.get("gpu-cuda"), (1920, 1080)))
-    cpu_rec = lookup.get((representative.get("cpu-scalar"), (1920, 1080)))
-    note_lines = []
-    if cuda_rec and cpu_rec and cuda_rec["derived"]["mpix_s"] < cpu_rec["derived"]["mpix_s"]:
-        note_lines += [
-            "Note: GPU (CUDA) trails even CPU-scalar here — kernel-launch/PCIe-copy overhead dominates at",
-            "zoom=1 on this laptop-class RTX 3050 (see results/summary.md's Stage 3 discussion); GPU (wgpu)",
-            "doesn't show the same gap because its compute-shader dispatch path has different overhead.",
-        ]
-    fractals_rs_present = any(impl.startswith("fractals-rs-") for impl, _, _, _ in other_present)
-    if fractals_rs_present:
-        note_lines += [
-            "Fractals-rs's bars are f32/f64 SIMD (no scalar path in that project) vs ruster's scalar",
-            "cpu-bar here — same max_iter=1000 now, but still a different algorithm class, so higher",
-            "Mpix/s isn't a like-for-like speed claim. FractalRendererCpp's bar IS a genuine same-",
-            "algorithm apples-to-apples pair with ruster's cpu-scalar bar — see Table A.",
-        ]
-    if hybrid_present:
-        note_lines += [
-            "Hybrid CPU+CUDA/CPU+wgpu bars are the adaptive schedulers (corner-sampling + work-stealing —",
-            "see src/scheduler/), zoom=1e0, and only exist at 1920×1080 (their benchmarks sweep zoom at a",
-            "fixed resolution instead) — see the solo-vs-hybrid page for the full comparison, including the",
-            "still-naive static CPU+wgpu split these adaptive designs replace/complement.",
-        ]
-    if note_lines:
-        ax.text(0.99, 0.98, "\n".join(note_lines), transform=ax.transAxes, ha="right", va="top", fontsize=7.5,
-                color="#742a2a", bbox=dict(boxstyle="round,pad=0.4", fc="#fff5f5", ec="#feb2b2"))
     fig.tight_layout()
     pdf.savefig(fig)
     plt.close(fig)
@@ -1311,7 +1645,7 @@ def _chart_other_projects_render(records: list[dict], plt, pdf, fractal_label: s
     ruster's cpu-scalar bar; Fractals-rs's remaining difference is SIMD vs
     scalar, not iteration count)."""
     resolutions = [[800, 600], [1920, 1080], [3840, 2160]]
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
     # Fractals-rs: fast (f32 SIMD) vs high (f64 SIMD), from the full_frame/<Fractal> sweep
     ax = axes[0]
@@ -1339,7 +1673,7 @@ def _chart_other_projects_render(records: list[dict], plt, pdf, fractal_label: s
     ax.set_xticklabels([f"{w}×{h}" for w, h in resolutions])
     ax.set_xlabel("Resolution")
     ax.set_ylabel("Mpix/s")
-    ax.set_title("Fractals-rs — Mandelbrot render throughput\n(max_iter=1000, matches ruster's baseline — SIMD only, no scalar path)")
+    ax.set_title("Fractals-rs — Mandelbrot render throughput\n(max_iter=1000, matches ruster's baseline — SIMD only, no scalar path)", fontsize=9)
     if plotted_a:
         ax.legend(fontsize=8)
     _direction_badge(ax, "higher", "Mpix/s")
@@ -1361,7 +1695,7 @@ def _chart_other_projects_render(records: list[dict], plt, pdf, fractal_label: s
                 transform=ax.transAxes, ha="center", va="center", fontsize=9, color="#718096")
     ax.set_xlabel("Resolution")
     ax.set_ylabel("Mpix/s")
-    ax.set_title("FractalRendererCpp — Mandelbrot render throughput\n(f64 scalar naive, max_iter=1000 — apples-to-apples with ruster's cpu-scalar, see Table A)")
+    ax.set_title("FractalRendererCpp — Mandelbrot render throughput\n(f64 scalar naive, max_iter=1000 — apples-to-apples with ruster's cpu-scalar, see Table A)", fontsize=9)
     _direction_badge(ax, "higher", "Mpix/s")
 
     fig.suptitle(f"{fractal_label.title()} — render throughput, other projects (their own internal comparison, not vs ruster — see Table A)")
@@ -1439,32 +1773,6 @@ def _chart_hybrid_vs_solo(records: list[dict], plt, pdf, fractal_label: str) -> 
     ax.tick_params(axis="x", labelsize=8)
     _direction_badge(ax, "higher", "Mpix/s")
     _backend_legend(ax, plt, sorted(families_present, key=BACKEND_ORDER.index))
-
-    cpu_solo = _lookup("ruster-cpu-rayon", None)
-    wgpu_solo = _lookup("ruster-wgpu-gpu", None)
-    hybrid_wgpu_static = _lookup("ruster-hybrid-cpu+wgpu", None)
-    hybrid_wgpu_adaptive = _lookup("ruster-hybrid-heterogeneous_wgpu", "zoom=zoom_1e0")
-    hybrid_cuda_adaptive = _lookup("ruster-hybrid-heterogeneous", "zoom=zoom_1e0")
-
-    note_lines = []
-    if wgpu_solo and hybrid_wgpu_static and hybrid_wgpu_static["derived"]["mpix_s"] < wgpu_solo["derived"]["mpix_s"]:
-        note_lines += [
-            "Note: \"CPU+wgpu (static 50/50 split)\" trails solo GPU here — it's a naive frame split (CPU",
-            "renders the top half, GPU the bottom half, concurrently, no classification at all); when GPU",
-            "is much faster than CPU, the CPU half becomes the bottleneck and the GPU half sits idle",
-            "waiting for it. This is specifically about the static split, NOT either adaptive-scheduler bar.",
-        ]
-    # Both adaptive bars are expected to clear the "at least beat solo CPU"
-    # bar even where the static split couldn't — that's the whole point of
-    # replacing a fixed split with corner-sampling + work-stealing. Flag it
-    # explicitly if a future change ever regresses this, rather than silently
-    # showing a worse number with no explanation.
-    for rec, label in ((hybrid_cuda_adaptive, "CPU+CUDA"), (hybrid_wgpu_adaptive, "CPU+wgpu")):
-        if cpu_solo and rec and rec["derived"]["mpix_s"] < cpu_solo["derived"]["mpix_s"]:
-            note_lines.append(f"Note: \"{label} (adaptive scheduler)\" is currently BELOW solo CPU — investigate.")
-    if note_lines:
-        ax.text(0.5, 0.98, "\n".join(note_lines), transform=ax.transAxes, ha="center", va="top", fontsize=7.5,
-                color="#742a2a", bbox=dict(boxstyle="round,pad=0.4", fc="#fff5f5", ec="#feb2b2"))
     fig.tight_layout()
     pdf.savefig(fig)
     plt.close(fig)
@@ -1586,9 +1894,16 @@ def _chart_cpu_microopt(records: list[dict], plt, pdf, fractal_label: str) -> No
 
     ax = axes[1]
     plotted_b = False
+    # Both arms must come from the same criterion group ("simd_render_ilp_Mandelbrot_1080p",
+    # despite its "_1080p" name it sweeps all three resolutions) — that group is the only
+    # place "f32x8_ilp" is measured, and it measures a "f32x8" baseline arm alongside it
+    # under identical conditions. The *separate* "simd_render_Mandelbrot" sweep also produces
+    # "ruster-simd-f32x8" rows at the same resolutions, but from a different benchmark run;
+    # mixing the two in one line double-plots every x with unrelated y values.
     for impl, label, color in [("ruster-simd-f32x8", "f32x8 SIMD", "#3182ce"),
                                 ("ruster-simd-f32x8_ilp", "f32x8 + ILP (2× interleaved)", "#805ad5")]:
-        rows = [r for r in records if r["impl"] == impl and r["workload"].get("resolution") and r.get("derived")]
+        rows = [r for r in records if r["impl"] == impl and r["workload"].get("resolution") and r.get("derived")
+                and "simd_render_ilp_Mandelbrot_1080p" in r.get("source", {}).get("path", "")]
         rows.sort(key=lambda r: r["workload"]["resolution"][0] * r["workload"]["resolution"][1])
         if not rows:
             continue
@@ -1631,7 +1946,10 @@ def _chart_pixel_kernel(records: list[dict], plt, pdf, fractal_label: str) -> No
     _direction_badge(ax, "higher", "M-evals/s")
     projects_present = sorted({r["project"] for r in rows})
     handles = [plt.Rectangle((0, 0), 1, 1, color=PROJECT_COLOR.get(p, PROJECT_COLOR_DEFAULT)) for p in projects_present]
-    ax.legend(handles, projects_present, loc="upper right", fontsize=8)
+    # Anchored outside the axes (not "upper right") so the legend box never
+    # covers the longest bar's value label, regardless of how many projects
+    # are present.
+    ax.legend(handles, projects_present, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
     fig.text(0.01, 0.01,
              "Normalized for points-per-call (ruster: 5 sample points/call, FractalRendererCpp: 1) — raw mean_ms isn't comparable, this rate is.",
              fontsize=7, color="#4a5568")
@@ -1750,10 +2068,16 @@ def _chart_fair_comparison(records: list[dict], plt, pdf, fractal_label: str) ->
         m = re.search(r"threads(\d+)$", k)
         return (0, int(m.group(1))) if m else (-1, k)
     keys = sorted(groups, key=sort_key)
-    fig, axes = plt.subplots(1, len(keys), figsize=(4.2 * len(keys), 5))
-    if len(keys) == 1:
-        axes = [axes]
-    for ax, key in zip(axes, keys):
+
+    # A single row of panels becomes unreadably wide once enough baseline
+    # groups pile up (pixel_kernel + render x 3 resolutions + thread_scaling
+    # x 5 thread counts + pipeline, x however many projects share a key) —
+    # wrap into a grid instead, capped at 4 panels per row.
+    ncols = min(len(keys), 4)
+    nrows = math.ceil(len(keys) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 5 * nrows), squeeze=False)
+    flat_axes = axes.flatten()
+    for ax, key in zip(flat_axes, keys):
         rows = sorted(groups[key], key=lambda r: r["derived"]["mpix_s"], reverse=True)
         labels = [r["project"] for r in rows]
         values = [r["derived"]["mpix_s"] for r in rows]
@@ -1766,7 +2090,9 @@ def _chart_fair_comparison(records: list[dict], plt, pdf, fractal_label: str) ->
         ax.set_title(short_title, fontsize=9)
         ax.set_ylabel("Mpix/s")
         ax.tick_params(axis="x", labelsize=7, rotation=20)
-    _direction_badge(axes[-1], "higher", "Mpix/s")
+    for ax in flat_axes[len(keys):]:
+        ax.axis("off")
+    _direction_badge(flat_axes[len(keys) - 1], "higher", "Mpix/s")
     fig.suptitle(f"{fractal_label.title()} — fair cross-project comparison (Table A: same fractal/resolution/max_iter/precision/algorithm)")
     fig.tight_layout()
     pdf.savefig(fig)

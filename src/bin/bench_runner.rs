@@ -9,7 +9,10 @@
 ///   --iters    N                                  (default: 1000)
 ///   --runs     N   warm-up + timed repetitions    (default: 5)
 ///   --threads  N   rayon threads, 0 = num_cpus    (default: 0)
-///   --backend  cpu|wgpu|hybrid                    (default: cpu)
+///   --backend  cpu|wgpu|wgpu-igpu|hybrid           (default: cpu)
+///              wgpu-igpu forces the integrated AMD Vega adapter instead of
+///              the discrete RTX 3050 — not comparable to CUDA numbers, see
+///              results/summary.md §1.1, but a real second wgpu data point
 ///   --zoom     F                                  (default: 1.0)
 ///   --center   RE,IM   (default: each fractal's own default_center() —
 ///                       Mandelbrot -0.5,0.0; Julia/Newton/Nova 0.0,0.0 —
@@ -124,7 +127,10 @@ struct Args {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Backend { Cpu, Wgpu, Hybrid }
+enum Backend { Cpu, Wgpu, WgpuIgpu, Hybrid }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GpuAdapterPref { Discrete, Integrated }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Traversal { Row, Hilbert }
@@ -197,9 +203,10 @@ fn parse_args() -> Args {
             "--backend" => {
                 i += 1;
                 a.backend = match raw[i].as_str() {
-                    "cpu"    => Backend::Cpu,
-                    "wgpu"   => Backend::Wgpu,
-                    "hybrid" => Backend::Hybrid,
+                    "cpu"       => Backend::Cpu,
+                    "wgpu"      => Backend::Wgpu,
+                    "wgpu-igpu" => Backend::WgpuIgpu,
+                    "hybrid"    => Backend::Hybrid,
                     x => panic!("unknown backend: {x}"),
                 };
             }
@@ -1135,15 +1142,23 @@ fn print_perturb_json(results: &[PerturbCompare]) {
 
 // ── wgpu benchmarking ─────────────────────────────────────────────────────────
 
-fn init_wgpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+/// Selects the adapter by explicit `DeviceType` rather than
+/// `PowerPreference`, because `PowerPreference::HighPerformance` is a hint
+/// wgpu is free to ignore, and this project has already been burned once by
+/// silently benchmarking the wrong GPU (see results/summary.md §1.1) — for
+/// `--backend wgpu-igpu` there is no ambiguity to risk.
+fn init_wgpu(pref: GpuAdapterPref) -> Option<(wgpu::Device, wgpu::Queue)> {
     use wgpu::*;
     pollster::block_on(async {
         let instance = Instance::default();
-        let adapter = instance.request_adapter(&RequestAdapterOptions {
-            power_preference: PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }).await?;
+        let wanted = match pref {
+            GpuAdapterPref::Discrete   => DeviceType::DiscreteGpu,
+            GpuAdapterPref::Integrated => DeviceType::IntegratedGpu,
+        };
+        let adapter = instance
+            .enumerate_adapters(Backends::all())
+            .into_iter()
+            .find(|a| a.get_info().device_type == wanted)?;
         let (device, queue) = adapter.request_device(
             &DeviceDescriptor {
                 label: Some("bench"),
@@ -1153,16 +1168,17 @@ fn init_wgpu() -> Option<(wgpu::Device, wgpu::Queue)> {
             },
             None,
         ).await.ok()?;
-        eprintln!("[wgpu] adapter: {}", adapter.get_info().name);
+        let i = adapter.get_info();
+        eprintln!("[wgpu] adapter: {} ({:?}, {:?})", i.name, i.device_type, i.backend);
         Some((device, queue))
     })
 }
 
-fn bench_wgpu(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize) -> Option<Sample> {
+fn bench_wgpu(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize, pref: GpuAdapterPref) -> Option<Sample> {
     use novafractal::gpu::wgpu::fractal_compute::FractalCompute;
     use novafractal::gpu::wgpu::uniforms::Uniforms;
 
-    let (device, queue) = init_wgpu()?;
+    let (device, queue) = init_wgpu(pref)?;
     let compute = FractalCompute::new(&device, vp.width, vp.height);
 
     let aspect = vp.width as f64 / vp.height as f64;
@@ -1204,7 +1220,10 @@ fn bench_wgpu(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize) -
 
     Some(Sample {
         fractal:        fractal.name(),
-        backend:        "wgpu",
+        backend:        match pref {
+            GpuAdapterPref::Discrete   => "wgpu",
+            GpuAdapterPref::Integrated => "wgpu-igpu",
+        },
         threads:        1,
         width:          vp.width,
         height:         vp.height,
@@ -1238,7 +1257,7 @@ fn bench_hybrid(fractal: FractalType, vp: &Viewport, max_iter: u32, runs: usize)
     use novafractal::gpu::wgpu::fractal_compute::FractalCompute;
     use novafractal::gpu::wgpu::uniforms::Uniforms;
 
-    let (device, queue) = init_wgpu()?;
+    let (device, queue) = init_wgpu(GpuAdapterPref::Discrete)?;
 
     let h_top    = vp.height / 2;
     let h_bottom = vp.height - h_top;
@@ -1648,10 +1667,21 @@ fn main() {
                         eprintln!("[wgpu] --perturbation is CPU-only — skipping");
                         continue;
                     }
-                    if let Some(s) = bench_wgpu(fractal, &fvp, args.max_iter, args.runs) {
+                    if let Some(s) = bench_wgpu(fractal, &fvp, args.max_iter, args.runs, GpuAdapterPref::Discrete) {
                         samples.push(s);
                     } else {
-                        eprintln!("[wgpu] no GPU available — skipping");
+                        eprintln!("[wgpu] no discrete GPU available — skipping");
+                    }
+                }
+                Backend::WgpuIgpu => {
+                    if args.perturbation {
+                        eprintln!("[wgpu-igpu] --perturbation is CPU-only — skipping");
+                        continue;
+                    }
+                    if let Some(s) = bench_wgpu(fractal, &fvp, args.max_iter, args.runs, GpuAdapterPref::Integrated) {
+                        samples.push(s);
+                    } else {
+                        eprintln!("[wgpu-igpu] no integrated GPU available — skipping");
                     }
                 }
                 Backend::Hybrid => {

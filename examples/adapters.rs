@@ -1,11 +1,16 @@
 //! Lists every GPU adapter wgpu can see, and which one
-//! `PowerPreference::HighPerformance` selects — i.e. which device every wgpu
-//! benchmark in this project actually ran on.
+//! `PowerPreference::HighPerformance` selects — i.e. which device a plain
+//! wgpu benchmark in this project would run on by default.
 //!
 //! This exists because the answer was, for a long time, "not the RTX 3050":
 //! the NVIDIA stack was installed compute-only, so there was no NVIDIA Vulkan
 //! ICD and wgpu silently fell back to the integrated AMD Vega. See
 //! results/summary.md §1.1.
+//!
+//! The Vega is no longer just a footgun to guard against — it's a real
+//! second wgpu data point. `bench_runner --backend wgpu-igpu` and
+//! `WGPU_ADAPTER=integrated cargo bench --bench fractal_bench` both select it
+//! explicitly by `DeviceType`, same as this example does below.
 //!
 //! Run: cargo run --release --example adapters
 
