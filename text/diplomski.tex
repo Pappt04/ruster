@@ -27,31 +27,47 @@
 %%  THESIS METADATA -- fill in before writing
 %% =====================================================================
 \autor{Papp Tamás}
-\naslov{Fraktal renderovanje sa hibridnom paralelizacijom}
+\autorEN{Papp Tamás}
+\naslov{Fractal rendering with hybrid parallelism}
 \naslovEN{Fractal rendering with hybrid parallelism}
 \vrstarada{Bachelor Thesis}
+\vrstaradaSR{Дипломски рад}
+\vrstaradaEN{bachelor thesis}
 \studije{Bachelor Academic Studies}
 \mesto{Novi Sad}
 \godina{2026}
 
 \studijskiprogram{Compute and Control Engineering}
 \brojindeksa{RA 4/2022}
-\oblast{Software Engineering}
+\oblast{High-Performance Computer Systems}
 
-\mentor{Dr Velko Petrović}
-\mentorEN{Dr Velko Petrović, PhD}
+\mentor{Dr Veljko Petrović}
+\mentorEN{Dr Veljko Petrović, PhD}
 
-\naucnaoblastEN{Software Engineering and Information Technologies}
-\naucnadisciplinaEN{Software Engineering}
+% Scientific field/discipline are standardized per study programme
+% (Computing and Control), not per thesis topic -- values matched to
+% another thesis from the same programme.
+\naucnaoblast{Електротехничко и рачунарско инжењерство}
+\naucnaoblastEN{Electrical and Computer Engineering}
+\naucnadisciplina{Примењене рачунарске науке и информатика}
+\naucnadisciplinaEN{Applied Computer Science and Informatics}
 
 \keywords{fractal, high performance computing, hybrid systems}
-\izvod{One paragraph that captures the essence of the thesis: the
-  problem, the motivation, an outline of the solution and the result.}
-\abstractEN{One paragraph that captures the essence of the thesis: the
-  problem, the motivation, an outline of the solution and the result.}
+\izvod{Изложити теоретске основе за, и онда имплементирати механизам који
+  рачуна фрактале, нарочито сет Манделброта, користећи перформантне
+  прорачуне на графичкој картици. Анализирати рад резултујућег решења.}
+\abstractEN{Present the theoretical foundations for, and then implement, a
+  mechanism that computes fractals, particularly the Mandelbrot set, using
+  high-performance computation on the graphics card. Analyze the
+  performance of the resulting solution.}
 
-% Number of chapters, pages, references, tables, figures, graphs, appendixes
-\fizickiopis{8}{XX}{X}{X}{X}{X}{X}
+% Chapters, pages, references, tables, figures, graphs, appendixes.
+% Pages = last numbered page before КЉУЧНА ДОКУМЕНТАЦИЈСКА ИНФОРМАЦИЈА
+% (Introduction, page 1, through the end of the Biography); references =
+% number of BibTeX entries in diplomski.bbl; figures = number of
+% \begin{figure} blocks; tables/graphs/appendixes = 0, this thesis has
+% none as separate elements.
+\fizickiopis{8}{49}{21}{0}{29}{0}{0}
 
 \predsednikkomisijeEN{Name Surname, full professor, PhD}
 \clankomisijeEN{Name Surname, full professor, PhD}
@@ -61,7 +77,20 @@
 %% =====================================================================
 \begin{document}
 
+% Cover page: native, English-language typesetting (the class's
+% \maketitle), since this is the English version of the thesis -- unlike
+% the assignment sheet and declaration below, the cover isn't a
+% university-issued form, so there's no reason to use the Serbian scan
+% here.
 \maketitle
+
+% Official university forms (Q2_NA_04-02, 04-03): these bureaucratic
+% forms are issued by the university only in Serbian, regardless of the
+% thesis's own language, so no English-language version exists to insert
+% here -- assignment sheet (04-03), no-conflict-of-interest declaration
+% (04-02).
+\ubaciobrazac{Q2_NA_04-03Zadatakzaizradurada-1.pdf}
+\ubaciobrazac{Q2_NA_04-02_Izjava_Mentor_Kandidat.pdf}
 
 \clearpage
 \thispagestyle{empty}
@@ -408,6 +437,17 @@ pixels per second across resolutions from $800\times600$ to $3840\times2160$ for
 $1000$ iterations. Throughput is essentially flat with resolution, which is expected for a workload
 where each pixel's cost does not depend on the size of the image around it.
 
+Listing~\ref{lst:mandelbrot-scalar} shows this kernel: the closed form test call right at the
+start, then the iteration loop with the Brent style cycle detection described above.
+
+\noindent\begin{minipage}{\linewidth}
+\lstinputlisting[language=Rust, numbers=none,
+  caption={Scalar \kod{f64} iteration of the Mandelbrot set, the reference
+  implementation the SIMD, CUDA and WGSL kernels are algebraically derived from
+  (\kod{src/fractal/kernels/mandelbrot.rs}).},
+  label={lst:mandelbrot-scalar}]{listings/mandelbrot_scalar.rs}
+\end{minipage}
+
 \section{SIMD Vectorization}
 \label{sec:simd}
 
@@ -444,6 +484,19 @@ pixels before the hot loop runs at all, leaving less latency left for a second c
 criterion run during benchmarking also showed two supposedly identical, repeated measurements of
 the same kernel disagreeing by more than half. Chapter~\ref{ch:methodology} returns to this as a
 reminder that a single benchmark run is noise until it has been repeated.
+
+Listing~\ref{lst:mandelbrot-simd} shows the \kod{active} mask from the \kod{f32x8} kernel
+described above: the \kod{just\_escaped} check records which lanes just escaped via a bitwise
+AND, and the immediately following \kod{active} update clears those lanes from the mask so
+further updates no longer touch them, even though the whole vector keeps computing until the loop
+ends.
+
+\noindent\begin{minipage}{\linewidth}
+\lstinputlisting[language=Rust, numbers=none,
+  caption={Active lane mask in the \kod{f32x8} Mandelbrot kernel
+  (\kod{src/fractal/kernels/mandelbrot.rs}).},
+  label={lst:mandelbrot-simd}]{listings/mandelbrot_simd.rs}
+\end{minipage}
 
 \section{Geometric Early Exit Tests}
 \label{sec:early-exit}
@@ -620,6 +673,20 @@ Measured directly, perturbation rendering is not a throughput win. Across the zo
 renders slower than the direct kernel it replaces, because that range never reaches the depth where
 \kod{f64} actually breaks down, so the perturbation machinery is pure overhead on top of arithmetic
 the direct kernel could already do unaided.
+
+Listing~\ref{lst:perturb-rebase} shows \kod{perturb\_mandelbrot\_rebase}, the rebasing variant.
+The \kod{er}/\kod{ei} update is a direct translation of the recurrence from
+Equation~\ref{eq:perturbation}, and the check \kod{if zn\_sq < er * er + ei * ei || m ==
+orbit.len} is the rebasing condition itself: once the squared modulus of the current orbit
+position drops below the squared modulus of the delta itself, or the reference orbit runs out, the
+current position $(az, bz)$ becomes the new delta and $m$ resets to zero.
+
+\noindent\begin{minipage}{\linewidth}
+\lstinputlisting[language=Rust, numbers=none,
+  caption={Perturbation iteration with rebasing
+  (\kod{src/fractal/perturbation/perturbation\_theory.rs}).},
+  label={lst:perturb-rebase}]{listings/perturb_rebase.rs}
+\end{minipage}
 
 \section{Series Approximation}
 \label{sec:series-approximation}
@@ -831,6 +898,25 @@ $2{,}073{,}600$ pixels. Zero differed, in every view. The realised effect on a f
 including the host transfer that dominates it, was a $15$ to $19\%$ reduction across every
 resolution tested, from $800\times600$ up to $3840\times2160$, and the same fix, being in shared
 kernel code, applied to the scheduler's tiled GPU dispatch for free.
+
+Listing~\ref{lst:period3-before} is the test call before the fix, inside the \kod{mandelbrot\_f32}
+kernel: \kod{cr}/\kod{ci} are widened to \kod{double} for the sole purpose of calling the
+\kod{f64} version of the test. Listing~\ref{lst:period3-after} is the function that replaced it at
+the call site, arithmetically identical except for staying in \kod{float} from start to finish.
+
+\noindent\begin{minipage}{\linewidth}
+\lstinputlisting[language=C++, numbers=none,
+  caption={Period 3 test call before the fix, inside \kod{mandelbrot\_f32}:
+  the check runs in \kod{double} inside an otherwise \kod{float} kernel.},
+  label={lst:period3-before}]{listings/period3_before.cu}
+\end{minipage}
+
+\noindent\begin{minipage}{\linewidth}
+\lstinputlisting[language=C++, numbers=none,
+  caption={\kod{in\_period3\_bulb\_f32}, the \kod{float} version of the same test that
+  replaced the call above (\kod{src/gpu/cuda/fractal.cu}).},
+  label={lst:period3-after}]{listings/period3_after.cu}
+\end{minipage}
 
 As with the WebGPU backend, the transfer back to the host costs more than the kernel does. At the
 same $1920\times1080$ configuration, the kernel takes $0.28\,\mathrm{ms}$ and the host readback
@@ -1046,6 +1132,17 @@ rather than resampling all four for each half. Recursion bottoms out at a minimu
 since subdividing further stops paying for itself no matter how divergent the tile still looks.
 The threshold itself is not fixed. Section~\ref{sec:load-balancing} covers where it comes from.
 
+Listing~\ref{lst:corner-spread} is the pair of functions behind Equation~\ref{eq:corner-spread}.
+\kod{sample\_corners} is the only pixel by pixel work the classifier does at all, exactly four
+kernel calls per cell or sub-tile.
+
+\noindent\begin{minipage}{\linewidth}
+\lstinputlisting[language=Rust, numbers=none,
+  caption={Corner sampling and normalized spread
+  (\kod{src/scheduler/classifier.rs}).},
+  label={lst:corner-spread}]{listings/classifier_corners.rs}
+\end{minipage}
+
 The classifier's output is two separate lists of tile rectangles, one bound for the GPU and one
 bound for the CPU, that Section~\ref{sec:work-distribution} dispatches from directly. Measured
 directly, this whole pass costs $0.03$ to $0.32\,\mathrm{ms}$ across a shallow to moderate zoom
@@ -1148,6 +1245,18 @@ was built to provide in the first place.
   is there to bound.}
   \label{fig:pi-controller-response}
 \end{figure}
+
+Listing~\ref{lst:pi-controller} is the entire controller, some twenty lines. The
+\kod{self.\allowbreak integral} update computes the moving average over \kod{history}, a circular
+buffer of the last $16$ errors, and the last two lines of \kod{update}'s body are directly
+Equation~\ref{eq:pi-controller}, clamp included.
+
+\noindent\begin{minipage}{\linewidth}
+\lstinputlisting[language=Rust, numbers=none,
+  caption={PI controller for the classifier threshold
+  (\kod{src/scheduler/controller.rs}).},
+  label={lst:pi-controller}]{listings/pi_controller.rs}
+\end{minipage}
 
 Because interactive rendering renders the frame again on every pan and zoom, this feedback runs continuously
 rather than as a one time calibration step. The update runs at the end of
@@ -2117,9 +2226,10 @@ school, they enrolled in the ... study programme at the Faculty of
 Technical Sciences in Novi Sad, where they studied from 20XX to 20XX.
 
 %% =====================================================================
-%%  Key documentation information (required appendix)
+%%  Key documentation information (required appendix) -- inserted as the
+%%  official filled PDF (Q2_NA_04-05, Serbian KDI + English KWD pages)
+%%  instead of the class's native \KDIpage/\KWDpage typesetting.
 %% =====================================================================
-\KDIpage
-\KWDpage
+\ubaciobrazac{Q2_NA_04-05 KDI.pdf}
 
 \end{document}

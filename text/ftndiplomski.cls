@@ -103,12 +103,15 @@
 \RequirePackage{xcolor}
 \definecolor{ftnplava}{HTML}{0000EE}
 
+% All link categories render in black -- this thesis is meant to be
+% printed, and blue link text (the hyperref/LaTeX default) only helps
+% on screen.
 \RequirePackage[
   colorlinks=true,
   linkcolor=black,
   citecolor=black,
-  urlcolor=ftnplava,
-  filecolor=ftnplava,
+  urlcolor=black,
+  filecolor=black,
   bookmarksnumbered=true,
   pdfstartview=FitH
 ]{hyperref}
@@ -323,12 +326,25 @@
 \newcommand{\univerzitet}[1]{\renewcommand{\@ftn@univerzitet}{#1}}
 \newcommand{\fakultet}[1]{\renewcommand{\@ftn@fakultet}{#1}}
 \newcommand{\autor}[1]{\renewcommand{\@ftn@autor}{#1}}
+% Latin-script rendering of the author's name, used only on the (always
+% English) KWD page -- \autor itself follows the thesis's own language/
+% script, so on a Cyrillic thesis it is not usable there directly.
+\newcommand{\@ftn@autorEN}{}
+\newcommand{\autorEN}[1]{\renewcommand{\@ftn@autorEN}{#1}}
 
 \newcommand{\naslov}[1]{\renewcommand{\@ftn@naslov}{#1}}
 \newcommand{\@ftn@naslovEN}{}
 \newcommand{\naslovEN}[1]{\renewcommand{\@ftn@naslovEN}{#1}}
 
 \newcommand{\vrstarada}[1]{\renewcommand{\@ftn@vrstarada}{#1}}
+% Serbian/English wording for the "Врста рада"/"contents code" field on
+% the KDI page (always Serbian) and KWD page (always English)
+% respectively -- independent of \vrstarada, which follows the thesis's
+% own language and is used only on the title page.
+\newcommand{\@ftn@vrstaradaSR}{Дипломски рад}
+\newcommand{\vrstaradaSR}[1]{\renewcommand{\@ftn@vrstaradaSR}{#1}}
+\newcommand{\@ftn@vrstaradaEN}{bachelor thesis}
+\newcommand{\vrstaradaEN}[1]{\renewcommand{\@ftn@vrstaradaEN}{#1}}
 \newcommand{\studije}[1]{\renewcommand{\@ftn@studije}{#1}}
 
 \newcommand{\@ftn@mesto}{Novi Sad}
@@ -387,6 +403,66 @@
   \renewcommand{\@ftn@brgrafikona}{#6}%
   \renewcommand{\@ftn@brpriloga}{#7}%
 }
+
+%% Additional KDI/KWD table fields -- library-assigned numbers, format
+%% codes, and standard boilerplate that some theses need to override.
+%% Each has a default matching the usual department wording. Fields that
+%% carry prose (rather than a shared code or number) get a separate EN
+%% variant for the KWD page, since the KDI page is always Serbian and the
+%% KWD page is always English regardless of the thesis's own language.
+\newcommand{\@ftn@rednibroj}{}
+\newcommand{\rednibroj}[1]{\renewcommand{\@ftn@rednibroj}{#1}}
+
+\newcommand{\@ftn@identifikacionibroj}{}
+\newcommand{\identifikacionibroj}[1]{\renewcommand{\@ftn@identifikacionibroj}{#1}}
+
+\newcommand{\@ftn@udk}{}
+\newcommand{\udk}[1]{\renewcommand{\@ftn@udk}{#1}}
+
+\newcommand{\@ftn@tipdokumentacije}{монографска публикација}
+\newcommand{\tipdokumentacije}[1]{\renewcommand{\@ftn@tipdokumentacije}{#1}}
+\newcommand{\@ftn@tipdokumentacijeEN}{monographic publication}
+\newcommand{\tipdokumentacijeEN}[1]{\renewcommand{\@ftn@tipdokumentacijeEN}{#1}}
+
+\newcommand{\@ftn@tipzapisa}{текстуални штампани документ}
+\newcommand{\tipzapisa}[1]{\renewcommand{\@ftn@tipzapisa}{#1}}
+\newcommand{\@ftn@tipzapisaEN}{textual printed document}
+\newcommand{\tipzapisaEN}[1]{\renewcommand{\@ftn@tipzapisaEN}{#1}}
+
+\newcommand{\@ftn@jezikizvoda}{српски / енглески}
+\newcommand{\jezikizvoda}[1]{\renewcommand{\@ftn@jezikizvoda}{#1}}
+\newcommand{\@ftn@jezikizvodaEN}{Serbian / English}
+\newcommand{\jezikizvodaEN}[1]{\renewcommand{\@ftn@jezikizvodaEN}{#1}}
+
+\newcommand{\@ftn@zemljapublikovanja}{Република Србија}
+\newcommand{\zemljapublikovanja}[1]{\renewcommand{\@ftn@zemljapublikovanja}{#1}}
+\newcommand{\@ftn@zemljapublikovanjaEN}{Republic of Serbia}
+\newcommand{\zemljapublikovanjaEN}[1]{\renewcommand{\@ftn@zemljapublikovanjaEN}{#1}}
+
+\newcommand{\@ftn@geografskopodrucje}{АП Војводина}
+\newcommand{\geografskopodrucje}[1]{\renewcommand{\@ftn@geografskopodrucje}{#1}}
+\newcommand{\@ftn@geografskopodrucjeEN}{AP Vojvodina}
+\newcommand{\geografskopodrucjeEN}[1]{\renewcommand{\@ftn@geografskopodrucjeEN}{#1}}
+
+\newcommand{\@ftn@izdavac}{ауторски репринт}
+\newcommand{\izdavac}[1]{\renewcommand{\@ftn@izdavac}{#1}}
+\newcommand{\@ftn@izdavacEN}{author's reprint}
+\newcommand{\izdavacEN}[1]{\renewcommand{\@ftn@izdavacEN}{#1}}
+
+\newcommand{\@ftn@mestoiadresa}{Нови Сад, Факултет техничких наука, Трг Доситеја Обрадовића 6}
+\newcommand{\mestoiadresa}[1]{\renewcommand{\@ftn@mestoiadresa}{#1}}
+\newcommand{\@ftn@mestoiadresaEN}{Novi Sad, Faculty of Technical Sciences, Trg Dositeja Obradovića 6}
+\newcommand{\mestoiadresaEN}[1]{\renewcommand{\@ftn@mestoiadresaEN}{#1}}
+
+\newcommand{\@ftn@cuvase}{Библиотека Факултета техничких наука, Трг Доситеја Обрадовића 6, Нови Сад}
+\newcommand{\cuvase}[1]{\renewcommand{\@ftn@cuvase}{#1}}
+\newcommand{\@ftn@cuvaseEN}{Library of the Faculty of Technical Sciences, Trg Dositeja Obradovića 6, Novi Sad}
+\newcommand{\cuvaseEN}[1]{\renewcommand{\@ftn@cuvaseEN}{#1}}
+
+\newcommand{\@ftn@vaznanapomena}{}
+\newcommand{\vaznanapomena}[1]{\renewcommand{\@ftn@vaznanapomena}{#1}}
+\newcommand{\@ftn@vaznanapomenaEN}{}
+\newcommand{\vaznanapomenaEN}[1]{\renewcommand{\@ftn@vaznanapomenaEN}{#1}}
 
 \newcommand{\@ftn@datumprihvatanja}{}
 \newcommand{\datumprihvatanja}[1]{\renewcommand{\@ftn@datumprihvatanja}{#1}}
@@ -451,93 +527,134 @@
 \RequirePackage{array}
 \RequirePackage{tabularx}
 \RequirePackage{colortbl}
+\RequirePackage{arydshln}
 
 \newcolumntype{L}{>{\raggedright\arraybackslash}X}
 
 \newcommand{\@kdi@row}[2]{#1 & #2 \\ \hline}
 
+%% Bordered header used by the KDI/KWD pages: logo, university/faculty name
+%% and address on one line each, then a shaded title bar -- distinct from
+%% \ftnheader (used by the title page), which keeps its own layout.
+%% Takes the institution line, the address line, and the title-bar text as
+%% explicit arguments (rather than branching on \if@ftn@english) because
+%% the KDI page is always Serbian and the KWD page is always English,
+%% regardless of which language the thesis itself is written in.
+\newcommand{\@ftn@kdiheader}[3]{%
+  \renewcommand{\arraystretch}{1.3}
+  \noindent\begin{tabularx}{\textwidth}{|>{\centering\arraybackslash}m{2.2cm}|>{\centering\arraybackslash}X|}
+    \hline
+    \includegraphics[width=1.6cm]{\@ftn@logofakultet} &
+      \ftnsans #1\newline
+      \normalfont #2 \\
+    \hline
+    \multicolumn{2}{|c|}{\cellcolor{gray!15}\ftnsans\bfseries #3} \\
+    \hline
+  \end{tabularx}%
+}
+
 \newcommand{\KDIpage}{%
   \clearpage
   \thispagestyle{empty}
-  \ftnheader
-  \begin{center}
-    \ftnsans\bfseries КЉУЧНА ДОКУМЕНТАЦИЈСКА ИНФОРМАЦИЈА
-  \end{center}
-  \vspace{4pt}
+  \begingroup
+  \setlength{\arrayrulewidth}{0.9pt}
+  \setlength{\dashlinedash}{1pt}
+  \setlength{\dashlinegap}{1pt}
+  \@ftn@kdiheader{Универзитет у Новом Саду\ \textbullet\ \textbf{ФАКУЛТЕТ ТЕХНИЧКИХ НАУКА}}%
+    {21000 Нови Сад, Трг Доситеја Обрадовића 6}%
+    {КЉУЧНА ДОКУМЕНТАЦИЈСКА ИНФОРМАЦИЈА}
+  \vspace{6pt}
   \small
   \renewcommand{\arraystretch}{1.25}
-  \begin{tabularx}{\textwidth}{|>{\raggedright\arraybackslash}p{4.3cm}|L|}
+  \noindent\begin{tabularx}{\textwidth}{|>{\raggedright\arraybackslash}p{4.3cm}:L|}
     \hline
-    Тип документације, ТД: & монографска публикација \\ \hline
-    Тип записа, ТЗ: & текстуални штампани документ \\ \hline
-    Врста рада, ВР: & \@ftn@vrstarada \\ \hline
-    Аутор, АУ: & \@ftn@autor \\ \hline
-    Ментор, МН: & \@ftn@mentor \\ \hline
-    Наслов рада, НР: & \@ftn@naslov \\ \hline
-    Језик публикације, ЈП: & \@ftn@jezikpub \\ \hline
-    Језик извода, ЈИ: & српски / енглески \\ \hline
-    Земља публиковања, ЗП: & Србија \\ \hline
-    Уже географско подручје, УГП: & Војводина \\ \hline
-    Година, ГО: & \@ftn@godina \\ \hline
-    Издавач, ИЗ: & ауторски репринт \\ \hline
-    Место и адреса, МА: & Нови Сад, Факултет техничких наука, Трг Доситеја Обрадовића 6 \\ \hline
-    Физички опис рада, ФО: & бр. поглавља \@ftn@brpoglavlja\ / страница \@ftn@brstranica\ / цитата \@ftn@brcitata\ / табела \@ftn@brtabela\ / слика \@ftn@brslika\ / графикона \@ftn@brgrafikona\ / прилога \@ftn@brpriloga \\ \hline
-    Научна област, НО: & \@ftn@naucnaoblast \\ \hline
-    Научна дисциплина, НД: & \@ftn@naucnadisciplina \\ \hline
-    Предметна одредница / кључне речи, ПО: & \@ftn@kljucnereci \\ \hline
-    УДК: & \\ \hline
-    Чува се, ЧУ: & Библиотека Факултета техничких наука, Трг Доситеја Обрадовића 6, Нови Сад \\ \hline
-    Важна напомена, ВН: & \\ \hline
-    Извод, ИЗ: & \@ftn@izvod \\ \hline
-    Датум прихватања теме, ДП: & \@ftn@datumprihvatanja \\ \hline
-    Датум одбране, ДО: & \@ftn@datumodbrane \\ \hline
-    Чланови комисије, КО: & \\ \hline
-    \quad председник: & \@ftn@predsednik \\ \hline
-    \quad члан: & \@ftn@clankomisije \\ \hline
-    \quad члан, ментор: & \@ftn@mentor \\ \hline
+    Редни број, \textbf{РБР}: & \@ftn@rednibroj \\ \hdashline
+    Идентификациони број, \textbf{ИБР}: & \@ftn@identifikacionibroj \\ \hdashline
+    Тип документације, \textbf{ТД}: & \@ftn@tipdokumentacije \\ \hdashline
+    Тип записа, \textbf{ТЗ}: & \@ftn@tipzapisa \\ \hdashline
+    Врста рада, \textbf{ВР}: & \@ftn@vrstaradaSR \\ \hdashline
+    Аутор, \textbf{АУ}: & \@ftn@autor \\ \hdashline
+    Ментор, \textbf{МН}: & \@ftn@mentor \\ \hdashline
+    Наслов рада, \textbf{НР}: & \@ftn@naslov \\ \hdashline
+    Језик публикације, \textbf{ЈП}: & \@ftn@jezikpub \\ \hdashline
+    Језик извода, \textbf{ЈИ}: & \@ftn@jezikizvoda \\ \hdashline
+    Земља публиковања, \textbf{ЗП}: & \@ftn@zemljapublikovanja \\ \hdashline
+    Уже географско подручје, \textbf{УГП}: & \@ftn@geografskopodrucje \\ \hdashline
+    Година, \textbf{ГО}: & \@ftn@godina. \\ \hdashline
+    Издавач, \textbf{ИЗ}: & \@ftn@izdavac \\ \hdashline
+    Место и адреса, \textbf{МА}: & \@ftn@mestoiadresa \\ \hdashline
+    Физички опис рада, \textbf{ФО}:\newline
+      {\scriptsize(поглавља/страна/цитата/табела/слика/графика/прилога)} &
+      \@ftn@brpoglavlja\ / \@ftn@brstranica\ / \@ftn@brcitata\ / \@ftn@brtabela\ /
+      \@ftn@brslika\ / \@ftn@brgrafikona\ / \@ftn@brpriloga \\ \hdashline
+    Научна област, \textbf{НО}: & \@ftn@naucnaoblast \\ \hdashline
+    Научна дисциплина, \textbf{НД}: & \@ftn@naucnadisciplina \\ \hdashline
+    Предметна одредница / кључне речи, \textbf{ПО}: & \@ftn@kljucnereci \\ \hdashline
+    \textbf{УДК}: & \@ftn@udk \\ \hdashline
+    Чува се, \textbf{ЧУ}: & \@ftn@cuvase \\ \hdashline
+    Важна напомена, \textbf{ВН}: & \@ftn@vaznanapomena \\ \hdashline
+    Извод, \textbf{ИЗ}: & \@ftn@izvod \\ \hdashline
+    Датум прихватања теме, \textbf{ДП}: & \@ftn@datumprihvatanja \\ \hdashline
+    Датум одбране, \textbf{ДО}: & \@ftn@datumodbrane \\ \hdashline
+    Чланови комисије, \textbf{КО}: & \\ \hdashline
+    \quad председник: & \@ftn@predsednik \\ \hdashline
+    \quad члан: & \@ftn@clankomisije \\ \hdashline
+    \quad члан, ментор: & \@ftn@mentor \\
+    \hline
   \end{tabularx}
+  \endgroup
 }
 
 \newcommand{\KWDpage}{%
   \clearpage
   \thispagestyle{empty}
-  \ftnheader
-  \begin{center}
-    \ftnsans\bfseries KEY WORDS DOCUMENTATION
-  \end{center}
-  \vspace{4pt}
+  \begingroup
+  \setlength{\arrayrulewidth}{0.9pt}
+  \setlength{\dashlinedash}{1pt}
+  \setlength{\dashlinegap}{1pt}
+  \@ftn@kdiheader{University of Novi Sad\ \textbullet\ \textbf{FACULTY OF TECHNICAL SCIENCES}}%
+    {21000 Novi Sad, Trg Dositeja Obradovića 6}%
+    {KEY WORDS DOCUMENTATION}
+  \vspace{6pt}
   \small
   \renewcommand{\arraystretch}{1.25}
-  \begin{tabularx}{\textwidth}{|>{\raggedright\arraybackslash}p{4.3cm}|L|}
+  \noindent\begin{tabularx}{\textwidth}{|>{\raggedright\arraybackslash}p{4.3cm}:L|}
     \hline
-    Document type, DT: & monographic publication \\ \hline
-    Type of record, TR: & textual material \\ \hline
-    Contents code, CC: & \@ftn@vrstarada \\ \hline
-    Author, AU: & \@ftn@autor \\ \hline
-    Mentor, MN: & \@ftn@mentorEN \\ \hline
-    Title, TI: & \@ftn@naslovEN \\ \hline
-    Language of text, LT: & \if@ftn@english English\else Serbian\fi \\ \hline
-    Language of abstract, LA: & Serbian / English \\ \hline
-    Country of publication, CP: & Serbia \\ \hline
-    Locality of publication, LP: & Vojvodina \\ \hline
-    Publication year, PY: & \@ftn@godina \\ \hline
-    Publisher, PB: & author's reprint \\ \hline
-    Publication place, PP: & Novi Sad, Faculty of Technical Sciences, Trg Dositeja Obradovića 6 \\ \hline
-    Physical description, PD: & chapters \@ftn@brpoglavlja\ / pages \@ftn@brstranica\ / references \@ftn@brcitata\ / tables \@ftn@brtabela\ / illustrations \@ftn@brslika\ / graphs \@ftn@brgrafikona\ / appendixes \@ftn@brpriloga \\ \hline
-    Scientific field, SF: & \@ftn@naucnaoblastEN \\ \hline
-    Scientific discipline, SD: & \@ftn@naucnadisciplinaEN \\ \hline
-    Subject/Keywords, S/KW: & \@ftn@keywords \\ \hline
-    UC: & \\ \hline
-    Holding data, HD: & Library of the Faculty of Technical Sciences, Trg Dositeja Obradovića 6, Novi Sad \\ \hline
-    Note, N: & \\ \hline
-    Abstract, AB: & \@ftn@abstract \\ \hline
-    Accepted by sci. Board on, ASB: & \@ftn@datumprihvatanja \\ \hline
-    Defended on, DE: & \@ftn@datumodbrane \\ \hline
-    Defense board, DB: & \\ \hline
-    \quad president: & \@ftn@predsednikEN \\ \hline
-    \quad member: & \@ftn@clankomisijeEN \\ \hline
-    \quad member, mentor: & \@ftn@mentorEN \\ \hline
+    Accession number, \textbf{AN}: & \@ftn@rednibroj \\ \hdashline
+    Identification number, \textbf{IN}: & \@ftn@identifikacionibroj \\ \hdashline
+    Document type, \textbf{DT}: & \@ftn@tipdokumentacijeEN \\ \hdashline
+    Type of record, \textbf{TR}: & \@ftn@tipzapisaEN \\ \hdashline
+    Contents code, \textbf{CC}: & \@ftn@vrstaradaEN \\ \hdashline
+    Author, \textbf{AU}: & \@ftn@autorEN \\ \hdashline
+    Mentor, \textbf{MN}: & \@ftn@mentorEN \\ \hdashline
+    Title, \textbf{TI}: & \@ftn@naslovEN \\ \hdashline
+    Language of text, \textbf{LT}: & \if@ftn@english English\else Serbian\fi \\ \hdashline
+    Language of abstract, \textbf{LA}: & \@ftn@jezikizvodaEN \\ \hdashline
+    Country of publication, \textbf{CP}: & \@ftn@zemljapublikovanjaEN \\ \hdashline
+    Locality of publication, \textbf{LP}: & \@ftn@geografskopodrucjeEN \\ \hdashline
+    Publication year, \textbf{PY}: & \@ftn@godina. \\ \hdashline
+    Publisher, \textbf{PB}: & \@ftn@izdavacEN \\ \hdashline
+    Publication place, \textbf{PP}: & \@ftn@mestoiadresaEN \\ \hdashline
+    Physical description, \textbf{PD}:\newline
+      {\scriptsize(chapters/pages/ref./tables/pictures/graphs/appendixes)} &
+      \@ftn@brpoglavlja\ / \@ftn@brstranica\ / \@ftn@brcitata\ / \@ftn@brtabela\ /
+      \@ftn@brslika\ / \@ftn@brgrafikona\ / \@ftn@brpriloga \\ \hdashline
+    Scientific field, \textbf{SF}: & \@ftn@naucnaoblastEN \\ \hdashline
+    Scientific discipline, \textbf{SD}: & \@ftn@naucnadisciplinaEN \\ \hdashline
+    Subject/Keywords, \textbf{S/KW}: & \@ftn@keywords \\ \hdashline
+    \textbf{UC}: & \@ftn@udk \\ \hdashline
+    Holding data, \textbf{HD}: & \@ftn@cuvaseEN \\ \hdashline
+    Note, \textbf{N}: & \@ftn@vaznanapomenaEN \\ \hdashline
+    Abstract, \textbf{AB}: & \@ftn@abstract \\ \hdashline
+    Accepted by sci. Board on, \textbf{ASB}: & \@ftn@datumprihvatanja \\ \hdashline
+    Defended on, \textbf{DE}: & \@ftn@datumodbrane \\ \hdashline
+    Defense board, \textbf{DB}: & \\ \hdashline
+    \quad president: & \@ftn@predsednikEN \\ \hdashline
+    \quad member: & \@ftn@clankomisijeEN \\ \hdashline
+    \quad member, mentor: & \@ftn@mentorEN \\
+    \hline
   \end{tabularx}
+  \endgroup
 }
 
 %% ------------------------------------------------------------------

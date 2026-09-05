@@ -1,0 +1,123 @@
+\begin{thebibliography}{10}
+
+\bibitem{barnsley1988}
+Michael~F. Barnsley.
+\newblock {\em Fractals Everywhere}.
+\newblock Academic Press, 1988.
+
+\bibitem{brent1980}
+Richard~P. Brent.
+\newblock An improved {M}onte {C}arlo factorization algorithm.
+\newblock {\em BIT Numerical Mathematics}, 20(2):176--184, 1980.
+
+\bibitem{fractalsrs2026}
+Maxime Collet.
+\newblock Fractals-rs: a {Rust} fractal explorer.
+\newblock \url{https://github.com/Maxime-Cllt/Fractals-rs}, 2026.
+
+\bibitem{dekker1971}
+T.~J. Dekker.
+\newblock A floating-point technique for extending the available precision.
+\newblock {\em Numerische Mathematik}, 18(3):224--242, 1971.
+
+\bibitem{falconer2014}
+Kenneth Falconer.
+\newblock {\em Fractal Geometry: Mathematical Foundations and Applications}.
+\newblock John Wiley \& Sons, 3rd edition, 2014.
+
+\bibitem{nanobrot2020}
+flutomax.
+\newblock Nanobrot: a fork of kalles fraktaler for deep-zoom mandelbrot
+  rendering.
+\newblock \url{https://github.com/flutomax/nanobrot}, 2020.
+
+\bibitem{heilandallen2021deepzoom}
+Claude Heiland-Allen.
+\newblock Deep zoom theory and practice.
+\newblock
+  \url{https://mathr.co.uk/blog/2021-05-14_deep_zoom_theory_and_practice.html},
+  2021.
+
+\bibitem{hilbert1891}
+David Hilbert.
+\newblock {\"U}ber die stetige abbildung einer linie auf ein
+  fl{\"a}chenst{\"u}ck.
+\newblock {\em Mathematische Annalen}, 38(3):459--460, 1891.
+
+\bibitem{knuth1997seminumerical}
+Donald~E. Knuth.
+\newblock {\em The Art of Computer Programming, Volume 2: Seminumerical
+  Algorithms}.
+\newblock Addison-Wesley, 3rd edition, 1997.
+
+\bibitem{lee2010debunking}
+Victor~W. Lee, Changkyu Kim, Jatin Chhugani, Michael Deisher, Daehyun Kim,
+  Anthony~D. Nguyen, Nadathur Satish, Mikhail Smelyanskiy, Srinivas Chennupaty,
+  Per Hammarlund, Ronak Singhal, and Pradeep Dubey.
+\newblock Debunking the 100x {GPU} vs.\ {CPU} myth: An evaluation of throughput
+  computing on {CPU} and {GPU}.
+\newblock In {\em Proceedings of the 37th International Symposium on Computer
+  Architecture (ISCA)}, 2010.
+
+\bibitem{luk2009qilin}
+Chi-Keung Luk, Sunpyo Hong, and Hyesoon Kim.
+\newblock Qilin: Exploiting parallelism on heterogeneous multiprocessors with
+  adaptive mapping.
+\newblock In {\em Proceedings of the 42nd IEEE/ACM International Symposium on
+  Microarchitecture (MICRO-42)}, 2009.
+
+\bibitem{mandelbrot1982}
+Benoit~B. Mandelbrot.
+\newblock {\em The Fractal Geometry of Nature}.
+\newblock W. H. Freeman, 1982.
+
+\bibitem{martin2013superfractalthing}
+K.~I. Martin.
+\newblock Superfractalthing maths: Theory and practice of perturbation in
+  complex dynamics.
+\newblock \url{https://superfractalthing.co.nf/sft_maths.pdf}, 2013.
+
+\bibitem{fraqtive2023}
+Micha{\l} M{\k{e}}ci{\'n}ski.
+\newblock Fraqtive: a {SIMD} and multi-core mandelbrot-family fractal
+  generator.
+\newblock \url{https://github.com/mimecorg/fraqtive}, 2023.
+
+\bibitem{milnor2006}
+John Milnor.
+\newblock {\em Dynamics in One Complex Variable}.
+\newblock Annals of Mathematics Studies. Princeton University Press, 3rd
+  edition, 2006.
+
+\bibitem{morton1966}
+Guy~M. Morton.
+\newblock A computer oriented geodetic data base and a new technique in file
+  sequencing.
+\newblock Technical report, IBM Ltd., Ottawa, Canada, 1966.
+
+\bibitem{ogitarumpoishi2005}
+Takeshi Ogita, Siegfried~M. Rump, and Shin'ichi Oishi.
+\newblock Accurate sum and dot product.
+\newblock {\em SIAM Journal on Scientific Computing}, 26(6):1955--1988, 2005.
+
+\bibitem{fractalnow2017}
+Marc P{\'e}gon.
+\newblock Fractalnow: an open-source, multi-threaded fractal generator.
+\newblock \url{http://fractalnow.sourceforge.net/}, 2017.
+
+\bibitem{peitgensaupe1988}
+Heinz-Otto Peitgen and Dietmar Saupe, editors.
+\newblock {\em The Science of Fractal Images}.
+\newblock Springer-Verlag, New York, 1988.
+
+\bibitem{fractalrenderercpp2021}
+Mark Seufert.
+\newblock Fractalrenderercpp: a {C++} fractal rendering library.
+\newblock \url{https://github.com/MarkSeufert/FractalRendererCpp}, 2021.
+
+\bibitem{xaos2026}
+{XaoS Project}.
+\newblock {XaoS}: a real-time interactive fractal zoomer.
+\newblock \url{https://github.com/xaos-project/XaoS}, 2026.
+
+\end{thebibliography}

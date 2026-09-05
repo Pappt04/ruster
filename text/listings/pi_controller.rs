@@ -1,0 +1,20 @@
+pub struct ThresholdController {
+    pub threshold: f32,
+    integral: f32,
+    history: [f32; 16],
+    head: usize,
+}
+
+impl ThresholdController {
+    pub fn update(&mut self, gpu_ms: f32, cpu_ms: f32) {
+        let error = gpu_ms - cpu_ms;
+        self.history[self.head] = error;
+        self.head = (self.head + 1) % self.history.len();
+        self.integral = self.history.iter().sum::<f32>() / self.history.len() as f32;
+
+        const K_P: f32 = 0.0005;
+        const K_I: f32 = 0.00005;
+        self.threshold -= K_P * error + K_I * self.integral;
+        self.threshold = self.threshold.clamp(0.001, 0.5);
+    }
+}
