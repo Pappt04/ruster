@@ -1,0 +1,408 @@
+% !TeX program = xelatex
+% Prezentacija (Beamer) - minimalistička, bela pozadina, srpski (latinica)
+% Zasnovano na diplomskom radu "Fraktal renderovanje sa hibridnom paralelizacijom"
+% Ciljano trajanje: 12-16 minuta, ~1 minut po slajdu (16 slajdova)
+% Kompajliranje:  xelatex main.tex   (dva puta, zbog brojača strana)
+
+\documentclass[aspectratio=169,11pt]{beamer}
+
+\usepackage{fontspec}
+\usepackage{polyglossia}
+\setmainlanguage[script=latin]{serbian}
+\setmainfont{Inter}
+\setmonofont{DejaVu Sans Mono}[Scale=0.86]
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,shapes.geometric}
+\usepackage{booktabs}
+
+%% ------------------------------------------------------------------
+%% Boje - minimalistička paleta: bela pozadina, jedan akcenat
+%% ------------------------------------------------------------------
+\definecolor{accent}{HTML}{1B4B66}
+\definecolor{accentlight}{HTML}{5C8AA6}
+\definecolor{accentwarm}{HTML}{C1601E}
+\definecolor{darktext}{HTML}{202020}
+\definecolor{graytext}{HTML}{707070}
+\definecolor{palegray}{HTML}{E7E7E7}
+
+\setbeamertemplate{navigation symbols}{}
+\setbeamercolor{background canvas}{bg=white}
+\setbeamercolor{normal text}{fg=darktext,bg=white}
+\setbeamercolor{structure}{fg=accent}
+\setbeamercolor{title}{fg=accent,bg=white}
+\setbeamercolor{frametitle}{fg=accent,bg=white}
+\setbeamercolor{itemize item}{fg=accent}
+\setbeamercolor{itemize subitem}{fg=accentlight}
+\setbeamercolor{footline}{fg=graytext,bg=white}
+\setbeamercolor{caption}{fg=graytext}
+\setbeamercolor{block title}{fg=accent,bg=palegray}
+\setbeamercolor{block body}{fg=darktext,bg=white}
+
+\setbeamerfont{title}{size=\huge,series=\bfseries}
+\setbeamerfont{frametitle}{size=\Large,series=\bfseries}
+\setbeamerfont{caption}{size=\scriptsize}
+
+\setbeamertemplate{itemize item}{\textcolor{accent}{\scriptsize\raisebox{0.15ex}{$\blacktriangleright$}}}
+\setbeamertemplate{itemize subitem}{\textcolor{accentlight}{\textendash}}
+\setbeamertemplate{enumerate item}{\textcolor{accent}{\bfseries\insertenumlabel.}}
+
+\setbeamertemplate{frametitle}{%
+  \vskip0.5em%
+  {\usebeamerfont{frametitle}\usebeamercolor[fg]{frametitle}\insertframetitle}\par%
+  \vskip0.3em%
+  {\color{accent}\hrule height 0.9pt}%
+  \vskip0.45em%
+}
+
+\setbeamertemplate{footline}{%
+  \begin{beamercolorbox}[wd=\paperwidth,ht=2.6ex,dp=1.4ex,right,rightskip=0.9em plus1fil,leftskip=0.9em]{footline}
+    {\color{graytext}\scriptsize Fraktal renderovanje sa hibridnom paralelizacijom \hfill \insertframenumber\,/\,\inserttotalframenumber}
+  \end{beamercolorbox}
+}
+
+\newcommand{\code}[1]{\texttt{\color{accent!80!black}#1}}
+
+\title{Fraktal renderovanje sa hibridnom paralelizacijom}
+\author{Tamaš Pap}
+\date{2026}
+
+\begin{document}
+
+%% ==================================================================== 1
+\begin{frame}[plain]
+  \vspace{-0.3cm}
+  \begin{center}
+    \includegraphics[height=1.35cm]{figures/ftn-logo.png}\\[0.6em]
+    {\color{accent}\rule{0.16\textwidth}{2pt}}\\[0.9em]
+    {\usebeamerfont{title}\color{accent} Fraktal renderovanje sa\\[0.15em] hibridnom paralelizacijom}\\[1em]
+    {\large\color{graytext} Diplomski rad}\\[1.6em]
+    {\large\color{darktext} Tamaš Pap}\\[0.35em]
+    {\small\color{graytext} Mentor: dr Veljko Petrović}\\[1.6em]
+    {\small\color{graytext}
+      Fakultet tehničkih nauka, Novi Sad\\
+      Računarstvo i automatika\\
+      2026}
+  \end{center}
+\end{frame}
+
+%% ==================================================================== 1b
+\begin{frame}{Šta su fraktali i čemu služe?}
+  \vspace{-0.2cm}
+  \begin{columns}[T]
+    \column{0.52\textwidth}
+      \footnotesize
+      \begin{itemize}
+        \item Oblik čija se složenost \textbf{ne gubi uvećanjem} i koji je samosličan, sa fraktalnom dimenzijom koja nije ceo broj
+        \item U prirodi: obalske linije, rečne mreže, oblaci, otkucaji srca, pluća i krvni sudovi (grananje)
+      \end{itemize}
+      \vspace{0.15em}
+      \textbf{Čemu služe:}
+      \begin{itemize}
+        \item kompresija slike (iterirani sistemi funkcija)
+        \item kompaktne fraktalne antene za rad na više frekvencija
+        \item proceduralna grafika (teren, oblaci, teksture)
+        \item dijagnostika u medicini: fraktalna dimenzija tkiva i krvnih sudova razlikuje zdravo od obolelog
+      \end{itemize}
+      \normalsize
+    \column{0.44\textwidth}
+      \centering
+      \begin{tikzpicture}[x=1.8cm,y=1.8cm]
+        \begin{scope}
+          \clip (0,0) rectangle (1,0.4);
+          \input{tikz/koch-curve.tex}
+        \end{scope}
+      \end{tikzpicture}\\[0.05em]
+      {\scriptsize\color{graytext} Kohova kriva}\\[0.5em]
+      \begin{tikzpicture}[x=1.2cm,y=1.2cm]
+        \input{tikz/sierpinski-triangle.tex}
+      \end{tikzpicture}\hspace{0.35em}
+      \begin{tikzpicture}[x=1.2cm,y=1.2cm]
+        \input{tikz/vicsek.tex}
+      \end{tikzpicture}\\[0.1em]
+      {\scriptsize\color{graytext} Sjerpinski trougao \hspace{0.5em} Vicekov fraktal}\\[0.5em]
+      \begin{tikzpicture}[x=1.2cm,y=1.2cm]
+        \input{tikz/sierpinski-carpet.tex}
+      \end{tikzpicture}\\[0.05em]
+      {\scriptsize\color{graytext} Sjerpinski tepih}
+  \end{columns}
+\end{frame}
+
+%% ==================================================================== 2
+\begin{frame}{Motivacija i cilj rada}
+  \begin{itemize}
+    \item Mandelbrotov skup: jednostavno pravilo daje granicu beskonačne detaljnosti; \emph{escape-time} algoritam je potpuno paralelan po pikselu
+    \item Većina renderera koristi samo jedno CPU jezgro \textbf{ili} samo GPU
+    \item Tipičan računar već ima višejezgarni CPU \textbf{i} GPU
+  \end{itemize}
+  \vspace{0.6em}
+  \begin{center}
+    {\large\color{accent}\bfseries Cilj: renderer koji gura CPU i GPU do granice, pa ih spaja raspoređivačem}
+  \end{center}
+\end{frame}
+
+%% ==================================================================== 3
+\begin{frame}{Mandelbrotov skup i \emph{escape-time} algoritam}
+  \begin{columns}[c]
+    \column{0.54\textwidth}
+      \small
+      \[
+        z_0 = 0, \qquad z_{n+1} = z_n^2 + c
+      \]
+      \[
+        M = \{\, c \in \mathbb{C} : (z_n) \text{ ograničen} \,\}
+      \]
+      \normalsize
+      \begin{itemize}
+        \item ograničen ($|c|\le 2$), povezan, samosličan
+        \item test: prag bekstva $|z_n|>2$ + \code{max\_iter}
+        \item broj iteracija je jako neuravnotežen po slici, što je glavni izazov za paralelizaciju
+      \end{itemize}
+    \column{0.4\textwidth}
+      \includegraphics[width=\textwidth]{figures/Mandelbrot_black.png}
+  \end{columns}
+\end{frame}
+
+%% ==================================================================== 4
+\begin{frame}{CPU renderer: skalarna varijanta i SIMD}
+  \begin{columns}[T]
+    \column{0.46\textwidth}
+      \begin{itemize}
+        \item \code{f64} + FMA, test bekstva kao $|z_n|^2>4$
+        \item Brentova detekcija ciklusa prepoznaje periodične piksele bez čekanja na \code{max\_iter}
+        \item SIMD: \code{f32x8} / \code{f64x4} + maska aktivnih traka; dva nezavisna lanca za ILP
+      \end{itemize}
+      \vspace{0.4em}
+      {\color{accent}\bfseries do $2.4\times$ ubrzanje} nad skalarnom osnovom
+    \column{0.5\textwidth}
+      \includegraphics[width=\textwidth]{figures/results-simd-progression.png}
+  \end{columns}
+\end{frame}
+
+%% ==================================================================== 5
+\begin{frame}{Rani izlazak, Mariani-Silver, procena rastojanja}
+  \begin{columns}[c]
+    \column{0.46\textwidth}
+      \begin{itemize}
+        \item Kardioida i period-2 balon: tačan zatvoren oblik, bez iteracije
+        \item Mariani-Silver: testira se samo ivica pravougaonika; ako je uniformna, popunjava se bez računanja unutrašnjosti
+        \item Procena rastojanja (DEM): meri koliko je piksel daleko od granice, koristi se kao dodatni test odsecanja
+      \end{itemize}
+    \column{0.46\textwidth}
+      \includegraphics[width=\textwidth]{figures/alg-early-exit-regions.png}
+  \end{columns}
+\end{frame}
+
+%% ==================================================================== 6
+\begin{frame}{Duboki zum i neočekivani rezultati}
+  \begin{itemize}
+    \item \textbf{Teorija perturbacije} ($\delta_n = z_n - Z_n$, rebasing, do 8 referenci) + \code{double-double} referentna orbita za zum $>10^{12}$
+    \item[]
+    \item Dve optimizacije koje \textbf{nisu} isplatile na ovom hardveru:
+    \begin{itemize}
+      \item perturbacija ne donosi dobitak do zuma $10^{12}$ (\code{f64} je dovoljan)
+      \item Hilbertova kriva (CPU obilazak) je \emph{sporija} od reda po redovima
+    \end{itemize}
+  \end{itemize}
+  \vspace{0.5em}
+\end{frame}
+
+%% ==================================================================== 7
+\begin{frame}{GPU implementacija: WebGPU i CUDA}
+  \begin{itemize}
+    \item \textbf{WebGPU} (\code{wgpu}) kompajlira se u Vulkan, Metal ili DirectX preko drajvera; WGSL nema \code{f64}, pa je kernel isključivo \code{f32}
+    \item Isti WGSL kernel deli sve tipove fraktala; dve ulazne tačke: ceo kadar (radne grupe $16{\times}16$) i pojedinačne pločice za hibridni raspoređivač
+    \item \textbf{CUDA} cilja \code{sm\_86} (Ampere); PTX se kompajlira unapred pomoću \code{nvcc}, bez kompajliranja u realnom vremenu
+    \item CUDA zadržava pun \code{f64} paritet sa CPU-om; \code{--ftz=false} čuva denormalizovane brojeve, potrebne za tačnost glatkog bojenja blizu praga bekstva
+  \end{itemize}
+  \vspace{0.3em}
+  \begin{center}
+  \small
+  \begin{tabular}{lcc}
+    \toprule
+     & \textbf{WebGPU} & \textbf{CUDA} \\
+    \midrule
+    prenosivost & Vulkan / Metal / DirectX & samo NVIDIA \\
+    preciznost & samo \code{f32} & \code{f32} i \code{f64} \\
+    kompajliranje & WGSL, u realnom vremenu & PTX, unapred (\code{nvcc}) \\
+    kadar (1080p, zum 1) & $2.26$ ms & $1.61$ ms \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+\end{frame}
+
+%% ==================================================================== 7b
+\begin{frame}{GPU optimizacije}
+  \begin{itemize}
+    \item \code{--fmad=false} isključuje sažimanje množenja i sabiranja, pa CUDA zaokružuje bit-identično sa CPU kernelom
+    \item \code{colorize()} premešten na GPU (histogram + očitavanje iz palete kao poseban kernel), tačno do piksela u odnosu na CPU verziju
+    \item Mortonov (Z) redosled niti, isproban za bolju lokalnost unutar \emph{warp}-a, donosi samo $+1{,}9\%$, u granicama šuma
+  \end{itemize}
+  \vspace{0.3em}
+  \begin{center}
+    {\color{accent}\bfseries colorize na GPU-u: $54$--$63\%$ brže od početka do kraja} \\
+    {\small\color{graytext} pri plitkim i srednjim uvećanjima, gde je bojenje ranije dominiralo kadrom}
+  \end{center}
+\end{frame}
+
+%% ==================================================================== 7c
+\begin{frame}{Usko grlo: PCIe magistrala}
+  \begin{columns}[T]
+    \column{0.46\textwidth}
+      \begin{itemize}
+        \item Diskretni GPU je dostupan samo preko \textbf{PCIe 3.0 x8} ($\sim\!7.9$ GB/s teorijski)
+        \item Integrisani GPU deli sistemsku RAM sa CPU-om, bez PCIe prenosa
+        \item Kadar $1920{\times}1080$ = $8.29$ MB koji se prenosi nazad na \emph{svaki} kadar
+        \item \emph{Pinned memory} omogućava DMA direktno u bafer pozivaoca
+      \end{itemize}
+    \column{0.5\textwidth}
+      \includegraphics[width=\textwidth]{figures/results-gpu-frame-breakdown.png}
+  \end{columns}
+  \vspace{0.3em}
+  \begin{center}
+    {\large\color{accentwarm}\bfseries $80$--$90\%$ vremena GPU kadra je prenos}
+  \end{center}
+\end{frame}
+
+%% ==================================================================== 8
+\begin{frame}{Hibridni CPU+GPU raspoređivač}
+  \begin{columns}[T]
+    \column{0.48\textwidth}
+      \textbf{Zašto:}
+      \begin{itemize}
+        \item GPU niti rade u \emph{warp}-ovima od 32, u lok-koraku, pa jedan spor piksel usporava ceo \emph{warp}
+        \item CPU nit je nezavisna, pa su divergentne granične oblasti jeftinije na CPU-u
+      \end{itemize}
+    \column{0.48\textwidth}
+      \textbf{Dizajn (4 koraka):}
+      \begin{enumerate}
+        \item klasifikacija pločica (4 temena)
+        \item raspodela: GPU odmah, CPU iz reda
+        \item krađa posla unutar kadra
+        \item PI regulator između kadrova
+      \end{enumerate}
+  \end{columns}
+\end{frame}
+
+%% ==================================================================== 9
+\begin{frame}{Klasifikacija pločica i PI regulator}
+  \begin{columns}[c]
+    \column{0.42\textwidth}
+      \[
+        s=\frac{\max(i_k)-\min(i_k)}{N}
+      \]
+      \[
+        \text{threshold} \,{-}{=}\, K_P\,\text{err} + K_I\,\overline{\text{err}}
+      \]
+      \begin{itemize}
+        \item $s<$ prag: pločica ide na GPU, inače rekurzivna podela
+        \item $\text{err}=t_{\text{gpu}}-t_{\text{cpu}}$, klizni prosek od 16 kadrova
+      \end{itemize}
+    \column{0.54\textwidth}
+      \includegraphics[width=\textwidth]{figures/sched-tiling.png}
+  \end{columns}
+\end{frame}
+
+%% ==================================================================== 10
+\begin{frame}{Rezultati: propusnost renderovanja}
+  \begin{center}
+    \includegraphics[width=0.78\textwidth,height=0.58\textheight,keepaspectratio]{figures/ruster-throughput-all-backends.png}
+  \end{center}
+  \begin{center}
+    {\color{accent}\bfseries CUDA: $1389$ Mpix/s na 4K} \quad
+    {\small\color{graytext} AMD Ryzen 7 5800H + RTX 3050 Laptop, Mandelbrotov skup, \code{max\_iter}=1000}
+  \end{center}
+\end{frame}
+
+%% ==================================================================== 11
+\begin{frame}{Rezultati: raspoređivač pri plitkom zumu}
+  \begin{columns}[T]
+    \column{0.5\textwidth}
+      \centering
+      \includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{figures/ruster-solo-vs-hybrid.png}
+    \column{0.46\textwidth}
+      \vspace{0.5cm}
+      \begin{itemize}
+        \item Pri plitkom zumu, samostalni GPU je već dovoljno brz i skoro uvek pobeđuje
+        \item Raspoređivač tu samo dodaje trošak klasifikacije, bez koristi
+      \end{itemize}
+      \vspace{0.5em}
+      \begin{center}
+        {\color{accentwarm}\bfseries gubi od samostalnog GPU-a}\\
+        {\scriptsize\color{graytext} nema neravnoteže između uređaja koju bi ispravio}
+      \end{center}
+  \end{columns}
+\end{frame}
+
+%% ==================================================================== 11b
+\begin{frame}{Rezultati: raspoređivač pri dubokom zumu}
+  \vspace{-0.15cm}
+  \begin{columns}[T]
+    \column{0.48\textwidth}
+      \centering
+      \includegraphics[width=\textwidth,height=0.5\textheight,keepaspectratio]{figures/results-scheduler-deepzoom.png}\\[0.3em]
+      {\scriptsize\color{graytext} Na pragu preciznosti $10^6$ GPU prelazi na sporiju \code{f64} aritmetiku, pa CPU postaje brži solo uređaj}
+    \column{0.46\textwidth}
+      \vspace{0.3cm}
+      \centering
+      \small
+      \begin{tabular}{lr}
+        \toprule
+        konfiguracija & vreme \\
+        \midrule
+        CPU (solo) & $130$ ms \\
+        "idealna" podela & $81.6$ ms \\
+        \textbf{hibrid} & \textbf{$74.3$ ms} \\
+        \bottomrule
+      \end{tabular}
+      \vspace{0.45em}
+
+      {\large\color{accent}\bfseries $1.75\times$} {\small brže od CPU-a}\\[0.25em]
+      {\large\color{accentlight}\bfseries $1.10\times$} {\small brže od "idealne" podele}
+  \end{columns}
+  \vspace{0.35em}
+  {\scriptsize\color{graytext} "Idealna" podela samo deli posao proporcionalno izmerenoj brzini uređaja, pod pretpostavkom da je
+  svaki piksel podjednako skup. Stvarna granica skupa mnogo je skuplja od unutrašnjosti; klasifikator pločica to
+  prepoznaje i usmerava skupe delove ka boljem uređaju, pa hibrid nadmašuje čak i tu "idealnu" podelu.}
+\end{frame}
+
+%% ==================================================================== 12
+\begin{frame}{Poređenje sa drugim rendererima i validacija}
+  \begin{columns}[T]
+    \column{0.5\textwidth}
+      \centering
+      \includegraphics[width=\textwidth,height=0.52\textheight,keepaspectratio]{figures/ruster-pixel-kernel-cost.png}\\[0.3em]
+      {\scriptsize\color{graytext} Trošak samog kernela po pikselu (miliona evaluacija/s, normalizovano), bez niti, bojenja i "nagađanja" kod XaoS-a i FractalNow-a: ruster je red veličine brži od najbržeg konkurenta, dva reda od najsporijeg}
+    \column{0.46\textwidth}
+      \centering
+      \includegraphics[width=\textwidth,height=0.52\textheight,keepaspectratio]{figures/results-numerical-validation.png}\\[0.3em]
+      {\scriptsize\color{graytext} Box-counting dimenzija $\approx1.10$; konvergencija površine ka $1.50659177$}
+  \end{columns}
+  \vspace{0.4em}
+\end{frame}
+
+%% ==================================================================== 13
+\begin{frame}{Zaključak}
+  \begin{itemize}
+    \item \textbf{CPU strana važnija nego očekivano}: rani izlazak i detekcija ciklusa daju $\sim\!16\times$ nad naivnim C++ rendererom, bez GPU-a
+    \item \textbf{GPU dominira transferom i bojenjem, ne kernelom}: premeštanje bojenja na uređaj je najveći pojedinačni dobitak
+    \item \textbf{Raspoređivač se isplati tačno na pragu preciznosti}, gubi kad su uređaji neuravnoteženi
+  \end{itemize}
+  \vspace{0.5em}
+  {\scriptsize\color{graytext} Budući rad: \code{colorize()} na GPU za wgpu i hibrid; podešavanje raspoređivača na dubokom zumu; perturbacija na stvarno dubokim zumovima; poređenje sa novim GPU-konkurentnim rešenjem koje je nedavno objavio jedan poznati render fraktala.}
+\end{frame}
+
+%% ==================================================================== 14
+\begin{frame}[plain]
+  \vspace{2.0cm}
+  \begin{center}
+    {\usebeamerfont{title}\color{accent} Hvala na pažnji}\\[1.2em]
+    {\color{accent}\rule{0.12\textwidth}{2pt}}\\[1.2em]
+    {\large\color{graytext} Pitanja?}
+  \end{center}
+\end{frame}
+
+\end{document}
